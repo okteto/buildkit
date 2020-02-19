@@ -34,8 +34,10 @@ func valid(authorization []string) bool {
 		return false
 	}
 	token := strings.TrimPrefix(authorization[0], "Bearer ")
+
+	//TODO: remove token from output
 	logrus.Errorf("%s is not a valid token", token)
-	
+
 	// TODO: validate okteto token
 	return token == "some-secret-token"
 }
