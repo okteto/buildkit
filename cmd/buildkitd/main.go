@@ -547,6 +547,7 @@ func unaryInterceptor(globalCtx context.Context, authEndpoint string) grpc.Serve
 		return grpc.UnaryInterceptor(req)
 	}
 
+	logrus.Info("enabling authorization endpoint")
 	svc := newAuthService(authEndpoint)
 	auth := grpc_auth.UnaryServerInterceptor(svc.ensureValidToken)
 	return grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(req, auth))
