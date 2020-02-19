@@ -172,6 +172,11 @@ func main() {
 			Name:  "allow-insecure-entitlement",
 			Usage: "allows insecure entitlements e.g. network.host, security.insecure",
 		},
+		cli.StringFlag{
+			Name:  "authorization-endpoint",
+			Usage: "authorization endpoint (optional)",
+			Value: "",
+		},
 	)
 	app.Flags = append(app.Flags, appFlags...)
 
@@ -201,7 +206,8 @@ func main() {
 				return err
 			}
 		}
-		opts := []grpc.ServerOption{unaryInterceptor(ctx), grpc.StreamInterceptor(otgrpc.OpenTracingStreamServerInterceptor(tracer))}
+
+		opts := []grpc.ServerOption{unaryInterceptor(ctx, cfg.AuthorizationEndpoint), grpc.StreamInterceptor(otgrpc.OpenTracingStreamServerInterceptor(tracer))}
 		creds, err := serverCredentials(cfg.GRPC.TLS)
 		if err != nil {
 			return err
@@ -456,6 +462,11 @@ func applyMainFlags(c *cli.Context, cfg *config.Config, md *toml.MetaData) error
 	if tlsca := c.String("tlscacert"); tlsca != "" {
 		cfg.GRPC.TLS.CA = tlsca
 	}
+
+	if ae := c.String("authorization-endpoint"); ae != "" {
+		cfg.AuthorizationEndpoint = ae
+	}
+
 	return nil
 }
 
@@ -510,7 +521,7 @@ func getListener(cfg config.GRPCConfig, addr string) (net.Listener, error) {
 	}
 }
 
-func unaryInterceptor(globalCtx context.Context) grpc.ServerOption {
+func unaryInterceptor(globalCtx context.Context, authEndpoint string) grpc.ServerOption {
 	withTrace := otgrpc.OpenTracingServerInterceptor(tracer, otgrpc.LogPayloads())
 
 	req := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
@@ -532,7 +543,12 @@ func unaryInterceptor(globalCtx context.Context) grpc.ServerOption {
 		return
 	}
 
-	auth := grpc_auth.UnaryServerInterceptor(ensureValidToken)
+	if len(authEndpoint) == 0 {
+		return grpc.UnaryInterceptor(req)
+	}
+
+	svc := newAuthService(authEndpoint)
+	auth := grpc_auth.UnaryServerInterceptor(svc.ensureValidToken)
 	return grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(req, auth))
 }
 

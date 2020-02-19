@@ -6,7 +6,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"strings"
+	"net/http"
 )
 
 var (
@@ -14,30 +14,57 @@ var (
 	errInvalidToken    = status.Errorf(codes.Unauthenticated, "invalid okteto token, run `okteto login` and try again")
 )
 
-func ensureValidToken(ctx context.Context) (context.Context, error) {
+type authService struct {
+	endpoint string
+	client *http.Client
+}
+
+func newAuthService(endpoint string) *authService {
+	return &authService{
+		endpoint: endpoint,
+		client:  &http.Client{},
+	}
+}
+
+func (a *authService) ensureValidToken(ctx context.Context) (context.Context, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return ctx, errMissingMetadata
 	}
 	// The keys within metadata.MD are normalized to lowercase.
 	// See: https://godoc.org/google.golang.org/grpc/metadata#New
-	if !valid(md["authorization"]) {
+	if !a.valid(md["authorization"]) {
 		return ctx, errInvalidToken
 	}
 
 	return ctx, nil
 }
 
-func valid(authorization []string) bool {
+func (a *authService) valid(authorization []string) bool {
 	if len(authorization) < 1 {
 		logrus.Error("request didn't contain an authorization header")
 		return false
 	}
-	token := strings.TrimPrefix(authorization[0], "Bearer ")
+	
+	req, err := http.NewRequest("POST", a.endpoint, nil)
+	if err != nil {
+		logrus.Error("couldn't create request: %s", err)
+		return false
+	}
 
-	//TODO: remove token from output
-	logrus.Errorf("%s is not a valid token", token)
+	req.Header.Add("Authorization", authorization[0])
+	resp, err := a.client.Do(req)
+	if err != nil {
+		logrus.Error("authentication request failed: %s", err)
+		return false
+	}
 
-	// TODO: validate okteto token
-	return token == "some-secret-token"
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		logrus.Error("%s is a bad token: %s | %d", authorization[0], resp.StatusCode)
+		return false
+	}
+
+	return true
 }
