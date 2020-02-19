@@ -23,6 +23,8 @@ import (
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/docker/go-connections/sockets"
 	"github.com/gofrs/flock"
+	"github.com/grpc-ecosystem/go-grpc-middleware"
+	"github.com/grpc-ecosystem/go-grpc-middleware/auth"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/moby/buildkit/cache/remotecache"
 	inlineremotecache "github.com/moby/buildkit/cache/remotecache/inline"
@@ -511,7 +513,7 @@ func getListener(cfg config.GRPCConfig, addr string) (net.Listener, error) {
 func unaryInterceptor(globalCtx context.Context) grpc.ServerOption {
 	withTrace := otgrpc.OpenTracingServerInterceptor(tracer, otgrpc.LogPayloads())
 
-	return grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	req := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
@@ -528,7 +530,10 @@ func unaryInterceptor(globalCtx context.Context) grpc.ServerOption {
 			logrus.Errorf("%s returned error: %+v", info.FullMethod, err)
 		}
 		return
-	})
+	}
+
+	auth := grpc_auth.UnaryServerInterceptor(ensureValidToken)
+	return grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(req, auth))
 }
 
 func serverCredentials(cfg config.TLSConfig) (grpc.ServerOption, error) {

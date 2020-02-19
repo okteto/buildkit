@@ -152,6 +152,14 @@ type withTracer struct {
 	tracer opentracing.Tracer
 }
 
+type withRPCCreds struct {
+	creds credentials.PerRPCCredentials
+}
+
+func WithRPCCreds(c credentials.PerRPCCredentials) ClientOpt {
+	return &withRPCCreds{c}
+}
+
 func resolveDialer(address string) (func(string, time.Duration) (net.Conn, error), error) {
 	ch, err := connhelper.GetConnectionHelper(address)
 	if err != nil {
