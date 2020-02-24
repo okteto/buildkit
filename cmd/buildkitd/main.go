@@ -23,7 +23,10 @@ import (
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/docker/go-connections/sockets"
 	"github.com/gofrs/flock"
+	"github.com/grpc-ecosystem/go-grpc-middleware"
+	"github.com/grpc-ecosystem/go-grpc-middleware/auth"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
+	"github.com/moby/buildkit/auth"
 	"github.com/moby/buildkit/cache/remotecache"
 	inlineremotecache "github.com/moby/buildkit/cache/remotecache/inline"
 	localremotecache "github.com/moby/buildkit/cache/remotecache/local"
@@ -169,6 +172,11 @@ func main() {
 			Name:  "allow-insecure-entitlement",
 			Usage: "allows insecure entitlements e.g. network.host, security.insecure",
 		},
+		cli.StringFlag{
+			Name:  "authorization-endpoint",
+			Usage: "authorization endpoint (optional)",
+			Value: "",
+		},
 	)
 	app.Flags = append(app.Flags, appFlags...)
 
@@ -198,7 +206,7 @@ func main() {
 				return err
 			}
 		}
-		opts := []grpc.ServerOption{unaryInterceptor(ctx), grpc.StreamInterceptor(otgrpc.OpenTracingStreamServerInterceptor(tracer))}
+		opts := []grpc.ServerOption{unaryInterceptor(ctx, cfg.AuthorizationEndpoint), grpc.StreamInterceptor(otgrpc.OpenTracingStreamServerInterceptor(tracer))}
 		server := grpc.NewServer(opts...)
 
 		// relative path does not work with nightlyone/lockfile
@@ -450,6 +458,9 @@ func applyMainFlags(c *cli.Context, cfg *config.Config, md *toml.MetaData) error
 	if tlsca := c.String("tlscacert"); tlsca != "" {
 		cfg.GRPC.TLS.CA = tlsca
 	}
+	if ae := c.String("authorization-endpoint"); ae != "" {
+		cfg.AuthorizationEndpoint = ae
+	}
 	return nil
 }
 
@@ -511,10 +522,10 @@ func getListener(addr string, uid, gid int, tlsConfig *tls.Config) (net.Listener
 	}
 }
 
-func unaryInterceptor(globalCtx context.Context) grpc.ServerOption {
+func unaryInterceptor(globalCtx context.Context, authEndpoint string) grpc.ServerOption {
 	withTrace := otgrpc.OpenTracingServerInterceptor(tracer, otgrpc.LogPayloads())
 
-	return grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	ui := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
@@ -531,7 +542,15 @@ func unaryInterceptor(globalCtx context.Context) grpc.ServerOption {
 			logrus.Errorf("%s returned error: %+v", info.FullMethod, err)
 		}
 		return
-	})
+	}
+
+	if len(authEndpoint) == 0 {
+		return grpc.UnaryInterceptor(ui)
+	}
+
+	svc := auth.NewService(authEndpoint)
+	auth := grpc_auth.UnaryServerInterceptor(svc.EnsureValidToken)
+	return grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(ui, auth))
 }
 
 func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
