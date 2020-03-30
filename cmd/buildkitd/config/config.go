@@ -20,6 +20,8 @@ type Config struct {
 	Registries map[string]RegistryConfig `toml:"registry"`
 
 	DNS *DNSConfig `toml:"dns"`
+
+	AuthorizationEndpoint string `toml:"authorization-endpoint"`
 }
 
 type GRPCConfig struct {

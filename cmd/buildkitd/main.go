@@ -24,6 +24,8 @@ import (
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/docker/go-connections/sockets"
 	"github.com/gofrs/flock"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/moby/buildkit/cache/remotecache"
 	inlineremotecache "github.com/moby/buildkit/cache/remotecache/inline"
@@ -170,6 +172,10 @@ func main() {
 			Name:  "allow-insecure-entitlement",
 			Usage: "allows insecure entitlements e.g. network.host, security.insecure",
 		},
+		cli.StringFlag{
+			Name:  "authorization-endpoint",
+			Usage: "authorization endpoint",
+		},
 	)
 	app.Flags = append(app.Flags, appFlags...)
 
@@ -201,6 +207,11 @@ func main() {
 				return err
 			}
 		}
+
+		if cfg.AuthorizationEndpoint != "" {
+			setupAuthorizer(cfg.AuthorizationEndpoint)
+		}
+
 		opts := []grpc.ServerOption{unaryInterceptor(ctx), grpc.StreamInterceptor(otgrpc.OpenTracingStreamServerInterceptor(tracer))}
 		server := grpc.NewServer(opts...)
 
@@ -453,6 +464,11 @@ func applyMainFlags(c *cli.Context, cfg *config.Config, md *toml.MetaData) error
 	if tlsca := c.String("tlscacert"); tlsca != "" {
 		cfg.GRPC.TLS.CA = tlsca
 	}
+
+	if ae := c.String("authorization-endpoint"); ae != "" {
+		cfg.AuthorizationEndpoint = ae
+	}
+
 	return nil
 }
 
@@ -515,8 +531,9 @@ func getListener(addr string, uid, gid int, tlsConfig *tls.Config) (net.Listener
 
 func unaryInterceptor(globalCtx context.Context) grpc.ServerOption {
 	withTrace := otgrpc.OpenTracingServerInterceptor(tracer, otgrpc.LogPayloads())
+	auth := grpc_auth.UnaryServerInterceptor(authorizer.EnsureValidToken)
 
-	return grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	interceptor := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
@@ -532,8 +549,11 @@ func unaryInterceptor(globalCtx context.Context) grpc.ServerOption {
 		if err != nil {
 			logrus.Errorf("%s returned error: %+v", info.FullMethod, err)
 		}
+
 		return
-	})
+	}
+
+	return grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(interceptor, auth))
 }
 
 func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
