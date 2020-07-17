@@ -50,6 +50,9 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 			gopts = append(gopts, grpc.WithDialer(wd.dialer))
 			needDialer = false
 		}
+		if rpc, ok := o.(*withRPCCreds); ok {
+			gopts = append(gopts, grpc.WithPerRPCCredentials(rpc.creds))
+		}
 	}
 	if needDialer {
 		dialFn, err := resolveDialer(address)
@@ -150,6 +153,14 @@ func WithTracer(t opentracing.Tracer) ClientOpt {
 
 type withTracer struct {
 	tracer opentracing.Tracer
+}
+
+type withRPCCreds struct {
+	creds credentials.PerRPCCredentials
+}
+
+func WithRPCCreds(c credentials.PerRPCCredentials) ClientOpt {
+	return &withRPCCreds{c}
 }
 
 func resolveDialer(address string) (func(string, time.Duration) (net.Conn, error), error) {
