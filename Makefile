@@ -34,5 +34,15 @@ vendor:
 generated-files:
 	./hack/update-generated-files
 
-.PHONY: vendor generated-files test binaries images install clean lint validate-all validate-vendor validate-generated-files
+okteto-push:
+	docker push okteto/buildkit:v0.7.1-1
+	docker push okteto/buildkit:v0.7.1-rootless1
+
+okteto-tag:
+	docker tag moby/buildkit:local okteto/buildkit:v0.7.1-1
+	docker tag moby/buildkit:local-rootless okteto/buildkit:v0.7.1-rootless1
+
+okteto: images okteto-tag okteto-push
+
+.PHONY: vendor generated-files test binaries images install clean lint validate-all validate-vendor validate-generated-files okteto okteto-push okteto-tag
 FORCE:

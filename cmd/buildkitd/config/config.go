@@ -19,7 +19,8 @@ type Config struct {
 
 	Registries map[string]RegistryConfig `toml:"registry"`
 
-	DNS *DNSConfig `toml:"dns"`
+	DNS                   *DNSConfig `toml:"dns"`
+	AuthorizationEndpoint string     `tolm:"authorization-endpoint"`
 }
 
 type GRPCConfig struct {
