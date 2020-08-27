@@ -35,12 +35,12 @@ generated-files:
 	./hack/update-generated-files
 
 okteto-push:
-	docker push okteto/buildkit:v0.7.1-1
-	docker push okteto/buildkit:v0.7.1-rootless1
+	docker push okteto/buildkit:v0.7.2-1
+	docker push okteto/buildkit:v0.7.2-rootless1
 
 okteto-tag:
-	docker tag moby/buildkit:local okteto/buildkit:v0.7.1-1
-	docker tag moby/buildkit:local-rootless okteto/buildkit:v0.7.1-rootless1
+	docker tag moby/buildkit:local okteto/buildkit:v0.7.2-1
+	docker tag moby/buildkit:local-rootless okteto/buildkit:v0.7.2-rootless1
 
 okteto: images okteto-tag okteto-push
 
