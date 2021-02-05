@@ -60,5 +60,9 @@ func retryError(err error) bool {
 		return true
 	}
 
+	if strings.Contains(err.Error(), "failed commit on ref") && strings.Contains(err.Error(), "500 Internal Server Error") {
+		return true
+	}
+
 	return false
 }
