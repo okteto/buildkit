@@ -13,7 +13,7 @@ ARG SHADOW_VERSION=4.8.1
 ARG FUSEOVERLAYFS_VERSION=v1.3.0
 ARG STARGZ_SNAPSHOTTER_VERSION=3a04e4c2c116c85b4b66d01945cf7ebcb7a2eb5a
 
-ARG ALPINE_VERSION=3.12
+ARG ALPINE_VERSION=3.14
 
 # git stage is used for checking out remote repository sources
 FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS git
@@ -36,10 +36,10 @@ RUN dpkg --add-architecture s390x && \
     gcc-s390x-linux-gnu libc6-dev-s390x-cross libseccomp-dev:s390x \
     crossbuild-essential-ppc64el libseccomp-dev:ppc64el \
     --no-install-recommends
-  
+
 FROM gobuild-minimal AS gobuild-cross-amd64-arm
 RUN echo "deb http://deb.debian.org/debian buster-backports main" >> /etc/apt/sources.list
-RUN apt-get update && apt-get install --no-install-recommends -y libseccomp2=2.4.4-1~bpo10+1 libseccomp-dev=2.4.4-1~bpo10+1 
+RUN apt-get update && apt-get install --no-install-recommends -y libseccomp2=2.4.4-1~bpo10+1 libseccomp-dev=2.4.4-1~bpo10+1
 RUN dpkg --add-architecture armel && \
   dpkg --add-architecture armhf && \
   dpkg --add-architecture arm64 && \
@@ -321,5 +321,3 @@ ENTRYPOINT ["rootlesskit", "buildkitd"]
 
 
 FROM buildkit-${BUILDKIT_TARGET}
-
-
