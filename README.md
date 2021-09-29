@@ -3,8 +3,9 @@
 # BuildKit
 
 [![GoDoc](https://godoc.org/github.com/moby/buildkit?status.svg)](https://godoc.org/github.com/moby/buildkit/client/llb)
-[![Build Status](https://travis-ci.org/moby/buildkit.svg?branch=master)](https://travis-ci.org/moby/buildkit)
+[![Build Status](https://github.com/moby/buildkit/workflows/build/badge.svg)](https://github.com/moby/buildkit/actions?query=workflow%3Abuild)
 [![Go Report Card](https://goreportcard.com/badge/github.com/moby/buildkit)](https://goreportcard.com/report/github.com/moby/buildkit)
+[![codecov](https://codecov.io/gh/moby/buildkit/branch/master/graph/badge.svg)](https://codecov.io/gh/moby/buildkit)
 
 BuildKit is a toolkit for converting source code to build artifacts in an efficient, expressive and repeatable manner.
 
@@ -27,7 +28,7 @@ Introductory blog post https://blog.mobyproject.org/introducing-buildkit-17e056c
 
 Join `#buildkit` channel on [Docker Community Slack](http://dockr.ly/slack)
 
-:information_source: If you are visiting this repo for the usage of experimental Dockerfile features like `RUN --mount=type=(bind|cache|tmpfs|secret|ssh)`, please refer to [`frontend/dockerfile/docs/experimental.md`](frontend/dockerfile/docs/experimental.md).
+:information_source: If you are visiting this repo for the usage of BuildKit-only Dockerfile features like `RUN --mount=type=(bind|cache|tmpfs|secret|ssh)`, please refer to [`frontend/dockerfile/docs/syntax.md`](frontend/dockerfile/docs/syntax.md).
 
 :information_source: [BuildKit has been integrated to `docker build` since Docker 18.06 .](https://docs.docker.com/develop/develop-images/build_enhancements/)
 You don't need to read this document unless you want to use the full-featured standalone version of BuildKit.
@@ -56,12 +57,14 @@ You don't need to read this document unless you want to use the full-featured st
     - [Inline (push image and cache together)](#inline-push-image-and-cache-together)
     - [Registry (push image and cache separately)](#registry-push-image-and-cache-separately)
     - [Local directory](#local-directory-1)
-    - [`--export-cache` options](#--export-cache-options)
-    - [`--import-cache` options](#--import-cache-options)
+    - [GitHub Actions cache (experimental)](#github-actions-cache-experimental)
   - [Consistent hashing](#consistent-hashing)
+- [Metadata](#metadata)
+- [Systemd socket activation](#systemd-socket-activation)
 - [Expose BuildKit as a TCP service](#expose-buildkit-as-a-tcp-service)
   - [Load balancing](#load-balancing)
 - [Containerizing BuildKit](#containerizing-buildkit)
+  - [Podman](#podman)
   - [Kubernetes](#kubernetes)
   - [Daemonless](#daemonless)
 - [Opentracing support](#opentracing-support)
@@ -83,6 +86,7 @@ BuildKit is used by the following projects:
 -   [the Sanic build tool](https://github.com/distributed-containers-inc/sanic)
 -   [vab](https://github.com/stellarproject/vab)
 -   [Rio](https://github.com/rancher/rio)
+-   [kim](https://github.com/rancher/kim)
 -   [PouchContainer](https://github.com/alibaba/pouch)
 -   [Docker buildx](https://github.com/docker/buildx)
 -   [Okteto Cloud](https://okteto.com/)
@@ -124,13 +128,11 @@ By default, the OCI (runc) worker is used. You can set `--oci-worker=false --con
 
 We are open to adding more backends.
 
+To start the buildkitd daemon using systemd socket activiation, you can install the buildkit systemd unit files.
+See [Systemd socket activation](#systemd-socket-activation)
+
 The buildkitd daemon listens gRPC API on `/run/buildkit/buildkitd.sock` by default, but you can also use TCP sockets.
 See [Expose BuildKit as a TCP service](#expose-buildkit-as-a-tcp-service).
-
-:information_source: Notice to Fedora 31 users:
-
-* As runc still does not work on cgroup v2 environment like Fedora 31, you need to substitute runc with crun. Run `buildkitd` with `--oci-worker-binary=crun`.
-* If you want to use runc, you need to configure the system to use cgroup v1. Run `sudo grubby --update-kernel=ALL --args="systemd.unified_cgroup_hierarchy=0"` and reboot.
 
 ### Exploring LLB
 
@@ -150,6 +152,9 @@ Currently, the following high-level languages has been implemented for LLB:
 -   [Mockerfile](https://matt-rickard.com/building-a-new-dockerfile-frontend/)
 -   [Gockerfile](https://github.com/po3rin/gockerfile)
 -   [bldr (Pkgfile)](https://github.com/talos-systems/bldr/)
+-   [HLB](https://github.com/openllb/hlb)
+-   [Earthfile (Earthly)](https://github.com/earthly/earthly)
+-   [Cargo Wharf (Rust)](https://github.com/denzp/cargo-wharf)
 -   (open a PR to add your own language)
 
 ### Exploring Dockerfiles
@@ -178,7 +183,7 @@ buildctl build \
 
 #### Building a Dockerfile using external frontend:
 
-External versions of the Dockerfile frontend are pushed to https://hub.docker.com/r/docker/dockerfile-upstream and https://hub.docker.com/r/docker/dockerfile and can be used with the gateway frontend. The source for the external frontend is currently located in `./frontend/dockerfile/cmd/dockerfile-frontend` but will move out of this repository in the future ([#163](https://github.com/moby/buildkit/issues/163)). For automatic build from master branch of this repository `docker/dockerfile-upsteam:master` or `docker/dockerfile-upstream:master-experimental` image can be used.
+External versions of the Dockerfile frontend are pushed to https://hub.docker.com/r/docker/dockerfile-upstream and https://hub.docker.com/r/docker/dockerfile and can be used with the gateway frontend. The source for the external frontend is currently located in `./frontend/dockerfile/cmd/dockerfile-frontend` but will move out of this repository in the future ([#163](https://github.com/moby/buildkit/issues/163)). For automatic build from master branch of this repository `docker/dockerfile-upstream:master` or `docker/dockerfile-upstream:master-labs` image can be used.
 
 ```bash
 buildctl build \
@@ -226,8 +231,9 @@ Keys supported by image output:
 * `unpack=true`: unpack image after creation (for use with containerd)
 * `dangling-name-prefix=[value]`: name image with `prefix@<digest>` , used for anonymous images
 * `name-canonical=true`: add additional canonical name `name@<digest>`
-* `compression=[uncompressed,gzip]`: choose compression type for layer, gzip is default value
-
+* `compression=[uncompressed,gzip,estargz,zstd]`: choose compression type for layers newly created and cached, gzip is default value. estargz should be used with `oci-mediatypes=true`.
+* `force-compression=true`: forcefully apply `compression` option to all layers (including already existing layers).
+* `buildinfo=[all,imageconfig,metadata,none]`: choose [build dependency](docs/build-repro.md#build-dependencies) version to export (default `all`).
 
 If credentials are required, `buildctl` will attempt to read Docker configuration file `$DOCKER_CONFIG/config.json`.
 `$DOCKER_CONFIG` defaults to `~/.docker`.
@@ -309,6 +315,7 @@ BuildKit supports the following cache exporters:
 * `inline`: embed the cache into the image, and push them to the registry together
 * `registry`: push the image and the cache separately
 * `local`: export to a local directory
+* `gha`: export to GitHub Actions cache
 
 In most case you want to use the `inline` cache exporter.
 However, note that the `inline` cache exporter only supports `min` cache mode. 
@@ -323,7 +330,7 @@ buildctl build ... \
   --import-cache type=registry,ref=docker.io/username/image
 ```
 
-Note that the inline cache is not imported unless `--import-cache type=registry,ref=...` is provided.
+Note that the inline cache is not imported unless [`--import-cache type=registry,ref=...`](#registry-push-image-and-cache-separately) is provided.
 
 :information_source: Docker-integrated BuildKit (`DOCKER_BUILDKIT=1 docker build`) and `docker buildx`requires 
 `--build-arg BUILDKIT_INLINE_CACHE=1` to be specified to enable the `inline` cache exporter.
@@ -335,8 +342,19 @@ However, the standalone `buildctl` does NOT require `--opt build-arg:BUILDKIT_IN
 buildctl build ... \
   --output type=image,name=localhost:5000/myrepo:image,push=true \
   --export-cache type=registry,ref=localhost:5000/myrepo:buildcache \
-  --import-cache type=registry,ref=localhost:5000/myrepo:buildcache \
+  --import-cache type=registry,ref=localhost:5000/myrepo:buildcache
 ```
+
+`--export-cache` options:
+* `type=registry`
+* `mode=min` (default): only export layers for the resulting image
+* `mode=max`: export all the layers of all intermediate steps.
+* `ref=docker.io/user/image:tag`: reference
+* `oci-mediatypes=true|false`: whether to use OCI mediatypes in exported manifests. Since BuildKit `v0.8` defaults to true.
+
+`--import-cache` options:
+* `type=registry`
+* `ref=docker.io/user/image:tag`: reference
 
 #### Local directory
 
@@ -347,20 +365,45 @@ buildctl build ... --import-cache type=local,src=path/to/input-dir
 
 The directory layout conforms to OCI Image Spec v1.0.
 
-#### `--export-cache` options
--   `type`: `inline`, `registry`, or `local`
--   `mode=min` (default): only export layers for the resulting image
--   `mode=max`: export all the layers of all intermediate steps. Not supported for `inline` cache exporter.
--   `ref=docker.io/user/image:tag`: reference for `registry` cache exporter
--   `dest=path/to/output-dir`: directory for `local` cache exporter
+`--export-cache` options:
+* `type=local`
+* `mode=min` (default): only export layers for the resulting image
+* `mode=max`: export all the layers of all intermediate steps.
+* `dest=path/to/output-dir`: destination directory for cache exporter
+* `oci-mediatypes=true|false`: whether to use OCI mediatypes in exported manifests. Since BuildKit `v0.8` defaults to true.
 
-#### `--import-cache` options
--   `type`: `registry` or `local`. Use `registry` to import `inline` cache.
--   `ref=docker.io/user/image:tag`: reference for `registry` cache importer
--   `src=path/to/input-dir`: directory for `local` cache importer
--   `digest=sha256:deadbeef`: digest of the manifest list to import for `local` cache importer.
--   `tag=customtag`: custom tag of image for `local` cache importer.
-    Defaults to the digest of "latest" tag in `index.json` is for digest, not for tag
+`--import-cache` options:
+* `type=local`
+* `src=path/to/input-dir`: source directory for cache importer
+* `digest=sha256:deadbeef`: digest of the manifest list to import.
+* `tag=customtag`: custom tag of image. Defaults "latest" tag digest in `index.json` is for digest, not for tag
+
+#### GitHub Actions cache (experimental)
+
+```bash
+buildctl build ... \
+  --output type=image,name=docker.io/username/image,push=true \
+  --export-cache type=gha \
+  --import-cache type=gha
+```
+
+Following attributes are required to authenticate against the [Github Actions Cache service API](https://github.com/tonistiigi/go-actions-cache/blob/master/api.md#authentication):
+* `url`: Cache server URL (default `$ACTIONS_CACHE_URL`)
+* `token`: Access token (default `$ACTIONS_RUNTIME_TOKEN`)
+
+:information_source: This type of cache can be used with [Docker Build Push Action](https://github.com/docker/build-push-action)
+where `url` and `token` will be automatically set. To use this backend in a inline `run` step, you have to include [crazy-max/ghaction-github-runtime](https://github.com/crazy-max/ghaction-github-runtime)
+in your workflow to expose the runtime.
+
+`--export-cache` options:
+* `type=gha`
+* `mode=min` (default): only export layers for the resulting image
+* `mode=max`: export all the layers of all intermediate steps.
+* `scope=buildkit`: which scope cache object belongs to (default `buildkit`)
+
+`--import-cache` options:
+* `type=gha`
+* `scope=buildkit`: which scope cache object belongs to (default `buildkit`)
 
 ### Consistent hashing
 
@@ -369,6 +412,24 @@ consider client-side load balancing using consistent hashing.
 
 See [`./examples/kubernetes/consistenthash`](./examples/kubernetes/consistenthash).
 
+## Metadata
+
+To output build metadata such as the image digest, pass the `--metadata-file` flag.
+The metadata will be written as a JSON object to the specified file.
+The directory of the specified file must already exist and be writable.
+
+```bash
+buildctl build ... --metadata-file metadata.json
+```
+
+```
+{"containerimage.digest": "sha256:ea0cfb27fd41ea0405d3095880c1efa45710f5bcdddb7d7d5a7317ad4825ae14",...}
+```
+
+## Systemd socket activation
+
+On Systemd based systems, you can communicate with the daemon via [Systemd socket activation](http://0pointer.de/blog/projects/socket-activation.html), use `buildkitd --addr fd://`.
+You can find examples of using Systemd socket activation with BuildKit and Systemd in [`./examples/systemd`](./examples/systemd).
 ## Expose BuildKit as a TCP service
 
 The `buildkitd` daemon can listen the gRPC API on a TCP socket.
@@ -418,13 +479,23 @@ export BUILDKIT_HOST=docker-container://buildkitd
 buildctl build --help
 ```
 
+### Podman
+To connect to a BuildKit daemon running in a Podman container, use `podman-container://` instead of `docker-container://` .
+
+```bash
+podman run -d --name buildkitd --privileged moby/buildkit:latest
+buildctl --addr=podman-container://buildkitd build --frontend dockerfile.v0 --local context=. --local dockerfile=. --output type=oci | podman load foo
+```
+
+`sudo` is not required.
+
 ### Kubernetes
 
 For Kubernetes deployments, see [`examples/kubernetes`](./examples/kubernetes).
 
 ### Daemonless
 
-To run client and an ephemeral daemon in a single container ("daemonless mode"):
+To run the client and an ephemeral daemon in a single container ("daemonless mode"):
 
 ```bash
 docker run \

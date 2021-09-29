@@ -4,6 +4,7 @@ package runc
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,9 +12,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	ctdsnapshot "github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/overlay"
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/executor/oci"
@@ -37,7 +40,7 @@ func newWorkerOpt(t *testing.T, processMode oci.ProcessMode) (base.WorkerOpt, fu
 		},
 	}
 	rootless := false
-	workerOpt, err := NewWorkerOpt(tmpdir, snFactory, rootless, processMode, nil, nil, netproviders.Opt{Mode: "host"}, nil, "")
+	workerOpt, err := NewWorkerOpt(tmpdir, snFactory, rootless, processMode, nil, nil, netproviders.Opt{Mode: "host"}, nil, "", "", nil, "")
 	require.NoError(t, err)
 
 	return workerOpt, cleanup
@@ -61,7 +64,7 @@ func TestRuncWorker(t *testing.T) {
 
 	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, oci.ProcessSandbox)
 	defer cleanupWorkerOpt()
-	w, err := base.NewWorker(workerOpt)
+	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
 	ctx := tests.NewCtx("buildkit-test")
@@ -69,7 +72,7 @@ func TestRuncWorker(t *testing.T) {
 	require.NoError(t, err)
 	snap := tests.NewBusyboxSourceSnapshot(ctx, t, w, sm)
 
-	mounts, err := snap.Mount(ctx, false)
+	mounts, err := snap.Mount(ctx, false, nil)
 	require.NoError(t, err)
 
 	lm := snapshot.LocalMounter(mounts)
@@ -90,7 +93,7 @@ func TestRuncWorker(t *testing.T) {
 	lm.Unmount()
 	require.NoError(t, err)
 
-	du, err := w.CacheManager.DiskUsage(ctx, client.DiskUsageInfo{})
+	du, err := w.CacheMgr.DiskUsage(ctx, client.DiskUsageInfo{})
 	require.NoError(t, err)
 
 	// for _, d := range du {
@@ -107,16 +110,16 @@ func TestRuncWorker(t *testing.T) {
 	}
 
 	stderr := bytes.NewBuffer(nil)
-	err = w.Executor.Run(ctx, "", snap, nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
+	err = w.WorkerOpt.Executor.Run(ctx, "", execMount(snap), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
 	require.Error(t, err) // Read-only root
 	// typical error is like `mkdir /.../rootfs/proc: read-only file system`.
 	// make sure the error is caused before running `echo foo > /bar`.
 	require.Contains(t, stderr.String(), "read-only file system")
 
-	root, err := w.CacheManager.New(ctx, snap)
+	root, err := w.CacheMgr.New(ctx, snap, nil)
 	require.NoError(t, err)
 
-	err = w.Executor.Run(ctx, "", root, nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
+	err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
 	require.NoError(t, err)
 
 	meta = executor.Meta{
@@ -124,13 +127,13 @@ func TestRuncWorker(t *testing.T) {
 		Cwd:  "/",
 	}
 
-	err = w.Executor.Run(ctx, "", root, nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
+	err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
 	require.NoError(t, err)
 
 	rf, err := root.Commit(ctx)
 	require.NoError(t, err)
 
-	mounts, err = rf.Mount(ctx, false)
+	mounts, err = rf.Mount(ctx, false, nil)
 	require.NoError(t, err)
 
 	lm = snapshot.LocalMounter(mounts)
@@ -153,10 +156,28 @@ func TestRuncWorker(t *testing.T) {
 	err = snap.Release(ctx)
 	require.NoError(t, err)
 
-	du2, err := w.CacheManager.DiskUsage(ctx, client.DiskUsageInfo{})
-	require.NoError(t, err)
-	require.Equal(t, 1, len(du2)-len(du))
+	retry := 0
+	var du2 []*client.UsageInfo
+	for {
+		du2, err = w.CacheMgr.DiskUsage(ctx, client.DiskUsageInfo{})
+		require.NoError(t, err)
+		if len(du2)-len(du) != 1 && retry == 0 {
+			t.Logf("invalid expected size: du1: %+v du2: %+v", formatDiskUsage(du), formatDiskUsage(du2))
+			time.Sleep(300 * time.Millisecond) // make race non-fatal if it fixes itself
+			retry++
+			continue
+		}
+		break
+	}
+	require.Equal(t, 1, len(du2)-len(du), "du1: %+v du2: %+v", formatDiskUsage(du), formatDiskUsage(du2))
+}
 
+func formatDiskUsage(du []*client.UsageInfo) string {
+	buf := new(bytes.Buffer)
+	for _, d := range du {
+		fmt.Fprintf(buf, "%+v ", d)
+	}
+	return buf.String()
 }
 
 func TestRuncWorkerNoProcessSandbox(t *testing.T) {
@@ -165,14 +186,14 @@ func TestRuncWorkerNoProcessSandbox(t *testing.T) {
 
 	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, oci.NoProcessSandbox)
 	defer cleanupWorkerOpt()
-	w, err := base.NewWorker(workerOpt)
+	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
 	ctx := tests.NewCtx("buildkit-test")
 	sm, err := session.NewManager()
 	require.NoError(t, err)
 	snap := tests.NewBusyboxSourceSnapshot(ctx, t, w, sm)
-	root, err := w.CacheManager.New(ctx, snap)
+	root, err := w.CacheMgr.New(ctx, snap, nil)
 	require.NoError(t, err)
 
 	// ensure the procfs is shared
@@ -185,7 +206,7 @@ func TestRuncWorkerNoProcessSandbox(t *testing.T) {
 	}
 	stdout := bytes.NewBuffer(nil)
 	stderr := bytes.NewBuffer(nil)
-	err = w.Executor.Run(ctx, "", root, nil, executor.ProcessInfo{Meta: meta, Stdout: &nopCloser{stdout}, Stderr: &nopCloser{stderr}}, nil)
+	err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root), nil, executor.ProcessInfo{Meta: meta, Stdout: &nopCloser{stdout}, Stderr: &nopCloser{stderr}}, nil)
 	require.NoError(t, err, fmt.Sprintf("stdout=%q, stderr=%q", stdout.String(), stderr.String()))
 	require.Equal(t, string(selfCmdline), stdout.String())
 }
@@ -196,7 +217,7 @@ func TestRuncWorkerExec(t *testing.T) {
 
 	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, oci.ProcessSandbox)
 	defer cleanupWorkerOpt()
-	w, err := base.NewWorker(workerOpt)
+	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExec(t, w)
@@ -208,7 +229,7 @@ func TestRuncWorkerExecFailures(t *testing.T) {
 
 	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, oci.ProcessSandbox)
 	defer cleanupWorkerOpt()
-	w, err := base.NewWorker(workerOpt)
+	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExecFailures(t, w)
@@ -220,4 +241,16 @@ type nopCloser struct {
 
 func (n *nopCloser) Close() error {
 	return nil
+}
+
+func execMount(m cache.Mountable) executor.Mount {
+	return executor.Mount{Src: &mountable{m: m}}
+}
+
+type mountable struct {
+	m cache.Mountable
+}
+
+func (m *mountable) Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
+	return m.m.Mount(ctx, readonly, nil)
 }

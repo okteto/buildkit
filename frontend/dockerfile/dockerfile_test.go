@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,18 +30,22 @@ import (
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/dockerfile/builder"
 	"github.com/moby/buildkit/frontend/dockerfile/dockerfile2llb"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/frontend/subrequests"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/upload/uploadprovider"
+	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/testutil"
 	"github.com/moby/buildkit/util/testutil/httpserver"
 	"github.com/moby/buildkit/util/testutil/integration"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -101,6 +106,15 @@ var allTests = []integration.Test{
 	testFrontendUseForwardedSolveResults,
 	testFrontendInputs,
 	testErrorsSourceMap,
+	testMultiArgs,
+	testFrontendSubrequests,
+	testDockefileCheckHostname,
+	testDefaultShellAndPath,
+	testDockerfileLowercase,
+	testExportCacheLoop,
+	testWildcardRenameCache,
+	testDockerfileInvalidInstruction,
+	testBuildInfo,
 }
 
 var fileOpTests = []integration.Test{
@@ -118,6 +132,7 @@ var fileOpTests = []integration.Test{
 	testCopyVarSubstitution,
 	testCopyWildcards,
 	testCopyRelative,
+	testAddURLChmod,
 	testTarContext,
 	testTarContextExternalDockerfile,
 	testWorkdirUser,
@@ -132,6 +147,9 @@ var securityTests = []integration.Test{}
 
 // Tests that depend on the `network.*` entitlements
 var networkTests = []integration.Test{}
+
+// Tests that depend on heredoc support
+var heredocTests = []integration.Test{}
 
 var opts []integration.TestOpt
 var securityOpts []integration.TestOpt
@@ -185,6 +203,7 @@ func TestIntegration(t *testing.T) {
 			"granted": networkHostGranted,
 			"denied":  networkHostDenied,
 		}))...)
+	integration.Run(t, heredocTests, opts...)
 }
 
 func testDefaultEnvWithArgs(t *testing.T, sb integration.Sandbox) {
@@ -212,7 +231,7 @@ echo -n $my_arg $1 > /out
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -230,7 +249,7 @@ echo -n $my_arg $1 > /out
 		{"override", map[string]string{"build-arg:my_arg": "override"}, "my_arg=override my_arg=override"},
 	} {
 		t.Run(x.name, func(t *testing.T) {
-			_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+			_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 				FrontendAttrs: x.frontendAttrs,
 				Exports: []client.ExportEntry{
 					{
@@ -267,7 +286,7 @@ RUN [ "$myenv" = 'foo%sbar' ]
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -275,7 +294,7 @@ RUN [ "$myenv" = 'foo%sbar' ]
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -323,11 +342,11 @@ foo
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -335,7 +354,7 @@ foo
 	}, nil)
 	require.NoError(t, err)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"filename": "Dockerfile2",
 		},
@@ -365,11 +384,11 @@ RUN [ "$(cat testfile)" == "contents0" ]
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 		},
@@ -377,6 +396,85 @@ RUN [ "$(cat testfile)" == "contents0" ]
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
 		},
+	}, nil)
+	require.NoError(t, err)
+}
+
+func testExportCacheLoop(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM alpine as base
+RUN echo aa > /foo
+WORKDIR /bar
+
+FROM base as base1
+COPY hello.txt .
+
+FROM base as base2
+COPY --from=base1 /bar/hello.txt .
+RUN true
+
+FROM scratch
+COPY --from=base2 /foo /f
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("hello.txt", []byte("hello"), 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	cacheDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(cacheDir)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+		CacheExports: []client.CacheOptionsEntry{
+			{
+				Type: "local",
+				Attrs: map[string]string{
+					"dest": filepath.Join(cacheDir, "cache"),
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	err = c.Prune(sb.Context(), nil)
+	require.NoError(t, err)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+		CacheExports: []client.CacheOptionsEntry{
+			{
+				Type: "local",
+				Attrs: map[string]string{
+					"dest": filepath.Join(cacheDir, "cache"),
+				},
+			},
+		},
+		CacheImports: []client.CacheOptionsEntry{
+			{
+				Type: "local",
+				Attrs: map[string]string{
+					"src": filepath.Join(cacheDir, "cache"),
+				},
+			},
+		},
+		FrontendAttrs: map[string]string{},
 	}, nil)
 	require.NoError(t, err)
 }
@@ -402,12 +500,12 @@ FROM stage-$TARGETOS
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	buf := &bytes.Buffer{}
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:   client.ExporterTar,
@@ -430,7 +528,7 @@ FROM stage-$TARGETOS
 
 	// repeat multi-platform
 	buf = &bytes.Buffer{}
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:   client.ExporterTar,
@@ -474,7 +572,7 @@ WORKDIR /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -482,7 +580,7 @@ WORKDIR /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -514,11 +612,11 @@ FROM busybox
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -526,7 +624,7 @@ FROM busybox
 	}, nil)
 	require.NoError(t, err)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -552,11 +650,11 @@ ENV foo bar
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -635,11 +733,11 @@ RUN e="300:400"; p="/file"                         ; a=` + "`" + `stat -c "%u:%g
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -647,7 +745,7 @@ RUN e="300:400"; p="/file"                         ; a=` + "`" + `stat -c "%u:%g
 	}, nil)
 	require.NoError(t, err)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"target": "copy_from",
 		},
@@ -680,7 +778,7 @@ COPY --from=base unique /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -688,7 +786,7 @@ COPY --from=base unique /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -712,7 +810,7 @@ COPY --from=base unique /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -737,7 +835,7 @@ COPY --from=base unique /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -771,7 +869,7 @@ COPY foo nomatch* /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -779,7 +877,7 @@ COPY foo nomatch* /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -816,11 +914,11 @@ RUN [ "$(stat -c "%U %G" /mydir)" == "user user" ]
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 		},
@@ -851,11 +949,11 @@ COPY --from=base Dockerfile .
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 		},
@@ -885,11 +983,11 @@ RUN [ "$(stat -c "%U %G" /mydir)" == "user user" ]
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 		},
@@ -923,11 +1021,11 @@ RUN [ "$(stat -c "%U %G" /dest01)" == "user01 user" ]
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 			"build-arg:group":                   "user",
@@ -958,7 +1056,7 @@ COPY link/foo .
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -966,7 +1064,7 @@ COPY link/foo .
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -1006,7 +1104,7 @@ COPY --from=build /sub2/foo bar
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -1014,7 +1112,7 @@ COPY --from=build /sub2/foo bar
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -1052,7 +1150,7 @@ COPY . /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -1060,7 +1158,7 @@ COPY . /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -1098,11 +1196,11 @@ RUN ["ls"]
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -1131,7 +1229,7 @@ COPY --from=build /out .
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -1139,7 +1237,7 @@ COPY --from=build /out .
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -1156,6 +1254,142 @@ COPY --from=build /out .
 	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out"))
 	require.NoError(t, err)
 	require.Equal(t, "bar-box-foo", string(dt))
+}
+
+func testMultiArgs(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+ARG a1="foo bar" a2=box
+ARG a3="$a2-foo"
+FROM busy$a2 AS build
+ARG a3 a4="123 456" a1
+RUN echo -n "$a1:$a3:$a4" > /out
+FROM scratch
+COPY --from=build /out .
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out"))
+	require.NoError(t, err)
+	require.Equal(t, "foo bar:box-foo:123 456", string(dt))
+}
+
+func testDefaultShellAndPath(t *testing.T, sb integration.Sandbox) {
+	skipDockerd(t, sb)
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM scratch
+ENTRYPOINT foo bar
+COPY Dockerfile .
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	out := filepath.Join(destDir, "out.tar")
+	outW, err := os.Create(out)
+	require.NoError(t, err)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+		FrontendAttrs: map[string]string{
+			"platform": "windows/amd64,linux/amd64",
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:   client.ExporterOCI,
+				Output: fixedWriteCloser(outW),
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out.tar"))
+	require.NoError(t, err)
+
+	m, err := testutil.ReadTarToMap(dt, false)
+	require.NoError(t, err)
+
+	var idx ocispecs.Index
+	err = json.Unmarshal(m["index.json"].Data, &idx)
+	require.NoError(t, err)
+
+	mlistHex := idx.Manifests[0].Digest.Hex()
+
+	idx = ocispecs.Index{}
+	err = json.Unmarshal(m["blobs/sha256/"+mlistHex].Data, &idx)
+	require.NoError(t, err)
+
+	require.Equal(t, 2, len(idx.Manifests))
+
+	for i, exp := range []struct {
+		p          string
+		entrypoint []string
+		env        []string
+	}{
+		{p: "windows/amd64", entrypoint: []string{"cmd", "/S", "/C", "foo bar"}, env: []string{"PATH=c:\\Windows\\System32;c:\\Windows"}},
+		{p: "linux/amd64", entrypoint: []string{"/bin/sh", "-c", "foo bar"}, env: []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}},
+	} {
+		t.Run(exp.p, func(t *testing.T) {
+			require.Equal(t, exp.p, platforms.Format(*idx.Manifests[i].Platform))
+
+			var mfst ocispecs.Manifest
+			err = json.Unmarshal(m["blobs/sha256/"+idx.Manifests[i].Digest.Hex()].Data, &mfst)
+			require.NoError(t, err)
+
+			require.Equal(t, 1, len(mfst.Layers))
+
+			var img ocispecs.Image
+			err = json.Unmarshal(m["blobs/sha256/"+mfst.Config.Digest.Hex()].Data, &img)
+			require.NoError(t, err)
+
+			require.Equal(t, exp.entrypoint, img.Config.Entrypoint)
+			require.Equal(t, exp.env, img.Config.Env)
+		})
+	}
 }
 
 func testExportMultiPlatform(t *testing.T, sb integration.Sandbox) {
@@ -1180,7 +1414,7 @@ COPY arch-$TARGETARCH whoami
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -1188,7 +1422,7 @@ COPY arch-$TARGETARCH whoami
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -1227,7 +1461,7 @@ COPY arch-$TARGETARCH whoami
 	outW, err := os.Create(out)
 	require.NoError(t, err)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -1250,13 +1484,13 @@ COPY arch-$TARGETARCH whoami
 	m, err := testutil.ReadTarToMap(dt, false)
 	require.NoError(t, err)
 
-	var idx ocispec.Index
+	var idx ocispecs.Index
 	err = json.Unmarshal(m["index.json"].Data, &idx)
 	require.NoError(t, err)
 
 	mlistHex := idx.Manifests[0].Digest.Hex()
 
-	idx = ocispec.Index{}
+	idx = ocispecs.Index{}
 	err = json.Unmarshal(m["blobs/sha256/"+mlistHex].Data, &idx)
 	require.NoError(t, err)
 
@@ -1275,7 +1509,7 @@ COPY arch-$TARGETARCH whoami
 		t.Run(exp.p, func(t *testing.T) {
 			require.Equal(t, exp.p, platforms.Format(*idx.Manifests[i].Platform))
 
-			var mfst ocispec.Manifest
+			var mfst ocispecs.Manifest
 			err = json.Unmarshal(m["blobs/sha256/"+idx.Manifests[i].Digest.Hex()].Data, &mfst)
 			require.NoError(t, err)
 
@@ -1285,7 +1519,7 @@ COPY arch-$TARGETARCH whoami
 			require.NoError(t, err)
 			require.Equal(t, exp.dt, string(m2["whoami"].Data))
 
-			var img ocispec.Image
+			var img ocispecs.Image
 			err = json.Unmarshal(m["blobs/sha256/"+mfst.Config.Digest.Hex()].Data, &img)
 			require.NoError(t, err)
 
@@ -1316,11 +1550,11 @@ COPY foo /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 		},
@@ -1342,7 +1576,7 @@ COPY foo /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -1380,11 +1614,11 @@ COPY foo /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 		},
@@ -1395,10 +1629,10 @@ COPY foo /
 	}, nil)
 	require.NoError(t, err)
 
-	du, err := c.DiskUsage(context.TODO())
+	du, err := c.DiskUsage(sb.Context())
 	require.NoError(t, err)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 		},
@@ -1409,7 +1643,7 @@ COPY foo /
 	}, nil)
 	require.NoError(t, err)
 
-	du2, err := c.DiskUsage(context.TODO())
+	du2, err := c.DiskUsage(sb.Context())
 	require.NoError(t, err)
 
 	require.Equal(t, len(du), len(du2))
@@ -1435,7 +1669,7 @@ COPY foo/sub bar
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -1443,7 +1677,7 @@ COPY foo/sub bar
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 		},
@@ -1480,7 +1714,7 @@ COPY sub/l* alllinks/
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -1488,7 +1722,7 @@ COPY sub/l* alllinks/
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -1553,11 +1787,11 @@ COPY --from=0 /foo /foo
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"context":  server.URL + "/df",
 			"filename": "mydockerfile", // this is bogus, any name should work
@@ -1596,12 +1830,12 @@ CMD ["test"]
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	target := "docker.io/moby/cmdoverridetest:latest"
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: client.ExporterImage,
@@ -1630,7 +1864,7 @@ ENTRYPOINT my entrypoint
 	defer os.RemoveAll(dir)
 
 	target = "docker.io/moby/cmdoverridetest2:latest"
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: client.ExporterImage,
@@ -1650,7 +1884,7 @@ ENTRYPOINT my entrypoint
 	require.NoError(t, err)
 	defer ctr.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 
 	img, err := ctr.ImageService().Get(ctx, target)
 	require.NoError(t, err)
@@ -1661,7 +1895,7 @@ ENTRYPOINT my entrypoint
 	dt, err := content.ReadBlob(ctx, ctr.ContentStore(), desc)
 	require.NoError(t, err)
 
-	var ociimg ocispec.Image
+	var ociimg ocispecs.Image
 	err = json.Unmarshal(dt, &ociimg)
 	require.NoError(t, err)
 
@@ -1688,12 +1922,12 @@ LABEL foo=bar
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	target := "docker.io/moby/testpullscratch:latest"
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: client.ExporterImage,
@@ -1723,7 +1957,7 @@ COPY foo .
 	defer os.RemoveAll(dir)
 
 	target = "docker.io/moby/testpullscratch2:latest"
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: client.ExporterImage,
@@ -1743,7 +1977,7 @@ COPY foo .
 	require.NoError(t, err)
 	defer ctr.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 
 	img, err := ctr.ImageService().Get(ctx, target)
 	require.NoError(t, err)
@@ -1754,7 +1988,7 @@ COPY foo .
 	dt, err := content.ReadBlob(ctx, ctr.ContentStore(), desc)
 	require.NoError(t, err)
 
-	var ociimg ocispec.Image
+	var ociimg ocispecs.Image
 	err = json.Unmarshal(dt, &ociimg)
 	require.NoError(t, err)
 
@@ -1771,14 +2005,14 @@ COPY foo .
 		Run(llb.Shlex(`sh -c "echo -n foo0 > /empty/foo"`)).
 		AddMount("/empty", llb.Image("docker.io/moby/testpullscratch:latest"))
 
-	def, err := echo.Marshal(context.TODO())
+	def, err := echo.Marshal(sb.Context())
 	require.NoError(t, err)
 
 	destDir, err := ioutil.TempDir("", "buildkit")
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = c.Solve(context.TODO(), def, client.SolveOpt{
+	_, err = c.Solve(sb.Context(), def, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -1811,11 +2045,11 @@ FROM busybox:${tag}
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:tag": "latest",
 		},
@@ -1920,7 +2154,38 @@ func testDockerfileInvalidCommand(t *testing.T, sb integration.Sandbox) {
 	err = cmd.Run()
 	require.Error(t, err)
 	require.Contains(t, stdout.String(), "/bin/sh -c invalidcmd")
-	require.Contains(t, stdout.String(), "executor failed running")
+	require.Contains(t, stdout.String(), "did not complete successfully")
+}
+
+func testDockerfileInvalidInstruction(t *testing.T, sb integration.Sandbox) {
+	skipDockerd(t, sb)
+	f := getFrontend(t, sb)
+	f.RequiresBuildctl(t)
+	dockerfile := []byte(`
+	FROM scratch
+	FNTRYPOINT ["/bin/sh", "-c", "echo invalidinstruction"]
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown instruction: FNTRYPOINT")
+	require.Contains(t, err.Error(), "did you mean ENTRYPOINT?")
 }
 
 func testDockerfileADDFromURL(t *testing.T, sb integration.Sandbox) {
@@ -2226,11 +2491,11 @@ ADD *.tar /dest
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -2262,7 +2527,7 @@ FROM busybox
 ARG group
 ENV owner 1000
 ADD --chown=${owner}:${group} foo /
-RUN [ "$(stat -c "%u %G" /foo)" == "1000 nogroup" ]
+RUN [ "$(stat -c "%u %G" /foo)" == "1000 nobody" ]
 `)
 
 	dir, err := tmpdir(
@@ -2272,14 +2537,14 @@ RUN [ "$(stat -c "%u %G" /foo)" == "1000 nogroup" ]
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
-			"build-arg:group":                   "nogroup",
+			"build-arg:group":                   "nobody",
 		},
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
@@ -2367,7 +2632,7 @@ ENV foo=bar
 	require.NoError(t, err)
 	defer client.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 
 	img, err := client.ImageService().Get(ctx, target)
 	require.NoError(t, err)
@@ -2378,7 +2643,7 @@ ENV foo=bar
 	dt, err := content.ReadBlob(ctx, client.ContentStore(), desc)
 	require.NoError(t, err)
 
-	var ociimg ocispec.Image
+	var ociimg ocispecs.Image
 	err = json.Unmarshal(dt, &ociimg)
 	require.NoError(t, err)
 
@@ -2421,12 +2686,12 @@ EXPOSE 5000
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	target := "example.com/moby/dockerfileexpansion:test"
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: client.ExporterImage,
@@ -2451,7 +2716,7 @@ EXPOSE 5000
 	require.NoError(t, err)
 	defer client.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 
 	img, err := client.ImageService().Get(ctx, target)
 	require.NoError(t, err)
@@ -2462,7 +2727,7 @@ EXPOSE 5000
 	dt, err := content.ReadBlob(ctx, client.ContentStore(), desc)
 	require.NoError(t, err)
 
-	var ociimg ocispec.Image
+	var ociimg ocispecs.Image
 	err = json.Unmarshal(dt, &ociimg)
 	require.NoError(t, err)
 
@@ -2506,7 +2771,7 @@ Dockerfile
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -2514,7 +2779,7 @@ Dockerfile
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -2568,7 +2833,7 @@ COPY . .
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(sb.Context(), 15*time.Second)
 	defer cancel()
 
 	c, err := client.New(ctx, sb.Address())
@@ -2588,6 +2853,34 @@ COPY . .
 		t.Fatal("timed out")
 	default:
 	}
+}
+
+// moby/moby#10858
+func testDockerfileLowercase(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`FROM scratch
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(ctx, c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
 }
 
 func testExportedHistory(t *testing.T, sb integration.Sandbox) {
@@ -2632,7 +2925,7 @@ RUN ["ls"]
 	require.NoError(t, err)
 	defer client.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 
 	img, err := client.ImageService().Get(ctx, target)
 	require.NoError(t, err)
@@ -2643,7 +2936,7 @@ RUN ["ls"]
 	dt, err := content.ReadBlob(ctx, client.ContentStore(), desc)
 	require.NoError(t, err)
 
-	var ociimg ocispec.Image
+	var ociimg ocispecs.Image
 	err = json.Unmarshal(dt, &ociimg)
 	require.NoError(t, err)
 
@@ -2748,7 +3041,7 @@ USER nobody
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -2756,7 +3049,7 @@ USER nobody
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -2780,7 +3073,7 @@ USER nobody
 
 	// test user in exported
 	target := "example.com/moby/dockerfileuser:test"
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: client.ExporterImage,
@@ -2805,7 +3098,7 @@ USER nobody
 	require.NoError(t, err)
 	defer client.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 
 	img, err := client.ImageService().Get(ctx, target)
 	require.NoError(t, err)
@@ -2816,7 +3109,7 @@ USER nobody
 	dt, err = content.ReadBlob(ctx, client.ContentStore(), desc)
 	require.NoError(t, err)
 
-	var ociimg ocispec.Image
+	var ociimg ocispecs.Image
 	err = json.Unmarshal(dt, &ociimg)
 	require.NoError(t, err)
 
@@ -2832,7 +3125,7 @@ FROM busybox AS base
 ENV owner 1000
 RUN mkdir -m 0777 /out
 COPY --chown=daemon foo /
-COPY --chown=1000:nogroup bar /baz
+COPY --chown=1000:nobody bar /baz
 ARG group
 COPY --chown=${owner}:${group} foo /foobis
 RUN stat -c "%U %G" /foo  > /out/fooowner
@@ -2851,7 +3144,7 @@ COPY --from=base /out /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -2859,7 +3152,7 @@ COPY --from=base /out /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -2868,7 +3161,7 @@ COPY --from=base /out /
 		},
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
-			"build-arg:group":                   "nogroup",
+			"build-arg:group":                   "nobody",
 		},
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
@@ -2883,11 +3176,11 @@ COPY --from=base /out /
 
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "subowner"))
 	require.NoError(t, err)
-	require.Equal(t, "1000 nogroup\n", string(dt))
+	require.Equal(t, "1000 nobody\n", string(dt))
 
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "foobisowner"))
 	require.NoError(t, err)
-	require.Equal(t, "1000 nogroup\n", string(dt))
+	require.Equal(t, "1000 nobody\n", string(dt))
 }
 
 func testCopyChmod(t *testing.T, sb integration.Sandbox) {
@@ -2918,7 +3211,7 @@ COPY --from=base /out /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -2926,7 +3219,7 @@ COPY --from=base /out /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -2986,7 +3279,7 @@ COPY files dest
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -2994,7 +3287,7 @@ COPY files dest
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -3038,7 +3331,7 @@ COPY $FOO baz
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -3046,7 +3339,7 @@ COPY $FOO baz
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -3097,7 +3390,7 @@ COPY sub/dir1 subdest6
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -3105,7 +3398,7 @@ COPY sub/dir1 subdest6
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -3200,11 +3493,11 @@ RUN sh -c "[ $(cat /test5/foo) = 'hello' ]"
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 		},
@@ -3214,6 +3507,66 @@ RUN sh -c "[ $(cat /test5/foo) = 'hello' ]"
 		},
 	}, nil)
 	require.NoError(t, err)
+}
+
+func testAddURLChmod(t *testing.T, sb integration.Sandbox) {
+	skipDockerd(t, sb)
+	f := getFrontend(t, sb)
+	f.RequiresBuildctl(t)
+
+	resp := httpserver.Response{
+		Etag:    identity.NewID(),
+		Content: []byte("content1"),
+	}
+	server := httpserver.NewTestServer(map[string]httpserver.Response{
+		"/foo": resp,
+	})
+	defer server.Close()
+
+	dockerfile := []byte(fmt.Sprintf(`
+FROM busybox AS build
+ADD --chmod=644 %[1]s /tmp/foo1
+ADD --chmod=755 %[1]s /tmp/foo2
+ADD --chmod=0413 %[1]s /tmp/foo3
+RUN stat -c "%%04a" /tmp/foo1 >> /dest && \
+	stat -c "%%04a" /tmp/foo2 >> /dest && \
+	stat -c "%%04a" /tmp/foo3 >> /dest
+
+FROM scratch
+COPY --from=build /dest /dest
+`, server.URL+"/foo"))
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	destDir, err := tmpdir()
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := ioutil.ReadFile(filepath.Join(destDir, "dest"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("0644\n0755\n0413\n"), dt)
 }
 
 func testDockerfileFromGit(t *testing.T, sb integration.Sandbox) {
@@ -3264,11 +3617,11 @@ COPY --from=build foo bar2
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"context": server.URL + "/.git#first",
 		},
@@ -3294,7 +3647,7 @@ COPY --from=build foo bar2
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"context": server.URL + "/.git",
 		},
@@ -3356,11 +3709,11 @@ COPY foo bar
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"context":  server.URL + "/myurl",
 			"filename": "mydockerfile",
@@ -3393,7 +3746,7 @@ COPY --from=busybox /etc/passwd test
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -3401,7 +3754,7 @@ COPY --from=busybox /etc/passwd test
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -3439,7 +3792,7 @@ COPY --from=golang /usr/bin/go go
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -3476,7 +3829,7 @@ COPY --from=stage1 baz bax
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -3484,7 +3837,7 @@ COPY --from=stage1 baz bax
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -3520,7 +3873,7 @@ LABEL foo=bar
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -3529,7 +3882,7 @@ LABEL foo=bar
 	defer os.RemoveAll(destDir)
 
 	target := "example.com/moby/dockerfilelabels:test"
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"label:bar": "baz",
 		},
@@ -3557,7 +3910,7 @@ LABEL foo=bar
 	require.NoError(t, err)
 	defer client.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 
 	img, err := client.ImageService().Get(ctx, target)
 	require.NoError(t, err)
@@ -3568,7 +3921,7 @@ LABEL foo=bar
 	dt, err := content.ReadBlob(ctx, client.ContentStore(), desc)
 	require.NoError(t, err)
 
-	var ociimg ocispec.Image
+	var ociimg ocispecs.Image
 	err = json.Unmarshal(dt, &ociimg)
 	require.NoError(t, err)
 
@@ -3579,6 +3932,52 @@ LABEL foo=bar
 	v, ok = ociimg.Config.Labels["bar"]
 	require.True(t, ok)
 	require.Equal(t, "baz", v)
+}
+
+// #2008
+func testWildcardRenameCache(t *testing.T, sb integration.Sandbox) {
+	skipDockerd(t, sb)
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM alpine
+COPY file* /files/
+RUN ls /files/file1
+`)
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("file1", []byte("foo"), 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	err = os.Rename(filepath.Join(dir, "file1"), filepath.Join(dir, "file2"))
+	require.NoError(t, err)
+
+	// cache should be invalidated and build should fail
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.Error(t, err)
 }
 
 func testOnBuildCleared(t *testing.T, sb integration.Sandbox) {
@@ -3601,13 +4000,13 @@ ONBUILD RUN mkdir -p /out && echo -n 11 >> /out/foo
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	target := registry + "/buildkit/testonbuild:base"
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: client.ExporterImage,
@@ -3636,7 +4035,7 @@ ONBUILD RUN mkdir -p /out && echo -n 11 >> /out/foo
 
 	target2 := registry + "/buildkit/testonbuild:child"
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: client.ExporterImage,
@@ -3669,7 +4068,7 @@ ONBUILD RUN mkdir -p /out && echo -n 11 >> /out/foo
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -3713,7 +4112,7 @@ COPY --from=base arch /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -3734,7 +4133,7 @@ COPY --from=base arch /
 	}
 	importCache := target + "-img"
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: client.ExporterImage,
@@ -3758,7 +4157,7 @@ COPY --from=base arch /
 	desc, provider, err := contentutil.ProviderFromRef(target + "-img")
 	require.NoError(t, err)
 
-	imgMap, err := readIndex(provider, desc)
+	imgMap, err := readIndex(sb.Context(), provider, desc)
 	require.NoError(t, err)
 
 	require.Equal(t, 2, len(imgMap))
@@ -3769,12 +4168,12 @@ COPY --from=base arch /
 	require.NotEqual(t, dtamd, dtarm)
 
 	for i := 0; i < 2; i++ {
-		err = c.Prune(context.TODO(), nil, client.PruneAll)
+		err = c.Prune(sb.Context(), nil, client.PruneAll)
 		require.NoError(t, err)
 
 		checkAllRemoved(t, c, sb)
 
-		_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+		_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 			FrontendAttrs: map[string]string{
 				"cache-from": importCache,
 				"platform":   "linux/amd64,linux/arm/v7",
@@ -3801,7 +4200,7 @@ COPY --from=base arch /
 
 		require.Equal(t, desc.Digest, desc2.Digest)
 
-		imgMap, err = readIndex(provider, desc2)
+		imgMap, err = readIndex(sb.Context(), provider, desc2)
 		require.NoError(t, err)
 
 		require.Equal(t, 2, len(imgMap))
@@ -3841,7 +4240,7 @@ COPY --from=base unique /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -3851,7 +4250,7 @@ COPY --from=base unique /
 
 	target := registry + "/buildkit/testexportdf:latest"
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -3878,7 +4277,7 @@ COPY --from=base unique /
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "unique"))
 	require.NoError(t, err)
 
-	err = c.Prune(context.TODO(), nil, client.PruneAll)
+	err = c.Prune(sb.Context(), nil, client.PruneAll)
 	require.NoError(t, err)
 
 	checkAllRemoved(t, c, sb)
@@ -3887,7 +4286,7 @@ COPY --from=base unique /
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"cache-from": target,
 		},
@@ -3934,7 +4333,7 @@ RUN echo bar > bar
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -3959,13 +4358,13 @@ RUN echo bar > bar
 		},
 	}
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	target2 := "example.com/moby/dockerfileids2:test"
 	opt.Exports[0].Attrs["name"] = target2
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	cdAddress := sb.ContainerdAddress()
@@ -3977,7 +4376,7 @@ RUN echo bar > bar
 	require.NoError(t, err)
 	defer client.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 
 	img, err := client.ImageService().Get(ctx, target)
 	require.NoError(t, err)
@@ -4015,7 +4414,7 @@ RUN echo bar > bar
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -4051,9 +4450,9 @@ RUN echo bar > bar
 	require.NoError(t, err)
 	defer ctd.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	img, err := ctd.ImageService().Get(ctx, target)
@@ -4062,7 +4461,7 @@ RUN echo bar > bar
 	err = ctd.ImageService().Delete(ctx, target)
 	require.NoError(t, err)
 
-	err = c.Prune(context.TODO(), nil, client.PruneAll)
+	err = c.Prune(sb.Context(), nil, client.PruneAll)
 	require.NoError(t, err)
 
 	checkAllRemoved(t, c, sb)
@@ -4072,7 +4471,7 @@ RUN echo bar > bar
 	opt.Exports[0].Attrs["name"] = target2
 	opt.FrontendAttrs["cache-from"] = cacheTarget
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	img2, err := ctd.ImageService().Get(ctx, target2)
@@ -4099,7 +4498,7 @@ COPY --from=s1 unique2 /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -4121,7 +4520,7 @@ COPY --from=s1 unique2 /
 		},
 	}
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	destDir2, err := ioutil.TempDir("", "buildkit")
@@ -4131,7 +4530,7 @@ COPY --from=s1 unique2 /
 	opt.FrontendAttrs["no-cache"] = ""
 	opt.Exports[0].OutputDir = destDir2
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	unique1Dir1, err := ioutil.ReadFile(filepath.Join(destDir, "unique"))
@@ -4156,7 +4555,7 @@ COPY --from=s1 unique2 /
 	opt.FrontendAttrs["no-cache"] = "s1"
 	opt.Exports[0].OutputDir = destDir3
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	unique1Dir3, err := ioutil.ReadFile(filepath.Join(destDir3, "unique"))
@@ -4187,7 +4586,7 @@ COPY foo2 bar2
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -4208,7 +4607,7 @@ COPY foo2 bar2
 		},
 	}
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	dt, err := ioutil.ReadFile(filepath.Join(destDir, "bar"))
@@ -4238,7 +4637,7 @@ COPY --from=build out .
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -4263,7 +4662,7 @@ COPY --from=build out .
 		},
 	}
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	dt, err := ioutil.ReadFile(filepath.Join(destDir, "platform"))
@@ -4294,7 +4693,7 @@ COPY --from=build /out /
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -4320,7 +4719,7 @@ COPY --from=build /out /
 		},
 	}
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out"))
@@ -4349,7 +4748,7 @@ COPY --from=build /out /
 		},
 	}
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "out"))
@@ -4378,7 +4777,7 @@ COPY --from=build /out /
 		},
 	}
 
-	_, err = f.Solve(context.TODO(), c, opt, nil)
+	_, err = f.Solve(sb.Context(), c, opt, nil)
 	require.NoError(t, err)
 
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "out"))
@@ -4420,14 +4819,14 @@ COPY foo /
 	err = tw.Close()
 	require.NoError(t, err)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	up := uploadprovider.New()
 	url := up.Add(buf)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 			"context":                           url,
@@ -4467,7 +4866,7 @@ COPY foo bar
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -4479,7 +4878,7 @@ COPY foo bar
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		FrontendAttrs: map[string]string{
 			"build-arg:BUILDKIT_DISABLE_FILEOP": strconv.FormatBool(!isFileOp),
 			"context":                           url,
@@ -4505,7 +4904,7 @@ COPY foo bar
 }
 
 func testFrontendUseForwardedSolveResults(t *testing.T, sb integration.Sandbox) {
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -4542,7 +4941,7 @@ COPY foo foo2
 			llb.Copy(st2, "foo2", "foo3"),
 		)
 
-		def, err := st.Marshal(context.TODO())
+		def, err := st.Marshal(sb.Context())
 		if err != nil {
 			return nil, err
 		}
@@ -4556,7 +4955,7 @@ COPY foo foo2
 	require.NoError(t, err)
 	defer os.RemoveAll(destDir)
 
-	_, err = c.Build(context.TODO(), client.SolveOpt{
+	_, err = c.Build(sb.Context(), client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -4578,7 +4977,7 @@ COPY foo foo2
 func testFrontendInputs(t *testing.T, sb integration.Sandbox) {
 	f := getFrontend(t, sb)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -4590,10 +4989,10 @@ func testFrontendInputs(t *testing.T, sb integration.Sandbox) {
 		llb.Shlex(`sh -c "cat /dev/urandom | head -c 100 | sha256sum > /out/foo"`),
 	).AddMount("/out", llb.Scratch())
 
-	def, err := outMount.Marshal(context.TODO())
+	def, err := outMount.Marshal(sb.Context())
 	require.NoError(t, err)
 
-	_, err = c.Solve(context.TODO(), def, client.SolveOpt{
+	_, err = c.Solve(sb.Context(), def, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -4617,7 +5016,7 @@ COPY foo foo2
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type:      client.ExporterLocal,
@@ -4638,6 +5037,233 @@ COPY foo foo2
 	require.Equal(t, expected, actual)
 }
 
+func testFrontendSubrequests(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	dockerfile := []byte(`
+FROM scratch
+COPY Dockerfile Dockerfile
+`)
+
+	if gf, ok := f.(*gatewayFrontend); ok {
+		dockerfile = []byte(fmt.Sprintf("#syntax=%s\n\n%s", gf.gw, dockerfile))
+	}
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	called := false
+
+	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		reqs, err := subrequests.Describe(ctx, c)
+		require.NoError(t, err)
+
+		require.True(t, len(reqs) > 0)
+
+		hasDescribe := false
+
+		for _, req := range reqs {
+			if req.Name == "frontend.subrequests.describe" {
+				hasDescribe = true
+				require.Equal(t, subrequests.RequestType("rpc"), req.Type)
+				require.NotEqual(t, req.Version, "")
+				require.True(t, len(req.Metadata) > 0)
+			}
+		}
+		require.True(t, hasDescribe)
+
+		_, err = c.Solve(ctx, gateway.SolveRequest{
+			FrontendOpt: map[string]string{
+				"requestid":     "frontend.subrequests.notexist",
+				"frontend.caps": "moby.buildkit.frontend.subrequests",
+			},
+			Frontend: "dockerfile.v0",
+		})
+		require.Error(t, err)
+		var reqErr *errdefs.UnsupportedSubrequestError
+		require.True(t, errors.As(err, &reqErr))
+		require.Equal(t, "frontend.subrequests.notexist", reqErr.GetName())
+
+		_, err = c.Solve(ctx, gateway.SolveRequest{
+			FrontendOpt: map[string]string{
+				"frontend.caps": "moby.buildkit.frontend.notexistcap",
+			},
+			Frontend: "dockerfile.v0",
+		})
+		require.Error(t, err)
+		var capErr *errdefs.UnsupportedFrontendCapError
+		require.True(t, errors.As(err, &capErr))
+		require.Equal(t, "moby.buildkit.frontend.notexistcap", capErr.GetName())
+
+		called = true
+		return nil, nil
+	}
+
+	_, err = c.Build(sb.Context(), client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+		},
+	}, "", frontend, nil)
+	require.NoError(t, err)
+
+	require.True(t, called)
+}
+
+// moby/buildkit#1301
+func testDockefileCheckHostname(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+	dockerfile := []byte(`
+FROM busybox
+RUN cat /etc/hosts | grep foo
+RUN echo $HOSTNAME | grep foo
+RUN echo $(hostname) | grep foo
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	cases := []struct {
+		name  string
+		attrs map[string]string
+	}{
+		{
+			name: "meta",
+			attrs: map[string]string{
+				"hostname": "foo",
+			},
+		},
+		{
+			name: "arg",
+			attrs: map[string]string{
+				"build-arg:BUILDKIT_SANDBOX_HOSTNAME": "foo",
+			},
+		},
+		{
+			name: "meta and arg",
+			attrs: map[string]string{
+				"hostname":                            "bar",
+				"build-arg:BUILDKIT_SANDBOX_HOSTNAME": "foo",
+			},
+		},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+				FrontendAttrs: tt.attrs,
+				LocalDirs: map[string]string{
+					builder.DefaultLocalNameDockerfile: dir,
+					builder.DefaultLocalNameContext:    dir,
+				},
+			}, nil)
+			require.NoError(t, err)
+		})
+	}
+}
+
+// moby/buildkit#2311
+func testBuildInfo(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	gitDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(gitDir)
+
+	dockerfile := `
+ARG DOCKERFILE_VERSION="1.3.0"
+FROM docker/dockerfile-upstream:${DOCKERFILE_VERSION} AS dockerfile
+FROM docker.io/docker/buildx-bin:0.6.1@sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0 AS buildx
+FROM busybox:latest
+ADD https://raw.githubusercontent.com/moby/moby/master/README.md /
+COPY --from=dockerfile /bin/dockerfile-frontend /tmp/
+COPY --from=buildx /buildx /usr/libexec/docker/cli-plugins/docker-buildx
+`
+
+	err = ioutil.WriteFile(filepath.Join(gitDir, "Dockerfile"), []byte(dockerfile), 0600)
+	require.NoError(t, err)
+
+	err = runShell(gitDir,
+		"git init",
+		"git config --local user.email test",
+		"git config --local user.name test",
+		"git add Dockerfile",
+		"git commit -m initial",
+		"git branch buildinfo",
+		"git update-server-info",
+	)
+	require.NoError(t, err)
+
+	server := httptest.NewServer(http.FileServer(http.Dir(filepath.Join(gitDir))))
+	defer server.Close()
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	out := filepath.Join(destDir, "out.tar")
+	outW, err := os.Create(out)
+	require.NoError(t, err)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	res, err := f.Solve(sb.Context(), c, client.SolveOpt{
+		Exports: []client.ExportEntry{
+			{
+				Type:   client.ExporterOCI,
+				Output: fixedWriteCloser(outW),
+			},
+		},
+		FrontendAttrs: map[string]string{
+			builder.DefaultLocalNameContext: server.URL + "/.git#buildinfo",
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	require.Contains(t, res.ExporterResponse, exptypes.ExporterBuildInfo)
+	dtbi, err := base64.StdEncoding.DecodeString(res.ExporterResponse[exptypes.ExporterBuildInfo])
+	require.NoError(t, err)
+
+	var bi map[string][]exptypes.BuildInfo
+	err = json.Unmarshal(dtbi, &bi)
+	require.NoError(t, err)
+
+	_, ok := bi["sources"]
+	require.True(t, ok)
+	require.Equal(t, 4, len(bi["sources"]))
+
+	assert.Equal(t, exptypes.BuildInfoTypeDockerImage, bi["sources"][0].Type)
+	assert.Equal(t, "docker.io/docker/buildx-bin:0.6.1@sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0", bi["sources"][0].Ref)
+	assert.Equal(t, "sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0", bi["sources"][0].Pin)
+
+	assert.Equal(t, exptypes.BuildInfoTypeDockerImage, bi["sources"][1].Type)
+	assert.Equal(t, "docker.io/docker/dockerfile-upstream:1.3.0", bi["sources"][1].Ref)
+	assert.Equal(t, "sha256:9e2c9eca7367393aecc68795c671f93466818395a2693498debe831fd67f5e89", bi["sources"][1].Pin)
+
+	assert.Equal(t, exptypes.BuildInfoTypeDockerImage, bi["sources"][2].Type)
+	assert.Equal(t, "docker.io/library/busybox:latest", bi["sources"][2].Ref)
+	assert.NotEmpty(t, bi["sources"][2].Pin)
+
+	assert.Equal(t, exptypes.BuildInfoTypeHTTP, bi["sources"][3].Type)
+	assert.Equal(t, "https://raw.githubusercontent.com/moby/moby/master/README.md", bi["sources"][3].Ref)
+	assert.Equal(t, "sha256:419455202b0ef97e480d7f8199b26a721a417818bc0e2d106975f74323f25e6c", bi["sources"][3].Pin)
+}
+
 func tmpdir(appliers ...fstest.Applier) (string, error) {
 	tmpdir, err := ioutil.TempDir("", "buildkit-dockerfile")
 	if err != nil {
@@ -4651,7 +5277,12 @@ func tmpdir(appliers ...fstest.Applier) (string, error) {
 
 func runShell(dir string, cmds ...string) error {
 	for _, args := range cmds {
-		cmd := exec.Command("sh", "-c", args)
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("powershell", "-command", args)
+		} else {
+			cmd = exec.Command("sh", "-c", args)
+		}
 		cmd.Dir = dir
 		if err := cmd.Run(); err != nil {
 			return errors.Wrapf(err, "error running %v", args)
@@ -4665,7 +5296,7 @@ func checkAllRemoved(t *testing.T, c *client.Client, sb integration.Sandbox) {
 	for {
 		require.True(t, 20 > retries)
 		retries++
-		du, err := c.DiskUsage(context.TODO())
+		du, err := c.DiskUsage(sb.Context())
 		require.NoError(t, err)
 		if len(du) > 0 {
 			time.Sleep(500 * time.Millisecond)
@@ -4681,7 +5312,7 @@ loop0:
 	for {
 		require.True(t, 20 > retries)
 		retries++
-		du, err := c.DiskUsage(context.TODO())
+		du, err := c.DiskUsage(sb.Context())
 		require.NoError(t, err)
 		for _, d := range du {
 			if d.InUse {
@@ -4692,10 +5323,10 @@ loop0:
 		break
 	}
 
-	err := c.Prune(context.TODO(), nil, client.PruneAll)
+	err := c.Prune(sb.Context(), nil, client.PruneAll)
 	require.NoError(t, err)
 
-	du, err := c.DiskUsage(context.TODO())
+	du, err := c.DiskUsage(sb.Context())
 	require.NoError(t, err)
 	require.Equal(t, 0, len(du))
 
@@ -4711,7 +5342,7 @@ loop0:
 	require.NoError(t, err)
 	defer client.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(sb.Context(), "buildkit")
 	snapshotService := client.SnapshotService("overlayfs")
 
 	retries = 0
@@ -4870,17 +5501,16 @@ func fixedWriteCloser(wc io.WriteCloser) func(map[string]string) (io.WriteCloser
 }
 
 type imageInfo struct {
-	desc   ocispec.Descriptor
+	desc   ocispecs.Descriptor
 	layers []map[string]*testutil.TarItem
 }
 
-func readIndex(p content.Provider, desc ocispec.Descriptor) (map[string]*imageInfo, error) {
-	ctx := context.TODO()
+func readIndex(ctx context.Context, p content.Provider, desc ocispecs.Descriptor) (map[string]*imageInfo, error) {
 	dt, err := content.ReadBlob(ctx, p, desc)
 	if err != nil {
 		return nil, err
 	}
-	var idx ocispec.Index
+	var idx ocispecs.Index
 	if err := json.Unmarshal(dt, &idx); err != nil {
 		return nil, err
 	}
@@ -4888,7 +5518,7 @@ func readIndex(p content.Provider, desc ocispec.Descriptor) (map[string]*imageIn
 	mi := map[string]*imageInfo{}
 
 	for _, m := range idx.Manifests {
-		img, err := readImage(p, m)
+		img, err := readImage(ctx, p, m)
 		if err != nil {
 			return nil, err
 		}
@@ -4896,16 +5526,15 @@ func readIndex(p content.Provider, desc ocispec.Descriptor) (map[string]*imageIn
 	}
 	return mi, nil
 }
-func readImage(p content.Provider, desc ocispec.Descriptor) (*imageInfo, error) {
+func readImage(ctx context.Context, p content.Provider, desc ocispecs.Descriptor) (*imageInfo, error) {
 	ii := &imageInfo{desc: desc}
 
-	ctx := context.TODO()
 	dt, err := content.ReadBlob(ctx, p, desc)
 	if err != nil {
 		return nil, err
 	}
 
-	var mfst ocispec.Manifest
+	var mfst ocispecs.Manifest
 	if err := json.Unmarshal(dt, &mfst); err != nil {
 		return nil, err
 	}

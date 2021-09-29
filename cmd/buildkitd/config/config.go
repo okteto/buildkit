@@ -1,5 +1,9 @@
 package config
 
+import (
+	resolverconfig "github.com/moby/buildkit/util/resolver/config"
+)
+
 // Config provides containerd configuration data for the server
 type Config struct {
 	Debug bool `toml:"debug"`
@@ -7,7 +11,7 @@ type Config struct {
 	// Root is the path to a directory where buildkit will store persistent data
 	Root string `toml:"root"`
 
-	//Entitlements e.g. security.insecure, network.host
+	// Entitlements e.g. security.insecure, network.host
 	Entitlements []string `toml:"insecure-entitlements"`
 	// GRPC configuration settings
 	GRPC GRPCConfig `toml:"grpc"`
@@ -17,7 +21,7 @@ type Config struct {
 		Containerd ContainerdConfig `toml:"containerd"`
 	} `toml:"worker"`
 
-	Registries map[string]RegistryConfig `toml:"registry"`
+	Registries map[string]resolverconfig.RegistryConfig `toml:"registry"`
 
 	DNS *DNSConfig `toml:"dns"`
 }
@@ -25,26 +29,12 @@ type Config struct {
 type GRPCConfig struct {
 	Address      []string `toml:"address"`
 	DebugAddress string   `toml:"debugAddress"`
-	UID          int      `toml:"uid"`
-	GID          int      `toml:"gid"`
+	UID          *int     `toml:"uid"`
+	GID          *int     `toml:"gid"`
 
 	TLS TLSConfig `toml:"tls"`
 	// MaxRecvMsgSize int    `toml:"max_recv_message_size"`
 	// MaxSendMsgSize int    `toml:"max_send_message_size"`
-}
-
-type RegistryConfig struct {
-	Mirrors      []string     `toml:"mirrors"`
-	PlainHTTP    *bool        `toml:"http"`
-	Insecure     *bool        `toml:"insecure"`
-	RootCAs      []string     `toml:"ca"`
-	KeyPairs     []TLSKeyPair `toml:"keypair"`
-	TLSConfigDir []string     `toml:"tlsconfigdir"`
-}
-
-type TLSKeyPair struct {
-	Key         string `toml:"key"`
-	Certificate string `toml:"cert"`
 }
 
 type TLSConfig struct {
@@ -78,7 +68,20 @@ type OCIConfig struct {
 	// incomplete and the intention is to make it default without config.
 	UserRemapUnsupported string `toml:"userRemapUnsupported"`
 	// For use in storing the OCI worker binary name that will replace buildkit-runc
-	Binary string `toml:"binary"`
+	Binary               string `toml:"binary"`
+	ProxySnapshotterPath string `toml:"proxySnapshotterPath"`
+
+	// StargzSnapshotterConfig is configuration for stargz snapshotter.
+	// We use a generic map[string]interface{} in order to remove the dependency
+	// on stargz snapshotter's config pkg from our config.
+	StargzSnapshotterConfig map[string]interface{} `toml:"stargzSnapshotter"`
+
+	// ApparmorProfile is the name of the apparmor profile that should be used to constrain build containers.
+	// The profile should already be loaded (by a higher level system) before creating a worker.
+	ApparmorProfile string `toml:"apparmor-profile"`
+
+	// MaxParallelism is the maximum number of parallel build steps that can be run at the same time.
+	MaxParallelism int `toml:"max-parallelism"`
 }
 
 type ContainerdConfig struct {
@@ -89,6 +92,13 @@ type ContainerdConfig struct {
 	Namespace string            `toml:"namespace"`
 	GCConfig
 	NetworkConfig
+	Snapshotter string `toml:"snapshotter"`
+
+	// ApparmorProfile is the name of the apparmor profile that should be used to constrain build containers.
+	// The profile should already be loaded (by a higher level system) before creating a worker.
+	ApparmorProfile string `toml:"apparmor-profile"`
+
+	MaxParallelism int `toml:"max-parallelism"`
 }
 
 type GCPolicy struct {

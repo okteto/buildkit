@@ -2,7 +2,7 @@ package llb
 
 import (
 	"context"
-	_ "crypto/sha256"
+	_ "crypto/sha256" // for opencontainers/go-digest
 	"encoding/json"
 	"os"
 	"strconv"
@@ -11,6 +11,8 @@ import (
 	"github.com/docker/distribution/reference"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/apicaps"
+	"github.com/moby/buildkit/util/gitutil"
+	"github.com/moby/buildkit/util/sshutil"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 )
@@ -34,7 +36,7 @@ func NewSource(id string, attrs map[string]string, c Constraints) *SourceOp {
 	return s
 }
 
-func (s *SourceOp) Validate(ctx context.Context) error {
+func (s *SourceOp) Validate(ctx context.Context, c *Constraints) error {
 	if s.err != nil {
 		return s.err
 	}
@@ -48,7 +50,7 @@ func (s *SourceOp) Marshal(ctx context.Context, constraints *Constraints) (diges
 	if s.Cached(constraints) {
 		return s.Load()
 	}
-	if err := s.Validate(ctx); err != nil {
+	if err := s.Validate(ctx, constraints); err != nil {
 		return "", nil, nil, nil, err
 	}
 
@@ -119,9 +121,13 @@ func Image(ref string, opts ...ImageOption) State {
 		src.err = err
 	} else if info.metaResolver != nil {
 		if _, ok := r.(reference.Digested); ok || !info.resolveDigest {
-			return NewState(src.Output()).Async(func(ctx context.Context, st State) (State, error) {
+			return NewState(src.Output()).Async(func(ctx context.Context, st State, c *Constraints) (State, error) {
+				p := info.Constraints.Platform
+				if p == nil {
+					p = c.Platform
+				}
 				_, dt, err := info.metaResolver.ResolveImageConfig(ctx, ref, ResolveImageConfigOpt{
-					Platform:    info.Constraints.Platform,
+					Platform:    p,
 					ResolveMode: info.resolveMode.String(),
 				})
 				if err != nil {
@@ -130,9 +136,13 @@ func Image(ref string, opts ...ImageOption) State {
 				return st.WithImageConfig(dt)
 			})
 		}
-		return Scratch().Async(func(ctx context.Context, _ State) (State, error) {
+		return Scratch().Async(func(ctx context.Context, _ State, c *Constraints) (State, error) {
+			p := info.Constraints.Platform
+			if p == nil {
+				p = c.Platform
+			}
 			dgst, dt, err := info.metaResolver.ResolveImageConfig(context.TODO(), ref, ResolveImageConfigOpt{
-				Platform:    info.Constraints.Platform,
+				Platform:    p,
 				ResolveMode: info.resolveMode.String(),
 			})
 			if err != nil {
@@ -198,15 +208,22 @@ type ImageInfo struct {
 }
 
 func Git(remote, ref string, opts ...GitOption) State {
-	url := ""
+	url := strings.Split(remote, "#")[0]
 
-	for _, prefix := range []string{
-		"http://", "https://", "git://", "git@",
-	} {
-		if strings.HasPrefix(remote, prefix) {
-			url = strings.Split(remote, "#")[0]
-			remote = strings.TrimPrefix(remote, prefix)
+	var protocolType int
+	remote, protocolType = gitutil.ParseProtocol(remote)
+
+	var sshHost string
+	if protocolType == gitutil.SSHProtocol {
+		parts := strings.SplitN(remote, ":", 2)
+		if len(parts) == 2 {
+			sshHost = parts[0]
+			// keep remote consistent with http(s) version
+			remote = parts[0] + "/" + parts[1]
 		}
+	}
+	if protocolType == gitutil.UnknownProtocol {
+		url = "https://" + url
 	}
 
 	id := remote
@@ -233,11 +250,34 @@ func Git(remote, ref string, opts ...GitOption) State {
 	}
 	if gi.AuthTokenSecret != "" {
 		attrs[pb.AttrAuthTokenSecret] = gi.AuthTokenSecret
-		addCap(&gi.Constraints, pb.CapSourceGitHttpAuth)
+		if gi.addAuthCap {
+			addCap(&gi.Constraints, pb.CapSourceGitHTTPAuth)
+		}
 	}
 	if gi.AuthHeaderSecret != "" {
 		attrs[pb.AttrAuthHeaderSecret] = gi.AuthHeaderSecret
-		addCap(&gi.Constraints, pb.CapSourceGitHttpAuth)
+		if gi.addAuthCap {
+			addCap(&gi.Constraints, pb.CapSourceGitHTTPAuth)
+		}
+	}
+	if protocolType == gitutil.SSHProtocol {
+		if gi.KnownSSHHosts != "" {
+			attrs[pb.AttrKnownSSHHosts] = gi.KnownSSHHosts
+		} else if sshHost != "" {
+			keyscan, err := sshutil.SSHKeyScan(sshHost)
+			if err == nil {
+				// best effort
+				attrs[pb.AttrKnownSSHHosts] = keyscan
+			}
+		}
+		addCap(&gi.Constraints, pb.CapSourceGitKnownSSHHosts)
+
+		if gi.MountSSHSock == "" {
+			attrs[pb.AttrMountSSHSock] = "default"
+		} else {
+			attrs[pb.AttrMountSSHSock] = gi.MountSSHSock
+		}
+		addCap(&gi.Constraints, pb.CapSourceGitMountSSHSock)
 	}
 
 	addCap(&gi.Constraints, pb.CapSourceGit)
@@ -260,6 +300,9 @@ type GitInfo struct {
 	KeepGitDir       bool
 	AuthTokenSecret  string
 	AuthHeaderSecret string
+	addAuthCap       bool
+	KnownSSHHosts    string
+	MountSSHSock     string
 }
 
 func KeepGitDir() GitOption {
@@ -271,12 +314,27 @@ func KeepGitDir() GitOption {
 func AuthTokenSecret(v string) GitOption {
 	return gitOptionFunc(func(gi *GitInfo) {
 		gi.AuthTokenSecret = v
+		gi.addAuthCap = true
 	})
 }
 
 func AuthHeaderSecret(v string) GitOption {
 	return gitOptionFunc(func(gi *GitInfo) {
 		gi.AuthHeaderSecret = v
+		gi.addAuthCap = true
+	})
+}
+
+func KnownSSHHosts(key string) GitOption {
+	key = strings.TrimSuffix(key, "\n")
+	return gitOptionFunc(func(gi *GitInfo) {
+		gi.KnownSSHHosts = gi.KnownSSHHosts + key + "\n"
+	})
+}
+
+func MountSSHSock(sshID string) GitOption {
+	return gitOptionFunc(func(gi *GitInfo) {
+		gi.MountSSHSock = sshID
 	})
 }
 
@@ -310,6 +368,12 @@ func Local(name string, opts ...LocalOption) State {
 	if gi.SharedKeyHint != "" {
 		attrs[pb.AttrSharedKeyHint] = gi.SharedKeyHint
 		addCap(&gi.Constraints, pb.CapSourceLocalSharedKeyHint)
+	}
+	if gi.Differ.Type != "" {
+		attrs[pb.AttrLocalDiffer] = string(gi.Differ.Type)
+		if gi.Differ.Required {
+			addCap(&gi.Constraints, pb.CapSourceLocalDiffer)
+		}
 	}
 
 	addCap(&gi.Constraints, pb.CapSourceLocal)
@@ -373,6 +437,32 @@ func SharedKeyHint(h string) LocalOption {
 	})
 }
 
+func Differ(t DiffType, required bool) LocalOption {
+	return localOptionFunc(func(li *LocalInfo) {
+		li.Differ = DifferInfo{
+			Type:     t,
+			Required: required,
+		}
+	})
+}
+
+type DiffType string
+
+const (
+	// DiffNone will do no file comparisons, all files in the Local source will
+	// be retransmitted.
+	DiffNone DiffType = pb.AttrLocalDifferNone
+	// DiffMetadata will compare file metadata (size, modified time, mode, owner,
+	// group, device and link name) to determine if the files in the Local source need
+	// to be retransmitted.  This is the default behavior.
+	DiffMetadata DiffType = pb.AttrLocalDifferMetadata
+)
+
+type DifferInfo struct {
+	Type     DiffType
+	Required bool
+}
+
 type LocalInfo struct {
 	constraintsWrapper
 	SessionID       string
@@ -380,6 +470,7 @@ type LocalInfo struct {
 	ExcludePatterns string
 	FollowPaths     string
 	SharedKeyHint   string
+	Differ          DifferInfo
 }
 
 func HTTP(url string, opts ...HTTPOption) State {

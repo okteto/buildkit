@@ -2,6 +2,8 @@ package containerdexecutor
 
 import (
 	"context"
+	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,21 +11,23 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/moby/buildkit/util/bklog"
+
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
+	"github.com/containerd/containerd/mount"
 	containerdoci "github.com/containerd/containerd/oci"
 	"github.com/containerd/continuity/fs"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/executor/oci"
+	gatewayapi "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/network"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 type containerdExecutor struct {
@@ -34,10 +38,12 @@ type containerdExecutor struct {
 	dnsConfig        *oci.DNSConfig
 	running          map[string]chan error
 	mu               sync.Mutex
+	apparmorProfile  string
+	traceSocket      string
 }
 
 // New creates a new executor backed by connection to containerd API
-func New(client *containerd.Client, root, cgroup string, networkProviders map[pb.NetMode]network.Provider, dnsConfig *oci.DNSConfig) executor.Executor {
+func New(client *containerd.Client, root, cgroup string, networkProviders map[pb.NetMode]network.Provider, dnsConfig *oci.DNSConfig, apparmorProfile string, traceSocket string) executor.Executor {
 	// clean up old hosts/resolv.conf file. ignore errors
 	os.RemoveAll(filepath.Join(root, "hosts"))
 	os.RemoveAll(filepath.Join(root, "resolv.conf"))
@@ -49,10 +55,12 @@ func New(client *containerd.Client, root, cgroup string, networkProviders map[pb
 		cgroupParent:     cgroup,
 		dnsConfig:        dnsConfig,
 		running:          make(map[string]chan error),
+		apparmorProfile:  apparmorProfile,
+		traceSocket:      traceSocket,
 	}
 }
 
-func (w *containerdExecutor) Run(ctx context.Context, id string, root cache.Mountable, mounts []executor.Mount, process executor.ProcessInfo, started chan<- struct{}) (err error) {
+func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.Mount, mounts []executor.Mount, process executor.ProcessInfo, started chan<- struct{}) (err error) {
 	if id == "" {
 		id = identity.NewID()
 	}
@@ -82,7 +90,7 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root cache.Moun
 		return err
 	}
 
-	hostsFile, clean, err := oci.GetHostsFile(ctx, w.root, meta.ExtraHosts, nil)
+	hostsFile, clean, err := oci.GetHostsFile(ctx, w.root, meta.ExtraHosts, nil, meta.Hostname)
 	if err != nil {
 		return err
 	}
@@ -90,7 +98,7 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root cache.Moun
 		defer clean()
 	}
 
-	mountable, err := root.Mount(ctx, false)
+	mountable, err := root.Src.Mount(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -103,17 +111,19 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root cache.Moun
 		defer release()
 	}
 
+	lm := snapshot.LocalMounterWithMounts(rootMounts)
+	rootfsPath, err := lm.Mount()
+	if err != nil {
+		return err
+	}
+	defer lm.Unmount()
+	defer executor.MountStubsCleaner(rootfsPath, mounts)()
+
 	var sgids []uint32
 	uid, gid, err := oci.ParseUIDGID(meta.User)
 	if err != nil {
-		lm := snapshot.LocalMounterWithMounts(rootMounts)
-		rootfsPath, err := lm.Mount()
+		uid, gid, sgids, err = oci.GetUser(rootfsPath, meta.User)
 		if err != nil {
-			return err
-		}
-		uid, gid, sgids, err = oci.GetUser(ctx, rootfsPath, meta.User)
-		if err != nil {
-			lm.Unmount()
 			return err
 		}
 
@@ -124,17 +134,13 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root cache.Moun
 
 		newp, err := fs.RootPath(rootfsPath, meta.Cwd)
 		if err != nil {
-			lm.Unmount()
 			return errors.Wrapf(err, "working dir %s points to invalid target", newp)
 		}
 		if _, err := os.Stat(newp); err != nil {
 			if err := idtools.MkdirAllAndChown(newp, 0755, identity); err != nil {
-				lm.Unmount()
 				return errors.Wrapf(err, "failed to create working directory %s", newp)
 			}
 		}
-
-		lm.Unmount()
 	}
 
 	provider, ok := w.networkProviders[meta.NetMode]
@@ -148,7 +154,7 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root cache.Moun
 	defer namespace.Close()
 
 	if meta.NetMode == pb.NetMode_HOST {
-		logrus.Info("enabling HostNetworking")
+		bklog.G(ctx).Info("enabling HostNetworking")
 	}
 
 	opts := []containerdoci.SpecOpts{oci.WithUIDGID(uid, gid, sgids)}
@@ -167,11 +173,12 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root cache.Moun
 		opts = append(opts, containerdoci.WithCgroup(cgroupsPath))
 	}
 	processMode := oci.ProcessSandbox // FIXME(AkihiroSuda)
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, processMode, nil, opts...)
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, processMode, nil, w.apparmorProfile, w.traceSocket, opts...)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+	spec.Process.Terminal = meta.Tty
 
 	container, err := w.client.NewContainer(ctx, id,
 		containerd.WithSpec(spec),
@@ -186,68 +193,38 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root cache.Moun
 		}
 	}()
 
+	fixProcessOutput(&process)
 	cioOpts := []cio.Opt{cio.WithStreams(process.Stdin, process.Stdout, process.Stderr)}
 	if meta.Tty {
 		cioOpts = append(cioOpts, cio.WithTerminal)
 	}
 
-	task, err := container.NewTask(ctx, cio.NewCreator(cioOpts...), containerd.WithRootFS(rootMounts))
+	task, err := container.NewTask(ctx, cio.NewCreator(cioOpts...), containerd.WithRootFS([]mount.Mount{{
+		Source:  rootfsPath,
+		Type:    "bind",
+		Options: []string{"rbind"},
+	}}))
 	if err != nil {
 		return err
 	}
+
 	defer func() {
 		if _, err1 := task.Delete(context.TODO()); err == nil && err1 != nil {
 			err = errors.Wrapf(err1, "failed to delete task %s", id)
 		}
 	}()
 
-	if err := task.Start(ctx); err != nil {
-		return err
-	}
-
-	if started != nil {
+	err = w.runProcess(ctx, task, process.Resize, func() {
 		startedOnce.Do(func() {
-			close(started)
+			if started != nil {
+				close(started)
+			}
 		})
-	}
-	statusCh, err := task.Wait(context.Background())
-	if err != nil {
-		return err
-	}
-
-	var cancel func()
-	ctxDone := ctx.Done()
-	for {
-		select {
-		case <-ctxDone:
-			ctxDone = nil
-			var killCtx context.Context
-			killCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-			task.Kill(killCtx, syscall.SIGKILL)
-		case status := <-statusCh:
-			if cancel != nil {
-				cancel()
-			}
-			if status.ExitCode() != 0 {
-				var err error
-				if status.ExitCode() == containerd.UnknownExitStatus && status.Error() != nil {
-					err = errors.Wrap(status.Error(), "failure waiting for process")
-				} else {
-					err = errors.Errorf("process returned non-zero exit code: %d", status.ExitCode())
-				}
-				select {
-				case <-ctx.Done():
-					err = errors.Wrap(ctx.Err(), err.Error())
-				default:
-				}
-				return err
-			}
-			return nil
-		}
-	}
+	})
+	return err
 }
 
-func (w *containerdExecutor) Exec(ctx context.Context, id string, process executor.ProcessInfo) error {
+func (w *containerdExecutor) Exec(ctx context.Context, id string, process executor.ProcessInfo) (err error) {
 	meta := process.Meta
 
 	// first verify the container is running, if we get an error assume the container
@@ -320,6 +297,7 @@ func (w *containerdExecutor) Exec(ctx context.Context, id string, process execut
 		spec.Process.Env = process.Meta.Env
 	}
 
+	fixProcessOutput(&process)
 	cioOpts := []cio.Opt{cio.WithStreams(process.Stdin, process.Stdout, process.Stderr)}
 	if meta.Tty {
 		cioOpts = append(cioOpts, cio.WithTerminal)
@@ -329,5 +307,116 @@ func (w *containerdExecutor) Exec(ctx context.Context, id string, process execut
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	return taskProcess.Start(ctx)
+
+	err = w.runProcess(ctx, taskProcess, process.Resize, nil)
+	return err
+}
+
+func fixProcessOutput(process *executor.ProcessInfo) {
+	// It seems like if containerd has one of stdin, stdout or stderr then the
+	// others need to be present as well otherwise we get this error:
+	// failed to start io pipe copy: unable to copy pipes: containerd-shim: opening file "" failed: open : no such file or directory: unknown
+	// So just stub out any missing output
+	if process.Stdout == nil {
+		process.Stdout = &nopCloser{ioutil.Discard}
+	}
+	if process.Stderr == nil {
+		process.Stderr = &nopCloser{ioutil.Discard}
+	}
+}
+
+func (w *containerdExecutor) runProcess(ctx context.Context, p containerd.Process, resize <-chan executor.WinSize, started func()) error {
+	// Not using `ctx` here because the context passed only affects the statusCh which we
+	// don't want cancelled when ctx.Done is sent.  We want to process statusCh on cancel.
+	statusCh, err := p.Wait(context.Background())
+	if err != nil {
+		return err
+	}
+
+	io := p.IO()
+	defer func() {
+		io.Wait()
+		io.Close()
+	}()
+
+	err = p.Start(ctx)
+	if err != nil {
+		return err
+	}
+
+	if started != nil {
+		started()
+	}
+
+	p.CloseIO(ctx, containerd.WithStdinCloser)
+
+	// resize in separate go loop so it does not potentially block
+	// the container cancel/exit status loop below.
+	resizeCtx, resizeCancel := context.WithCancel(ctx)
+	defer resizeCancel()
+	go func() {
+		for {
+			select {
+			case <-resizeCtx.Done():
+				return
+			case size, ok := <-resize:
+				if !ok {
+					return // chan closed
+				}
+				err = p.Resize(resizeCtx, size.Cols, size.Rows)
+				if err != nil {
+					bklog.G(resizeCtx).Warnf("Failed to resize %s: %s", p.ID(), err)
+				}
+			}
+		}
+	}()
+
+	var cancel func()
+	var killCtxDone <-chan struct{}
+	ctxDone := ctx.Done()
+	for {
+		select {
+		case <-ctxDone:
+			ctxDone = nil
+			var killCtx context.Context
+			killCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+			killCtxDone = killCtx.Done()
+			p.Kill(killCtx, syscall.SIGKILL)
+			io.Cancel()
+		case status := <-statusCh:
+			if cancel != nil {
+				cancel()
+			}
+			if status.ExitCode() != 0 {
+				exitErr := &gatewayapi.ExitError{
+					ExitCode: status.ExitCode(),
+					Err:      status.Error(),
+				}
+				if status.ExitCode() == gatewayapi.UnknownExitStatus && status.Error() != nil {
+					exitErr.Err = errors.Wrap(status.Error(), "failure waiting for process")
+				}
+				select {
+				case <-ctx.Done():
+					exitErr.Err = errors.Wrap(ctx.Err(), exitErr.Error())
+				default:
+				}
+				return exitErr
+			}
+			return nil
+		case <-killCtxDone:
+			if cancel != nil {
+				cancel()
+			}
+			io.Cancel()
+			return errors.Errorf("failed to kill process on cancel")
+		}
+	}
+}
+
+type nopCloser struct {
+	io.Writer
+}
+
+func (c *nopCloser) Close() error {
+	return nil
 }

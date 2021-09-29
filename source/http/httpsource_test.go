@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/containerd/containerd/content/local"
@@ -25,6 +26,10 @@ import (
 )
 
 func TestHTTPSource(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
 	t.Parallel()
 	ctx := context.TODO()
 
@@ -44,17 +49,19 @@ func TestHTTPSource(t *testing.T) {
 	})
 	defer server.Close()
 
-	id := &source.HttpIdentifier{URL: server.URL + "/foo"}
+	id := &source.HTTPIdentifier{URL: server.URL + "/foo"}
 
-	h, err := hs.Resolve(ctx, id, nil)
+	h, err := hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	k, _, err := h.CacheKey(ctx, nil, 0)
+	k, p, _, _, err := h.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 
 	expectedContent1 := "sha256:0b1a154faa3003c1fbe7fda9c8a42d55fde2df2a2c405c32038f8ac7ed6b044a"
+	expectedPin1 := "sha256:d0b425e00e15a0d36b9b361f02bab63563aed6cb4665083905386c55d5b679fa"
 
 	require.Equal(t, expectedContent1, k)
+	require.Equal(t, expectedPin1, p)
 	require.Equal(t, server.Stats("/foo").AllRequests, 1)
 	require.Equal(t, server.Stats("/foo").CachedRequests, 0)
 
@@ -75,13 +82,14 @@ func TestHTTPSource(t *testing.T) {
 	ref = nil
 
 	// repeat, should use the etag
-	h, err = hs.Resolve(ctx, id, nil)
+	h, err = hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	k, _, err = h.CacheKey(ctx, nil, 0)
+	k, p, _, _, err = h.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 
 	require.Equal(t, expectedContent1, k)
+	require.Equal(t, expectedPin1, p)
 	require.Equal(t, server.Stats("/foo").AllRequests, 2)
 	require.Equal(t, server.Stats("/foo").CachedRequests, 1)
 
@@ -107,17 +115,19 @@ func TestHTTPSource(t *testing.T) {
 	}
 
 	expectedContent2 := "sha256:888722f299c02bfae173a747a0345bb2291cf6a076c36d8eb6fab442a8adddfa"
+	expectedPin2 := "sha256:dab741b6289e7dccc1ed42330cae1accc2b755ce8079c2cd5d4b5366c9f769a6"
 
 	// update etag, downloads again
 	server.SetRoute("/foo", resp2)
 
-	h, err = hs.Resolve(ctx, id, nil)
+	h, err = hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	k, _, err = h.CacheKey(ctx, nil, 0)
+	k, p, _, _, err = h.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 
 	require.Equal(t, expectedContent2, k)
+	require.Equal(t, expectedPin2, p)
 	require.Equal(t, server.Stats("/foo").AllRequests, 4)
 	require.Equal(t, server.Stats("/foo").CachedRequests, 1)
 
@@ -139,6 +149,10 @@ func TestHTTPSource(t *testing.T) {
 }
 
 func TestHTTPDefaultName(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
 	t.Parallel()
 	ctx := context.TODO()
 
@@ -158,15 +172,16 @@ func TestHTTPDefaultName(t *testing.T) {
 	})
 	defer server.Close()
 
-	id := &source.HttpIdentifier{URL: server.URL}
+	id := &source.HTTPIdentifier{URL: server.URL}
 
-	h, err := hs.Resolve(ctx, id, nil)
+	h, err := hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	k, _, err := h.CacheKey(ctx, nil, 0)
+	k, p, _, _, err := h.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 
 	require.Equal(t, "sha256:146f16ec8810a62a57ce314aba391f95f7eaaf41b8b1ebaf2ab65fd63b1ad437", k)
+	require.Equal(t, "sha256:d0b425e00e15a0d36b9b361f02bab63563aed6cb4665083905386c55d5b679fa", p)
 	require.Equal(t, server.Stats("/").AllRequests, 1)
 	require.Equal(t, server.Stats("/").CachedRequests, 0)
 
@@ -201,17 +216,21 @@ func TestHTTPInvalidURL(t *testing.T) {
 	server := httpserver.NewTestServer(map[string]httpserver.Response{})
 	defer server.Close()
 
-	id := &source.HttpIdentifier{URL: server.URL + "/foo"}
+	id := &source.HTTPIdentifier{URL: server.URL + "/foo"}
 
-	h, err := hs.Resolve(ctx, id, nil)
+	h, err := hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	_, _, err = h.CacheKey(ctx, nil, 0)
+	_, _, _, _, err = h.CacheKey(ctx, nil, 0)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "invalid response")
 }
 
 func TestHTTPChecksum(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
 	t.Parallel()
 	ctx := context.TODO()
 
@@ -231,18 +250,21 @@ func TestHTTPChecksum(t *testing.T) {
 	})
 	defer server.Close()
 
-	id := &source.HttpIdentifier{URL: server.URL + "/foo", Checksum: digest.FromBytes([]byte("content-different"))}
+	id := &source.HTTPIdentifier{URL: server.URL + "/foo", Checksum: digest.FromBytes([]byte("content-different"))}
 
-	h, err := hs.Resolve(ctx, id, nil)
+	h, err := hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	k, _, err := h.CacheKey(ctx, nil, 0)
+	k, p, _, _, err := h.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 
 	expectedContentDifferent := "sha256:f25996f463dca69cffb580f8273ffacdda43332b5f0a8bea2ead33900616d44b"
 	expectedContentCorrect := "sha256:c6a440110a7757b9e1e47b52e413cba96c62377c37a474714b6b3c4f8b74e536"
+	expectedPinDifferent := "sha256:ab0d5a7aa55c1c95d59c302eb12c55368940e6f0a257646afd455cabe248edc4"
+	expectedPinCorrect := "sha256:f5fa14774044d2ec428ffe7efbfaa0a439db7bc8127d6b71aea21e1cd558d0f0"
 
 	require.Equal(t, expectedContentDifferent, k)
+	require.Equal(t, expectedPinDifferent, p)
 	require.Equal(t, server.Stats("/foo").AllRequests, 0)
 	require.Equal(t, server.Stats("/foo").CachedRequests, 0)
 
@@ -250,18 +272,20 @@ func TestHTTPChecksum(t *testing.T) {
 	require.Error(t, err)
 
 	require.Equal(t, expectedContentDifferent, k)
+	require.Equal(t, expectedPinDifferent, p)
 	require.Equal(t, server.Stats("/foo").AllRequests, 1)
 	require.Equal(t, server.Stats("/foo").CachedRequests, 0)
 
-	id = &source.HttpIdentifier{URL: server.URL + "/foo", Checksum: digest.FromBytes([]byte("content-correct"))}
+	id = &source.HTTPIdentifier{URL: server.URL + "/foo", Checksum: digest.FromBytes([]byte("content-correct"))}
 
-	h, err = hs.Resolve(ctx, id, nil)
+	h, err = hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	k, _, err = h.CacheKey(ctx, nil, 0)
+	k, p, _, _, err = h.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 
 	require.Equal(t, expectedContentCorrect, k)
+	require.Equal(t, expectedPinCorrect, p)
 	require.Equal(t, server.Stats("/foo").AllRequests, 1)
 	require.Equal(t, server.Stats("/foo").CachedRequests, 0)
 
@@ -279,6 +303,7 @@ func TestHTTPChecksum(t *testing.T) {
 	require.Equal(t, dt, []byte("content-correct"))
 
 	require.Equal(t, expectedContentCorrect, k)
+	require.Equal(t, expectedPinCorrect, p)
 	require.Equal(t, server.Stats("/foo").AllRequests, 2)
 	require.Equal(t, server.Stats("/foo").CachedRequests, 0)
 
@@ -288,7 +313,7 @@ func TestHTTPChecksum(t *testing.T) {
 }
 
 func readFile(ctx context.Context, ref cache.ImmutableRef, fp string) ([]byte, error) {
-	mount, err := ref.Mount(ctx, false)
+	mount, err := ref.Mount(ctx, false, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -315,11 +340,6 @@ func newHTTPSource(tmpdir string) (source.Source, error) {
 		return nil, err
 	}
 
-	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
-	if err != nil {
-		return nil, err
-	}
-
 	store, err := local.NewStore(tmpdir)
 	if err != nil {
 		return nil, err
@@ -334,6 +354,11 @@ func newHTTPSource(tmpdir string) (source.Source, error) {
 		"native": snapshotter,
 	})
 
+	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
+	if err != nil {
+		return nil, err
+	}
+
 	cm, err := cache.NewManager(cache.ManagerOpt{
 		Snapshotter:    snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil),
 		MetadataStore:  md,
@@ -347,6 +372,5 @@ func newHTTPSource(tmpdir string) (source.Source, error) {
 
 	return NewSource(Opt{
 		CacheAccessor: cm,
-		MetadataStore: md,
 	})
 }

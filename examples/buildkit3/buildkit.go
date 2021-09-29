@@ -34,9 +34,9 @@ func main() {
 }
 
 func goBuildBase() llb.State {
-	goAlpine := llb.Image("docker.io/library/golang:1.13-alpine")
+	goAlpine := llb.Image("docker.io/library/golang:1.17-alpine")
 	return goAlpine.
-		AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnv).
+		AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnvUnix).
 		AddEnv("GOPATH", "/go").
 		Run(llb.Shlex("apk add --no-cache g++ linux-headers libseccomp-dev make")).Root()
 }

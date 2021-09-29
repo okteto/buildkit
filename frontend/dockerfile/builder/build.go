@@ -14,18 +14,18 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/platforms"
-	"github.com/docker/docker/builder/dockerignore"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/dockerfile/dockerfile2llb"
+	"github.com/moby/buildkit/frontend/dockerfile/dockerignore"
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/apicaps"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -33,35 +33,49 @@ import (
 const (
 	DefaultLocalNameContext    = "context"
 	DefaultLocalNameDockerfile = "dockerfile"
-	keyTarget                  = "target"
-	keyFilename                = "filename"
-	keyCacheFrom               = "cache-from"    // for registry only. deprecated in favor of keyCacheImports
-	keyCacheImports            = "cache-imports" // JSON representation of []CacheOptionsEntry
-	keyCacheNS                 = "build-arg:BUILDKIT_CACHE_MOUNT_NS"
 	defaultDockerfileName      = "Dockerfile"
 	dockerignoreFilename       = ".dockerignore"
-	buildArgPrefix             = "build-arg:"
-	labelPrefix                = "label:"
-	keyNoCache                 = "no-cache"
-	keyTargetPlatform          = "platform"
-	keyMultiPlatform           = "multi-platform"
-	keyImageResolveMode        = "image-resolve-mode"
-	keyGlobalAddHosts          = "add-hosts"
-	keyForceNetwork            = "force-network-mode"
-	keyOverrideCopyImage       = "override-copy-image" // remove after CopyOp implemented
-	keyNameContext             = "contextkey"
-	keyNameDockerfile          = "dockerfilekey"
-	keyContextSubDir           = "contextsubdir"
-	keyContextKeepGitDir       = "build-arg:BUILDKIT_CONTEXT_KEEP_GIT_DIR"
+
+	buildArgPrefix = "build-arg:"
+	labelPrefix    = "label:"
+
+	keyTarget            = "target"
+	keyFilename          = "filename"
+	keyCacheFrom         = "cache-from"    // for registry only. deprecated in favor of keyCacheImports
+	keyCacheImports      = "cache-imports" // JSON representation of []CacheOptionsEntry
+	keyContextSubDir     = "contextsubdir"
+	keyForceNetwork      = "force-network-mode"
+	keyGlobalAddHosts    = "add-hosts"
+	keyHostname          = "hostname"
+	keyImageResolveMode  = "image-resolve-mode"
+	keyMultiPlatform     = "multi-platform"
+	keyNameContext       = "contextkey"
+	keyNameDockerfile    = "dockerfilekey"
+	keyNoCache           = "no-cache"
+	keyOverrideCopyImage = "override-copy-image" // remove after CopyOp implemented
+	keyTargetPlatform    = "platform"
+
+	// Don't forget to update frontend documentation if you add
+	// a new build-arg: frontend/dockerfile/docs/syntax.md
+	keyCacheNSArg           = "build-arg:BUILDKIT_CACHE_MOUNT_NS"
+	keyContextKeepGitDirArg = "build-arg:BUILDKIT_CONTEXT_KEEP_GIT_DIR"
+	keyHostnameArg          = "build-arg:BUILDKIT_SANDBOX_HOSTNAME"
+	keyMultiPlatformArg     = "build-arg:BUILDKIT_MULTI_PLATFORM"
+	keySyntaxArg            = "build-arg:BUILDKIT_SYNTAX"
 )
 
 var httpPrefix = regexp.MustCompile(`^https?://`)
-var gitUrlPathWithFragmentSuffix = regexp.MustCompile(`\.git(?:#.+)?$`)
+var gitURLPathWithFragmentSuffix = regexp.MustCompile(`\.git(?:#.+)?$`)
 
 func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	opts := c.BuildOpts().Opts
 	caps := c.BuildOpts().LLBCaps
 	gwcaps := c.BuildOpts().Caps
+
+	allowForward, capsError := validateCaps(opts["frontend.caps"])
+	if !allowForward && capsError != nil {
+		return nil, capsError
+	}
 
 	marshalOpts := []llb.ConstraintsOpt{llb.WithCaps(caps)}
 
@@ -82,8 +96,8 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 		defaultBuildPlatform = workers[0].Platforms[0]
 	}
 
-	buildPlatforms := []specs.Platform{defaultBuildPlatform}
-	targetPlatforms := []*specs.Platform{nil}
+	buildPlatforms := []ocispecs.Platform{defaultBuildPlatform}
+	targetPlatforms := []*ocispecs.Platform{nil}
 	if v := opts[keyTargetPlatform]; v != "" {
 		var err error
 		targetPlatforms, err = parsePlatforms(v)
@@ -123,18 +137,26 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 
 	name := "load build definition from " + filename
 
+	filenames := []string{filename, filename + ".dockerignore"}
+
+	// dockerfile is also supported casing moby/moby#10858
+	if path.Base(filename) == defaultDockerfileName {
+		filenames = append(filenames, path.Join(path.Dir(filename), strings.ToLower(defaultDockerfileName)))
+	}
+
 	src := llb.Local(localNameDockerfile,
-		llb.FollowPaths([]string{filename, filename + ".dockerignore"}),
+		llb.FollowPaths(filenames),
 		llb.SessionID(c.BuildOpts().SessionID),
 		llb.SharedKeyHint(localNameDockerfile),
 		dockerfile2llb.WithInternalName(name),
+		llb.Differ(llb.DiffNone, false),
 	)
 
 	fileop := useFileOp(opts, &caps)
 
 	var buildContext *llb.State
 	isNotLocalContext := false
-	if st, ok := detectGitContext(opts[localNameContext], opts[keyContextKeepGitDir]); ok {
+	if st, ok := detectGitContext(opts[localNameContext], opts[keyContextKeepGitDirArg]); ok {
 		if !forceLocalDockerfile {
 			src = *st
 		}
@@ -251,7 +273,19 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 			Filename: filename,
 		})
 		if err != nil {
-			return errors.Wrapf(err, "failed to read dockerfile")
+			fallback := false
+			if path.Base(filename) == defaultDockerfileName {
+				var err1 error
+				dtDockerfile, err1 = ref.ReadFile(ctx2, client.ReadRequest{
+					Filename: path.Join(path.Dir(filename), strings.ToLower(defaultDockerfileName)),
+				})
+				if err1 == nil {
+					fallback = true
+				}
+			}
+			if !fallback {
+				return errors.Wrapf(err, "failed to read dockerfile")
+			}
 		}
 
 		sourceMap = llb.NewSourceMap(&src, filename, dtDockerfile)
@@ -275,6 +309,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 					llb.FollowPaths([]string{dockerignoreFilename}),
 					llb.SharedKeyHint(localNameContext+"-"+dockerignoreFilename),
 					dockerfile2llb.WithInternalName("load "+dockerignoreFilename),
+					llb.Differ(llb.DiffNone, false),
 				)
 				dockerignoreState = &st
 			}
@@ -317,8 +352,14 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	}
 
 	if _, ok := opts["cmdline"]; !ok {
-		ref, cmdline, loc, ok := dockerfile2llb.DetectSyntax(bytes.NewBuffer(dtDockerfile))
-		if ok {
+		if cmdline, ok := opts[keySyntaxArg]; ok {
+			p := strings.SplitN(strings.TrimSpace(cmdline), " ", 2)
+			res, err := forwardGateway(ctx, c, p[0], cmdline)
+			if err != nil && len(errdefs.Sources(err)) == 0 {
+				return nil, errors.Wrapf(err, "failed with %s = %s", keySyntaxArg, cmdline)
+			}
+			return res, err
+		} else if ref, cmdline, loc, ok := dockerfile2llb.DetectSyntax(bytes.NewBuffer(dtDockerfile)); ok {
 			res, err := forwardGateway(ctx, c, ref, cmdline)
 			if err != nil && len(errdefs.Sources(err)) == 0 {
 				return nil, wrapSource(err, sourceMap, loc)
@@ -327,8 +368,19 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 		}
 	}
 
+	if capsError != nil {
+		return nil, capsError
+	}
+
+	if res, ok, err := checkSubRequest(ctx, opts); ok {
+		return res, err
+	}
+
 	exportMap := len(targetPlatforms) > 1
 
+	if v := opts[keyMultiPlatformArg]; v != "" {
+		opts[keyMultiPlatform] = v
+	}
 	if v := opts[keyMultiPlatform]; v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
@@ -345,10 +397,14 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	}
 	res := client.NewResult()
 
+	if v, ok := opts[keyHostnameArg]; ok && len(v) > 0 {
+		opts[keyHostname] = v
+	}
+
 	eg, ctx = errgroup.WithContext(ctx)
 
 	for i, tp := range targetPlatforms {
-		func(i int, tp *specs.Platform) {
+		func(i int, tp *ocispecs.Platform) {
 			eg.Go(func() (err error) {
 				defer func() {
 					var el *parser.ErrorLocation
@@ -361,7 +417,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 					MetaResolver:      c,
 					BuildArgs:         filter(opts, buildArgPrefix),
 					Labels:            filter(opts, labelPrefix),
-					CacheIDNamespace:  opts[keyCacheNS],
+					CacheIDNamespace:  opts[keyCacheNSArg],
 					SessionID:         c.BuildOpts().SessionID,
 					BuildContext:      buildContext,
 					Excludes:          excludes,
@@ -375,10 +431,11 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 					OverrideCopyImage: opts[keyOverrideCopyImage],
 					LLBCaps:           &caps,
 					SourceMap:         sourceMap,
+					Hostname:          opts[keyHostname],
 				})
 
 				if err != nil {
-					return errors.Wrapf(err, "failed to create LLB definition")
+					return err
 				}
 
 				def, err := st.Marshal(ctx)
@@ -512,7 +569,7 @@ func filter(opt map[string]string, key string) map[string]string {
 
 func detectGitContext(ref, gitContext string) (*llb.State, bool) {
 	found := false
-	if httpPrefix.MatchString(ref) && gitUrlPathWithFragmentSuffix.MatchString(ref) {
+	if httpPrefix.MatchString(ref) && gitURLPathWithFragmentSuffix.MatchString(ref) {
 		found = true
 	}
 
@@ -566,8 +623,8 @@ func isArchive(header []byte) bool {
 	return err == nil
 }
 
-func parsePlatforms(v string) ([]*specs.Platform, error) {
-	var pp []*specs.Platform
+func parsePlatforms(v string) ([]*ocispecs.Platform, error) {
+	var pp []*ocispecs.Platform
 	for _, v := range strings.Split(v, ",") {
 		p, err := platforms.Parse(v)
 		if err != nil {

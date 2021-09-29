@@ -65,7 +65,7 @@ func (e *localExporterInstance) Export(ctx context.Context, inp exporter.Source,
 			}
 			defers = append(defers, func() { os.RemoveAll(src) })
 		} else {
-			mount, err := ref.Mount(ctx, true)
+			mount, err := ref.Mount(ctx, true, session.NewGroup(sessionID))
 			if err != nil {
 				return nil, err
 			}
@@ -135,7 +135,7 @@ func (e *localExporterInstance) Export(ctx context.Context, inp exporter.Source,
 	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	caller, err := e.opt.SessionManager.Get(timeoutCtx, sessionID)
+	caller, err := e.opt.SessionManager.Get(timeoutCtx, sessionID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +153,7 @@ func (e *localExporterInstance) Export(ctx context.Context, inp exporter.Source,
 }
 
 func oneOffProgress(ctx context.Context, id string) func(err error) error {
-	pw, _, _ := progress.FromContext(ctx)
+	pw, _, _ := progress.NewFromContext(ctx)
 	now := time.Now()
 	st := progress.Status{
 		Started: &now,

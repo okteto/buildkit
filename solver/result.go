@@ -5,8 +5,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/moby/buildkit/util/bklog"
+
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // SharedResult is a result that can be cloned
@@ -47,8 +48,8 @@ type splitResult struct {
 
 func (r *splitResult) Release(ctx context.Context) error {
 	if atomic.AddInt64(&r.released, 1) > 1 {
-		err := errors.Errorf("releasing already released reference")
-		logrus.Error(err)
+		err := errors.Errorf("releasing already released reference %+v", r.Result.ID())
+		bklog.G(ctx).Error(err)
 		return err
 	}
 	if atomic.AddInt64(r.sem, 1) == 2 {
@@ -78,8 +79,12 @@ func NewSharedCachedResult(res CachedResult) *SharedCachedResult {
 	}
 }
 
-func (r *SharedCachedResult) Clone() CachedResult {
+func (r *SharedCachedResult) CloneCachedResult() CachedResult {
 	return &clonedCachedResult{Result: r.SharedResult.Clone(), cr: r.CachedResult}
+}
+
+func (r *SharedCachedResult) Clone() Result {
+	return r.CloneCachedResult()
 }
 
 func (r *SharedCachedResult) Release(ctx context.Context) error {
@@ -91,12 +96,12 @@ type clonedCachedResult struct {
 	cr CachedResult
 }
 
-func (r *clonedCachedResult) ID() string {
-	return r.Result.ID()
+func (ccr *clonedCachedResult) ID() string {
+	return ccr.Result.ID()
 }
 
-func (cr *clonedCachedResult) CacheKeys() []ExportableCacheKey {
-	return cr.cr.CacheKeys()
+func (ccr *clonedCachedResult) CacheKeys() []ExportableCacheKey {
+	return ccr.cr.CacheKeys()
 }
 
 type SharedCachedResult struct {

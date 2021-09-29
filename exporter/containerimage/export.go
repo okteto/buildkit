@@ -14,16 +14,21 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/rootfs"
-	"github.com/moby/buildkit/cache/blobs"
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/exporter"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/util/buildinfo"
+	"github.com/moby/buildkit/util/compression"
+	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/push"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -35,6 +40,8 @@ const (
 	keyDanglingPrefix   = "dangling-name-prefix"
 	keyNameCanonical    = "name-canonical"
 	keyLayerCompression = "compression"
+	keyForceCompression = "force-compression"
+	keyBuildInfo        = "buildinfo"
 	ociTypes            = "oci-mediatypes"
 )
 
@@ -62,9 +69,11 @@ func New(opt Opt) (exporter.Exporter, error) {
 func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exporter.ExporterInstance, error) {
 	i := &imageExporterInstance{
 		imageExporter:    e,
-		layerCompression: blobs.DefaultCompression,
+		layerCompression: compression.Default,
+		buildInfoMode:    buildinfo.ExportDefault,
 	}
 
+	var esgz bool
 	for k, v := range opt {
 		switch k {
 		case keyImageName:
@@ -134,18 +143,46 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 		case keyLayerCompression:
 			switch v {
 			case "gzip":
-				i.layerCompression = blobs.Gzip
+				i.layerCompression = compression.Gzip
+			case "estargz":
+				i.layerCompression = compression.EStargz
+				esgz = true
+			case "zstd":
+				i.layerCompression = compression.Zstd
 			case "uncompressed":
-				i.layerCompression = blobs.Uncompressed
+				i.layerCompression = compression.Uncompressed
 			default:
 				return nil, errors.Errorf("unsupported layer compression type: %v", v)
 			}
+		case keyForceCompression:
+			if v == "" {
+				i.forceCompression = true
+				continue
+			}
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
+			}
+			i.forceCompression = b
+		case keyBuildInfo:
+			if v == "" {
+				continue
+			}
+			bimode, err := buildinfo.ParseExportMode(v)
+			if err != nil {
+				return nil, err
+			}
+			i.buildInfoMode = bimode
 		default:
 			if i.meta == nil {
 				i.meta = make(map[string][]byte)
 			}
 			i.meta[k] = []byte(v)
 		}
+	}
+	if esgz && !i.ociTypes {
+		logrus.Warn("forcibly turning on oci-mediatype mode for estargz")
+		i.ociTypes = true
 	}
 	return i, nil
 }
@@ -160,7 +197,9 @@ type imageExporterInstance struct {
 	ociTypes         bool
 	nameCanonical    bool
 	danglingPrefix   string
-	layerCompression blobs.CompressionType
+	layerCompression compression.Type
+	forceCompression bool
+	buildInfoMode    buildinfo.ExportMode
 	meta             map[string][]byte
 }
 
@@ -182,7 +221,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 	}
 	defer done(context.TODO())
 
-	desc, err := e.opt.ImageWriter.Commit(ctx, src, e.ociTypes, e.layerCompression)
+	desc, err := e.opt.ImageWriter.Commit(ctx, src, e.ociTypes, e.layerCompression, e.buildInfoMode, e.forceCompression, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +229,15 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 	defer func() {
 		e.opt.ImageWriter.ContentStore().Delete(context.TODO(), desc.Digest)
 	}()
+
+	if e.buildInfoMode&buildinfo.ExportMetadata == 0 {
+		for k := range src.Metadata {
+			if !strings.HasPrefix(k, exptypes.ExporterBuildInfo) {
+				continue
+			}
+			delete(src.Metadata, k)
+		}
+	}
 
 	resp := make(map[string]string)
 
@@ -231,13 +279,38 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 				tagDone(nil)
 
 				if e.unpack {
-					if err := e.unpackImage(ctx, img); err != nil {
+					if err := e.unpackImage(ctx, img, src, session.NewGroup(sessionID)); err != nil {
 						return nil, err
 					}
 				}
 			}
 			if e.push {
-				if err := push.Push(ctx, e.opt.SessionManager, sessionID, e.opt.ImageWriter.ContentStore(), desc.Digest, targetName, e.insecure, e.opt.RegistryHosts, e.pushByDigest); err != nil {
+				annotations := map[digest.Digest]map[string]string{}
+				mprovider := contentutil.NewMultiProvider(e.opt.ImageWriter.ContentStore())
+				if src.Ref != nil {
+					remote, err := src.Ref.GetRemote(ctx, false, e.layerCompression, e.forceCompression, session.NewGroup(sessionID))
+					if err != nil {
+						return nil, err
+					}
+					for _, desc := range remote.Descriptors {
+						mprovider.Add(desc.Digest, remote.Provider)
+						addAnnotations(annotations, desc)
+					}
+				}
+				if len(src.Refs) > 0 {
+					for _, r := range src.Refs {
+						remote, err := r.GetRemote(ctx, false, e.layerCompression, e.forceCompression, session.NewGroup(sessionID))
+						if err != nil {
+							return nil, err
+						}
+						for _, desc := range remote.Descriptors {
+							mprovider.Add(desc.Digest, remote.Provider)
+							addAnnotations(annotations, desc)
+						}
+					}
+				}
+
+				if err := push.Push(ctx, e.opt.SessionManager, sessionID, mprovider, e.opt.ImageWriter.ContentStore(), desc.Digest, targetName, e.insecure, e.opt.RegistryHosts, e.pushByDigest, annotations); err != nil {
 					return nil, err
 				}
 			}
@@ -245,11 +318,14 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 		resp["image.name"] = e.targetName
 	}
 
-	resp["containerimage.digest"] = desc.Digest.String()
+	resp[exptypes.ExporterImageDigestKey] = desc.Digest.String()
+	if v, ok := desc.Annotations[exptypes.ExporterConfigDigestKey]; ok {
+		resp[exptypes.ExporterImageConfigDigestKey] = v
+	}
 	return resp, nil
 }
 
-func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Image) (err0 error) {
+func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Image, src exporter.Source, s session.Group) (err0 error) {
 	unpackDone := oneOffProgress(ctx, "unpacking to "+img.Name)
 	defer func() {
 		unpackDone(err0)
@@ -267,7 +343,28 @@ func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Imag
 		return err
 	}
 
-	layers, err := getLayers(ctx, contentStore, manifest)
+	topLayerRef := src.Ref
+	if len(src.Refs) > 0 {
+		if r, ok := src.Refs[platforms.DefaultString()]; ok {
+			topLayerRef = r
+		} else {
+			return errors.Errorf("no reference for default platform %s", platforms.DefaultString())
+		}
+	}
+
+	remote, err := topLayerRef.GetRemote(ctx, true, e.layerCompression, e.forceCompression, s)
+	if err != nil {
+		return err
+	}
+
+	// ensure the content for each layer exists locally in case any are lazy
+	if unlazier, ok := remote.Provider.(cache.Unlazier); ok {
+		if err := unlazier.Unlazy(ctx); err != nil {
+			return err
+		}
+	}
+
+	layers, err := getLayers(ctx, remote.Descriptors, manifest)
 	if err != nil {
 		return err
 	}
@@ -297,23 +394,32 @@ func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Imag
 	return err
 }
 
-func getLayers(ctx context.Context, contentStore content.Store, manifest ocispec.Manifest) ([]rootfs.Layer, error) {
-	diffIDs, err := images.RootFS(ctx, contentStore, manifest.Config)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to resolve rootfs")
-	}
-
-	if len(diffIDs) != len(manifest.Layers) {
+func getLayers(ctx context.Context, descs []ocispecs.Descriptor, manifest ocispecs.Manifest) ([]rootfs.Layer, error) {
+	if len(descs) != len(manifest.Layers) {
 		return nil, errors.Errorf("mismatched image rootfs and manifest layers")
 	}
 
-	layers := make([]rootfs.Layer, len(diffIDs))
-	for i := range diffIDs {
-		layers[i].Diff = ocispec.Descriptor{
-			MediaType: ocispec.MediaTypeImageLayer,
-			Digest:    diffIDs[i],
+	layers := make([]rootfs.Layer, len(descs))
+	for i, desc := range descs {
+		layers[i].Diff = ocispecs.Descriptor{
+			MediaType: ocispecs.MediaTypeImageLayer,
+			Digest:    digest.Digest(desc.Annotations["containerd.io/uncompressed"]),
 		}
 		layers[i].Blob = manifest.Layers[i]
 	}
 	return layers, nil
+}
+
+func addAnnotations(m map[digest.Digest]map[string]string, desc ocispecs.Descriptor) {
+	if desc.Annotations == nil {
+		return
+	}
+	a, ok := m[desc.Digest]
+	if !ok {
+		m[desc.Digest] = desc.Annotations
+		return
+	}
+	for k, v := range desc.Annotations {
+		a[k] = v
+	}
 }

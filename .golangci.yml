@@ -1,0 +1,42 @@
+run:
+  timeout: 10m
+  skip-files:
+    - ".*\\.pb\\.go$"
+
+  modules-download-mode: vendor
+
+  build-tags:
+    - dfrunsecurity
+    - dfheredoc
+
+linters:
+  enable:
+    - deadcode
+    - gofmt
+    - goimports
+    - golint
+    - govet
+    - importas
+    - ineffassign
+    - misspell
+    - staticcheck
+    - structcheck
+    - typecheck
+    - unused
+    - varcheck
+  disable-all: true
+
+linters-settings:
+  importas:
+    alias:
+      - pkg: "github.com/opencontainers/image-spec/specs-go/v1"
+        alias: "ocispecs"
+      - pkg: "github.com/opencontainers/go-digest"
+        alias: "digest"
+    no-unaliased: true
+
+issues:
+  exclude-rules:
+    - linters:
+        - golint
+      text: "stutters"

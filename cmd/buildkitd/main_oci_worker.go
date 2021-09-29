@@ -3,29 +3,51 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
-	fuseoverlayfs "github.com/AkihiroSuda/containerd-fuse-overlayfs"
+	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
+	"github.com/containerd/containerd/defaults"
+	"github.com/containerd/containerd/pkg/dialer"
+	"github.com/containerd/containerd/pkg/userns"
+	"github.com/containerd/containerd/reference"
+	"github.com/containerd/containerd/remotes/docker"
 	ctdsnapshot "github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/native"
 	"github.com/containerd/containerd/snapshots/overlay"
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/containerd/snapshots/overlay/overlayutils"
+	snproxy "github.com/containerd/containerd/snapshots/proxy"
+	fuseoverlayfs "github.com/containerd/fuse-overlayfs-snapshotter"
+	sgzfs "github.com/containerd/stargz-snapshotter/fs"
+	sgzconf "github.com/containerd/stargz-snapshotter/fs/config"
+	sgzsource "github.com/containerd/stargz-snapshotter/fs/source"
+	remotesn "github.com/containerd/stargz-snapshotter/snapshot"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/executor/oci"
+	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/network/cniprovider"
 	"github.com/moby/buildkit/util/network/netproviders"
+	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/worker"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/runc"
+	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	"golang.org/x/sync/semaphore"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 )
 
 func init() {
-	defaultConf, _, _ := defaultConf()
+	defaultConf, _ := defaultConf()
 
 	enabledValue := func(b *bool) string {
 		if b == nil {
@@ -50,8 +72,12 @@ func init() {
 		},
 		cli.StringFlag{
 			Name:  "oci-worker-snapshotter",
-			Usage: "name of snapshotter (overlayfs or native)",
+			Usage: "name of snapshotter (overlayfs, native, etc.)",
 			Value: defaultConf.Workers.OCI.Snapshotter,
+		},
+		cli.StringFlag{
+			Name:  "oci-worker-proxy-snapshotter-path",
+			Usage: "address of proxy snapshotter socket (do not include 'unix://' prefix)",
 		},
 		cli.StringSliceFlag{
 			Name:  "oci-worker-platform",
@@ -77,10 +103,14 @@ func init() {
 			Usage: "name of specified oci worker binary",
 			Value: defaultConf.Workers.OCI.Binary,
 		},
+		cli.StringFlag{
+			Name:  "oci-worker-apparmor-profile",
+			Usage: "set the name of the apparmor profile applied to containers",
+		},
 	}
 	n := "oci-worker-rootless"
 	u := "enable rootless mode"
-	if sys.RunningInUserNS() {
+	if userns.RunningInUserNS() {
 		flags = append(flags, cli.BoolTFlag{
 			Name:  n,
 			Usage: u,
@@ -159,7 +189,7 @@ func applyOCIFlags(c *cli.Context, cfg *config.Config) error {
 		cfg.Workers.OCI.Rootless = c.GlobalBool("rootless")
 	}
 	if c.GlobalIsSet("oci-worker-rootless") {
-		if !sys.RunningInUserNS() || os.Geteuid() > 0 {
+		if !userns.RunningInUserNS() || os.Geteuid() > 0 {
 			return errors.New("rootless mode requires to be executed as the mapped root in a user namespace; you may use RootlessKit for setting up the namespace")
 		}
 		cfg.Workers.OCI.Rootless = c.GlobalBool("oci-worker-rootless")
@@ -193,6 +223,12 @@ func applyOCIFlags(c *cli.Context, cfg *config.Config) error {
 	if c.GlobalIsSet("oci-worker-binary") {
 		cfg.Workers.OCI.Binary = c.GlobalString("oci-worker-binary")
 	}
+	if c.GlobalIsSet("oci-worker-proxy-snapshotter-path") {
+		cfg.Workers.OCI.ProxySnapshotterPath = c.GlobalString("oci-worker-proxy-snapshotter-path")
+	}
+	if c.GlobalIsSet("oci-worker-apparmor-profile") {
+		cfg.Workers.OCI.ApparmorProfile = c.GlobalString("oci-worker-apparmor-profile")
+	}
 	return nil
 }
 
@@ -213,7 +249,8 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 		return nil, err
 	}
 
-	snFactory, err := snapshotterFactory(common.config.Root, cfg.Snapshotter)
+	hosts := resolverFunc(common.config)
+	snFactory, err := snapshotterFactory(common.config.Root, cfg, common.sessionManager, hosts)
 	if err != nil {
 		return nil, err
 	}
@@ -245,12 +282,17 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 		},
 	}
 
-	opt, err := runc.NewWorkerOpt(common.config.Root, snFactory, cfg.Rootless, processMode, cfg.Labels, idmapping, nc, dns, cfg.Binary)
+	var parallelismSem *semaphore.Weighted
+	if cfg.MaxParallelism > 0 {
+		parallelismSem = semaphore.NewWeighted(int64(cfg.MaxParallelism))
+	}
+
+	opt, err := runc.NewWorkerOpt(common.config.Root, snFactory, cfg.Rootless, processMode, cfg.Labels, idmapping, nc, dns, cfg.Binary, cfg.ApparmorProfile, parallelismSem, common.traceSocket)
 	if err != nil {
 		return nil, err
 	}
 	opt.GCPolicy = getGCPolicy(cfg.GCConfig, common.config.Root)
-	opt.RegistryHosts = resolverFunc(common.config)
+	opt.RegistryHosts = hosts
 
 	if platformsStr := cfg.Platforms; len(platformsStr) != 0 {
 		platforms, err := parsePlatforms(platformsStr)
@@ -259,16 +301,49 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 		}
 		opt.Platforms = platforms
 	}
-	w, err := base.NewWorker(opt)
+	w, err := base.NewWorker(context.TODO(), opt)
 	if err != nil {
 		return nil, err
 	}
 	return []worker.Worker{w}, nil
 }
 
-func snapshotterFactory(commonRoot, name string) (runc.SnapshotterFactory, error) {
+func snapshotterFactory(commonRoot string, cfg config.OCIConfig, sm *session.Manager, hosts docker.RegistryHosts) (runc.SnapshotterFactory, error) {
+	var (
+		name    = cfg.Snapshotter
+		address = cfg.ProxySnapshotterPath
+	)
+	if address != "" {
+		snFactory := runc.SnapshotterFactory{
+			Name: name,
+		}
+		if _, err := os.Stat(address); os.IsNotExist(err) {
+			return snFactory, errors.Wrapf(err, "snapshotter doesn't exist on %q (Do not include 'unix://' prefix)", address)
+		}
+		snFactory.New = func(root string) (ctdsnapshot.Snapshotter, error) {
+			backoffConfig := backoff.DefaultConfig
+			backoffConfig.MaxDelay = 3 * time.Second
+			connParams := grpc.ConnectParams{
+				Backoff: backoffConfig,
+			}
+			gopts := []grpc.DialOption{
+				grpc.WithInsecure(),
+				grpc.WithConnectParams(connParams),
+				grpc.WithContextDialer(dialer.ContextDialer),
+				grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
+				grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
+			}
+			conn, err := grpc.Dial(dialer.DialAddress(address), gopts...)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to dial %q", address)
+			}
+			return snproxy.NewSnapshotter(snapshotsapi.NewSnapshotsClient(conn), name), nil
+		}
+		return snFactory, nil
+	}
+
 	if name == "auto" {
-		if err := overlay.Supported(commonRoot); err == nil {
+		if err := overlayutils.Supported(commonRoot); err == nil {
 			name = "overlayfs"
 		} else {
 			logrus.Debugf("auto snapshotter: overlayfs is not available for %s, trying fuse-overlayfs: %v", commonRoot, err)
@@ -297,6 +372,35 @@ func snapshotterFactory(commonRoot, name string) (runc.SnapshotterFactory, error
 			// no Opt (AsynchronousRemove is untested for fuse-overlayfs)
 			return fuseoverlayfs.NewSnapshotter(root)
 		}
+	case "stargz":
+		sgzCfg := sgzconf.Config{}
+		if cfg.StargzSnapshotterConfig != nil {
+			// In order to keep the stargz Config type (and dependency) out of
+			// the main BuildKit config, the main config Unmarshalls it into a
+			// generic map[string]interface{}. Here we convert it back into TOML
+			// tree, and unmarshal it to the actual type.
+			t, err := toml.TreeFromMap(cfg.StargzSnapshotterConfig)
+			if err != nil {
+				return snFactory, errors.Wrapf(err, "failed to parse stargz config")
+			}
+			err = t.Unmarshal(&sgzCfg)
+			if err != nil {
+				return snFactory, errors.Wrapf(err, "failed to parse stargz config")
+			}
+		}
+		snFactory.New = func(root string) (ctdsnapshot.Snapshotter, error) {
+			fs, err := sgzfs.NewFilesystem(filepath.Join(root, "stargz"),
+				sgzCfg,
+				// Source info based on the buildkit's registry config and session
+				sgzfs.WithGetSources(sourceWithSession(hosts, sm)),
+			)
+			if err != nil {
+				return nil, err
+			}
+			return remotesn.NewSnapshotter(context.Background(),
+				filepath.Join(root, "snapshotter"),
+				fs, remotesn.AsynchronousRemove)
+		}
 	default:
 		return snFactory, errors.Errorf("unknown snapshotter name: %q", name)
 	}
@@ -311,4 +415,75 @@ func validOCIBinary() bool {
 		return false
 	}
 	return true
+}
+
+const (
+	// targetRefLabel is a label which contains image reference.
+	targetRefLabel = "containerd.io/snapshot/remote/stargz.reference"
+
+	// targetDigestLabel is a label which contains layer digest.
+	targetDigestLabel = "containerd.io/snapshot/remote/stargz.digest"
+
+	// targetImageLayersLabel is a label which contains layer digests contained in
+	// the target image.
+	targetImageLayersLabel = "containerd.io/snapshot/remote/stargz.layers"
+
+	// targetSessionLabel is a labeld which contains session IDs usable for
+	// authenticating the target snapshot.
+	targetSessionLabel = "containerd.io/snapshot/remote/stargz.session"
+)
+
+// sourceWithSession returns a callback which implements a converter from labels to the
+// typed snapshot source info. This callback is called everytime the snapshotter resolves a
+// snapshot. This callback returns configuration that is based on buildkitd's registry config
+// and utilizes the session-based authorizer.
+func sourceWithSession(hosts docker.RegistryHosts, sm *session.Manager) sgzsource.GetSources {
+	return func(labels map[string]string) (src []sgzsource.Source, err error) {
+		// labels contains multiple source candidates with unique IDs appended on each call
+		// to the snapshotter API. So, first, get all these IDs
+		var ids []string
+		for k := range labels {
+			if strings.HasPrefix(k, targetRefLabel+".") {
+				ids = append(ids, strings.TrimPrefix(k, targetRefLabel+"."))
+			}
+		}
+
+		// Parse all labels
+		for _, id := range ids {
+			// Parse session labels
+			ref, ok := labels[targetRefLabel+"."+id]
+			if !ok {
+				continue
+			}
+			named, err := reference.Parse(ref)
+			if err != nil {
+				continue
+			}
+			var sids []string
+			for i := 0; ; i++ {
+				sidKey := targetSessionLabel + "." + fmt.Sprintf("%d", i) + "." + id
+				sid, ok := labels[sidKey]
+				if !ok {
+					break
+				}
+				sids = append(sids, sid)
+			}
+
+			// Get source information based on labels and RegistryHosts containing
+			// session-based authorizer.
+			parse := sgzsource.FromDefaultLabels(func(ref reference.Spec) ([]docker.RegistryHost, error) {
+				return resolver.DefaultPool.GetResolver(hosts, named.String(), "pull", sm, session.NewGroup(sids...)).
+					HostsFunc(ref.Hostname())
+			})
+			if s, err := parse(map[string]string{
+				targetRefLabel:         ref,
+				targetDigestLabel:      labels[targetDigestLabel+"."+id],
+				targetImageLayersLabel: labels[targetImageLayersLabel+"."+id],
+			}); err == nil {
+				src = append(src, s...)
+			}
+		}
+
+		return src, nil
+	}
 }

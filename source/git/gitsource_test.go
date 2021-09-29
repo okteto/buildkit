@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/native"
+	"github.com/docker/docker/pkg/reexec"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/snapshot"
@@ -26,6 +28,12 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+func init() {
+	if reexec.Init() {
+		os.Exit(0)
+	}
+}
+
 func TestRepeatedFetch(t *testing.T) {
 	testRepeatedFetch(t, false)
 }
@@ -34,6 +42,10 @@ func TestRepeatedFetchKeepGitDir(t *testing.T) {
 }
 
 func testRepeatedFetch(t *testing.T, keepGitDir bool) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
 	t.Parallel()
 	ctx := context.TODO()
 
@@ -52,10 +64,10 @@ func testRepeatedFetch(t *testing.T, keepGitDir bool) {
 
 	id := &source.GitIdentifier{Remote: repodir, KeepGitDir: keepGitDir}
 
-	g, err := gs.Resolve(ctx, id, nil)
+	g, err := gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	key1, done, err := g.CacheKey(ctx, nil, 0)
+	key1, pin1, _, done, err := g.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 	require.True(t, done)
 
@@ -65,12 +77,13 @@ func testRepeatedFetch(t *testing.T, keepGitDir bool) {
 	}
 
 	require.Equal(t, expLen, len(key1))
+	require.Equal(t, 40, len(pin1))
 
 	ref1, err := g.Snapshot(ctx, nil)
 	require.NoError(t, err)
 	defer ref1.Release(context.TODO())
 
-	mount, err := ref1.Mount(ctx, false)
+	mount, err := ref1.Mount(ctx, false, nil)
 	require.NoError(t, err)
 
 	lm := snapshot.LocalMounter(mount)
@@ -94,13 +107,14 @@ func testRepeatedFetch(t *testing.T, keepGitDir bool) {
 	// second fetch returns same dir
 	id = &source.GitIdentifier{Remote: repodir, Ref: "master", KeepGitDir: keepGitDir}
 
-	g, err = gs.Resolve(ctx, id, nil)
+	g, err = gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	key2, _, err := g.CacheKey(ctx, nil, 0)
+	key2, pin2, _, _, err := g.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 
 	require.Equal(t, key1, key2)
+	require.Equal(t, pin1, pin2)
 
 	ref2, err := g.Snapshot(ctx, nil)
 	require.NoError(t, err)
@@ -110,18 +124,19 @@ func testRepeatedFetch(t *testing.T, keepGitDir bool) {
 
 	id = &source.GitIdentifier{Remote: repodir, Ref: "feature", KeepGitDir: keepGitDir}
 
-	g, err = gs.Resolve(ctx, id, nil)
+	g, err = gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	key3, _, err := g.CacheKey(ctx, nil, 0)
+	key3, pin3, _, _, err := g.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 	require.NotEqual(t, key1, key3)
+	require.NotEqual(t, pin1, pin3)
 
 	ref3, err := g.Snapshot(ctx, nil)
 	require.NoError(t, err)
 	defer ref3.Release(context.TODO())
 
-	mount, err = ref3.Mount(ctx, false)
+	mount, err = ref3.Mount(ctx, false, nil)
 	require.NoError(t, err)
 
 	lm = snapshot.LocalMounter(mount)
@@ -148,6 +163,10 @@ func TestFetchBySHAKeepGitDir(t *testing.T) {
 }
 
 func testFetchBySHA(t *testing.T, keepGitDir bool) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
@@ -175,10 +194,10 @@ func testFetchBySHA(t *testing.T, keepGitDir bool) {
 
 	id := &source.GitIdentifier{Remote: repodir, Ref: sha, KeepGitDir: keepGitDir}
 
-	g, err := gs.Resolve(ctx, id, nil)
+	g, err := gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	key1, done, err := g.CacheKey(ctx, nil, 0)
+	key1, pin1, _, done, err := g.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 	require.True(t, done)
 
@@ -188,12 +207,13 @@ func testFetchBySHA(t *testing.T, keepGitDir bool) {
 	}
 
 	require.Equal(t, expLen, len(key1))
+	require.Equal(t, 40, len(pin1))
 
 	ref1, err := g.Snapshot(ctx, nil)
 	require.NoError(t, err)
 	defer ref1.Release(context.TODO())
 
-	mount, err := ref1.Mount(ctx, false)
+	mount, err := ref1.Mount(ctx, false, nil)
 	require.NoError(t, err)
 
 	lm := snapshot.LocalMounter(mount)
@@ -221,6 +241,10 @@ func TestMultipleReposKeepGitDir(t *testing.T) {
 }
 
 func testMultipleRepos(t *testing.T, keepGitDir bool) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
@@ -254,10 +278,10 @@ func testMultipleRepos(t *testing.T, keepGitDir bool) {
 	id := &source.GitIdentifier{Remote: repodir, KeepGitDir: keepGitDir}
 	id2 := &source.GitIdentifier{Remote: repodir2, KeepGitDir: keepGitDir}
 
-	g, err := gs.Resolve(ctx, id, nil)
+	g, err := gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	g2, err := gs.Resolve(ctx, id2, nil)
+	g2, err := gs.Resolve(ctx, id2, nil, nil)
 	require.NoError(t, err)
 
 	expLen := 40
@@ -265,21 +289,24 @@ func testMultipleRepos(t *testing.T, keepGitDir bool) {
 		expLen += 4
 	}
 
-	key1, _, err := g.CacheKey(ctx, nil, 0)
+	key1, pin1, _, _, err := g.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, expLen, len(key1))
+	require.Equal(t, 40, len(pin1))
 
-	key2, _, err := g2.CacheKey(ctx, nil, 0)
+	key2, pin2, _, _, err := g2.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, expLen, len(key2))
+	require.Equal(t, 40, len(pin2))
 
 	require.NotEqual(t, key1, key2)
+	require.NotEqual(t, pin1, pin2)
 
 	ref1, err := g.Snapshot(ctx, nil)
 	require.NoError(t, err)
 	defer ref1.Release(context.TODO())
 
-	mount, err := ref1.Mount(ctx, false)
+	mount, err := ref1.Mount(ctx, false, nil)
 	require.NoError(t, err)
 
 	lm := snapshot.LocalMounter(mount)
@@ -291,7 +318,7 @@ func testMultipleRepos(t *testing.T, keepGitDir bool) {
 	require.NoError(t, err)
 	defer ref2.Release(context.TODO())
 
-	mount, err = ref2.Mount(ctx, false)
+	mount, err = ref2.Mount(ctx, false, nil)
 	require.NoError(t, err)
 
 	lm = snapshot.LocalMounter(mount)
@@ -310,11 +337,110 @@ func testMultipleRepos(t *testing.T, keepGitDir bool) {
 	require.Equal(t, "xyz\n", string(dt))
 }
 
+func TestCredentialRedaction(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir, err := ioutil.TempDir("", "buildkit-state")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	gs := setupGitSource(t, tmpdir)
+
+	url := "https://user:keepthissecret@non-existant-host/user/private-repo.git"
+	id := &source.GitIdentifier{Remote: url}
+
+	g, err := gs.Resolve(ctx, id, nil, nil)
+	require.NoError(t, err)
+
+	_, _, _, _, err = g.CacheKey(ctx, nil, 0)
+	require.Error(t, err)
+	require.False(t, strings.Contains(err.Error(), "keepthissecret"))
+}
+
+func TestSubdir(t *testing.T) {
+	testSubdir(t, false)
+}
+func TestSubdirKeepGitDir(t *testing.T) {
+	testSubdir(t, true)
+}
+
+func testSubdir(t *testing.T, keepGitDir bool) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := context.TODO()
+
+	tmpdir, err := ioutil.TempDir("", "buildkit-state")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	gs := setupGitSource(t, tmpdir)
+
+	repodir, err := ioutil.TempDir("", "buildkit-gitsource")
+	require.NoError(t, err)
+	defer os.RemoveAll(repodir)
+
+	err = runShell(repodir,
+		"git init",
+		"git config --local user.email test",
+		"git config --local user.name test",
+		"echo foo > abc",
+		"mkdir sub",
+		"echo abc > sub/bar",
+		"git add abc sub",
+		"git commit -m initial",
+	)
+	require.NoError(t, err)
+
+	id := &source.GitIdentifier{Remote: repodir, KeepGitDir: keepGitDir, Subdir: "sub"}
+
+	g, err := gs.Resolve(ctx, id, nil, nil)
+	require.NoError(t, err)
+
+	key1, pin1, _, done, err := g.CacheKey(ctx, nil, 0)
+	require.NoError(t, err)
+	require.True(t, done)
+
+	expLen := 44
+	if keepGitDir {
+		expLen += 4
+	}
+
+	require.Equal(t, expLen, len(key1))
+	require.Equal(t, 40, len(pin1))
+
+	ref1, err := g.Snapshot(ctx, nil)
+	require.NoError(t, err)
+	defer ref1.Release(context.TODO())
+
+	mount, err := ref1.Mount(ctx, false, nil)
+	require.NoError(t, err)
+
+	lm := snapshot.LocalMounter(mount)
+	dir, err := lm.Mount()
+	require.NoError(t, err)
+	defer lm.Unmount()
+
+	fis, err := ioutil.ReadDir(dir)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, len(fis))
+
+	dt, err := ioutil.ReadFile(filepath.Join(dir, "bar"))
+	require.NoError(t, err)
+
+	require.Equal(t, "abc\n", string(dt))
+}
+
 func setupGitSource(t *testing.T, tmpdir string) source.Source {
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
-	assert.NoError(t, err)
-
-	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
 	assert.NoError(t, err)
 
 	store, err := local.NewStore(tmpdir)
@@ -327,6 +453,9 @@ func setupGitSource(t *testing.T, tmpdir string) source.Source {
 		"native": snapshotter,
 	})
 
+	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
+	require.NoError(t, err)
+
 	cm, err := cache.NewManager(cache.ManagerOpt{
 		Snapshotter:    snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil),
 		MetadataStore:  md,
@@ -338,7 +467,6 @@ func setupGitSource(t *testing.T, tmpdir string) source.Source {
 
 	gs, err := NewSource(Opt{
 		CacheAccessor: cm,
-		MetadataStore: md,
 	})
 	require.NoError(t, err)
 
@@ -384,6 +512,7 @@ func setupGitRepo(dir string) (string, error) {
 		"git submodule add "+subPath+" sub",
 		"git add -A",
 		"git commit -m withsub",
+		"git checkout master",
 	); err != nil {
 		return "", err
 	}
@@ -392,8 +521,14 @@ func setupGitRepo(dir string) (string, error) {
 
 func runShell(dir string, cmds ...string) error {
 	for _, args := range cmds {
-		cmd := exec.Command("sh", "-c", args)
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("powershell", "-command", args)
+		} else {
+			cmd = exec.Command("sh", "-c", args)
+		}
 		cmd.Dir = dir
+		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return errors.Wrapf(err, "error running %v", args)
 		}

@@ -14,8 +14,10 @@ import (
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/buildkit/util/resolver/limited"
+	"github.com/moby/buildkit/util/resolver/retryhandler"
 	digest "github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
@@ -36,7 +38,13 @@ func CancelCacheLeases() {
 	leasesMu.Unlock()
 }
 
-func Config(ctx context.Context, str string, resolver remotes.Resolver, cache ContentCache, leaseManager leases.Manager, p *specs.Platform) (digest.Digest, []byte, error) {
+func AddLease(f func(context.Context) error) {
+	leasesMu.Lock()
+	leasesF = append(leasesF, f)
+	leasesMu.Unlock()
+}
+
+func Config(ctx context.Context, str string, resolver remotes.Resolver, cache ContentCache, leaseManager leases.Manager, p *ocispecs.Platform) (digest.Digest, []byte, error) {
 	// TODO: fix buildkit to take interface instead of struct
 	var platform platforms.MatchComparer
 	if p != nil {
@@ -57,13 +65,11 @@ func Config(ctx context.Context, str string, resolver remotes.Resolver, cache Co
 		ctx = ctx2
 		defer func() {
 			// this lease is not deleted to allow other components to access manifest/config from cache. It will be deleted after 5 min deadline or on pruning inactive builder
-			leasesMu.Lock()
-			leasesF = append(leasesF, done)
-			leasesMu.Unlock()
+			AddLease(done)
 		}()
 	}
 
-	desc := specs.Descriptor{
+	desc := ocispecs.Descriptor{
 		Digest: ref.Digest(),
 	}
 	if desc.Digest != "" {
@@ -96,7 +102,7 @@ func Config(ctx context.Context, str string, resolver remotes.Resolver, cache Co
 	children := childrenConfigHandler(cache, platform)
 
 	handlers := []images.Handler{
-		remotes.FetchHandler(cache, fetcher),
+		retryhandler.New(limited.FetchHandler(cache, fetcher, str), func(_ []byte) {}),
 		children,
 	}
 	if err := images.Dispatch(ctx, images.Handlers(handlers...), nil, desc); err != nil {
@@ -116,10 +122,10 @@ func Config(ctx context.Context, str string, resolver remotes.Resolver, cache Co
 }
 
 func childrenConfigHandler(provider content.Provider, platform platforms.MatchComparer) images.HandlerFunc {
-	return func(ctx context.Context, desc specs.Descriptor) ([]specs.Descriptor, error) {
-		var descs []specs.Descriptor
+	return func(ctx context.Context, desc ocispecs.Descriptor) ([]ocispecs.Descriptor, error) {
+		var descs []ocispecs.Descriptor
 		switch desc.MediaType {
-		case images.MediaTypeDockerSchema2Manifest, specs.MediaTypeImageManifest:
+		case images.MediaTypeDockerSchema2Manifest, ocispecs.MediaTypeImageManifest:
 			p, err := content.ReadBlob(ctx, provider, desc)
 			if err != nil {
 				return nil, err
@@ -127,19 +133,19 @@ func childrenConfigHandler(provider content.Provider, platform platforms.MatchCo
 
 			// TODO(stevvooe): We just assume oci manifest, for now. There may be
 			// subtle differences from the docker version.
-			var manifest specs.Manifest
+			var manifest ocispecs.Manifest
 			if err := json.Unmarshal(p, &manifest); err != nil {
 				return nil, err
 			}
 
 			descs = append(descs, manifest.Config)
-		case images.MediaTypeDockerSchema2ManifestList, specs.MediaTypeImageIndex:
+		case images.MediaTypeDockerSchema2ManifestList, ocispecs.MediaTypeImageIndex:
 			p, err := content.ReadBlob(ctx, provider, desc)
 			if err != nil {
 				return nil, err
 			}
 
-			var index specs.Index
+			var index ocispecs.Index
 			if err := json.Unmarshal(p, &index); err != nil {
 				return nil, err
 			}
@@ -153,7 +159,7 @@ func childrenConfigHandler(provider content.Provider, platform platforms.MatchCo
 			} else {
 				descs = append(descs, index.Manifests...)
 			}
-		case images.MediaTypeDockerSchema2Config, specs.MediaTypeImageConfig, docker.LegacyConfigMediaType:
+		case images.MediaTypeDockerSchema2Config, ocispecs.MediaTypeImageConfig, docker.LegacyConfigMediaType:
 			// childless data types.
 			return nil, nil
 		default:

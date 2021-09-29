@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/moby/buildkit/identity"
+	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
@@ -213,34 +214,41 @@ func (cs *cacheResultStorage) Save(res solver.Result, createdAt time.Time) (solv
 }
 
 func (cs *cacheResultStorage) LoadWithParents(ctx context.Context, res solver.CacheResult) (map[string]solver.Result, error) {
-	v := cs.byResultID(res.ID)
-	if v == nil || v.result == nil {
+	m := map[string]solver.Result{}
+
+	visited := make(map[*item]struct{})
+
+	ids, ok := cs.byResult[res.ID]
+	if !ok || len(ids) == 0 {
 		return nil, errors.WithStack(solver.ErrNotFound)
 	}
 
-	m := map[string]solver.Result{}
-
-	if err := v.walkAllResults(func(i *item) error {
-		if i.result == nil {
-			return nil
-		}
-		id, ok := cs.byItem[i]
-		if !ok {
-			return nil
-		}
-		if isSubRemote(*i.result, *v.result) {
-			ref, err := cs.w.FromRemote(ctx, i.result)
-			if err != nil {
-				return err
+	for id := range ids {
+		v, ok := cs.byID[id]
+		if ok && v.result != nil {
+			if err := v.walkAllResults(func(i *item) error {
+				if i.result == nil {
+					return nil
+				}
+				id, ok := cs.byItem[i]
+				if !ok {
+					return nil
+				}
+				if isSubRemote(*i.result, *v.result) {
+					ref, err := cs.w.FromRemote(ctx, i.result)
+					if err != nil {
+						return err
+					}
+					m[id] = worker.NewWorkerRefResult(ref, cs.w)
+				}
+				return nil
+			}, visited); err != nil {
+				for _, v := range m {
+					v.Release(context.TODO())
+				}
+				return nil, err
 			}
-			m[id] = worker.NewWorkerRefResult(ref, cs.w)
 		}
-		return nil
-	}); err != nil {
-		for _, v := range m {
-			v.Release(context.TODO())
-		}
-		return nil, err
 	}
 
 	return m, nil
@@ -259,7 +267,7 @@ func (cs *cacheResultStorage) Load(ctx context.Context, res solver.CacheResult) 
 	return worker.NewWorkerRefResult(ref, cs.w), nil
 }
 
-func (cs *cacheResultStorage) LoadRemote(ctx context.Context, res solver.CacheResult) (*solver.Remote, error) {
+func (cs *cacheResultStorage) LoadRemote(ctx context.Context, res solver.CacheResult, _ session.Group) (*solver.Remote, error) {
 	if r := cs.byResultID(res.ID); r != nil && r.result != nil {
 		return r.result, nil
 	}

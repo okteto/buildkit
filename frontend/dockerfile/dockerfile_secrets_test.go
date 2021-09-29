@@ -1,9 +1,6 @@
-// +build dfsecrets
-
 package dockerfile
 
 import (
-	"context"
 	"os"
 	"testing"
 
@@ -18,6 +15,7 @@ import (
 
 var secretsTests = []integration.Test{
 	testSecretFileParams,
+	testSecretRequiredWithoutValue,
 }
 
 func init() {
@@ -30,6 +28,7 @@ func testSecretFileParams(t *testing.T, sb integration.Sandbox) {
 	dockerfile := []byte(`
 FROM busybox
 RUN --mount=type=secret,required=false,mode=741,uid=100,gid=102,target=/mysecret [ "$(stat -c "%u %g %f" /mysecret)" = "100 102 81e1" ]
+RUN [ ! -f /mysecret ] # check no stub left behind
 `)
 
 	dir, err := tmpdir(
@@ -38,11 +37,11 @@ RUN --mount=type=secret,required=false,mode=741,uid=100,gid=102,target=/mysecret
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
 			builder.DefaultLocalNameDockerfile: dir,
 			builder.DefaultLocalNameContext:    dir,
@@ -52,4 +51,32 @@ RUN --mount=type=secret,required=false,mode=741,uid=100,gid=102,target=/mysecret
 		})},
 	}, nil)
 	require.NoError(t, err)
+}
+
+func testSecretRequiredWithoutValue(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM busybox
+RUN --mount=type=secret,required,id=mysecret foo
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "secret mysecret: not found")
 }

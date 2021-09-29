@@ -25,11 +25,9 @@ func NewBuildOp(source llb.Output, opt ...BuildOption) llb.Vertex {
 
 type build struct {
 	llb.MarshalCache
-	source         llb.Output
-	info           *BuildInfo
-	cachedPBDigest digest.Digest
-	cachedPB       []byte
-	constraints    llb.Constraints
+	source      llb.Output
+	info        *BuildInfo
+	constraints llb.Constraints
 }
 
 func (b *build) ToInput(ctx context.Context, c *llb.Constraints) (*pb.Input, error) {
@@ -40,11 +38,11 @@ func (b *build) ToInput(ctx context.Context, c *llb.Constraints) (*pb.Input, err
 	return &pb.Input{Digest: dgst, Index: pb.OutputIndex(0)}, nil
 }
 
-func (b *build) Vertex(context.Context) llb.Vertex {
+func (b *build) Vertex(context.Context, *llb.Constraints) llb.Vertex {
 	return b
 }
 
-func (b *build) Validate(context.Context) error {
+func (b *build) Validate(context.Context, *llb.Constraints) error {
 	return nil
 }
 

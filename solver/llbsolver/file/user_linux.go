@@ -2,6 +2,7 @@ package file
 
 import (
 	"os"
+	"syscall"
 
 	"github.com/containerd/continuity/fs"
 	"github.com/moby/buildkit/snapshot"
@@ -45,6 +46,10 @@ func readUser(chopt *pb.ChownOpt, mu, mg fileoptypes.Mount) (*copy.User, error) 
 			}
 
 			ufile, err := os.Open(passwdPath)
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+				// Couldn't open the file. Considering this case as not finding the user in the file.
+				break
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -58,12 +63,12 @@ func readUser(chopt *pb.ChownOpt, mu, mg fileoptypes.Mount) (*copy.User, error) 
 			}
 
 			if len(users) > 0 {
-				us.Uid = users[0].Uid
-				us.Gid = users[0].Gid
+				us.UID = users[0].Uid
+				us.GID = users[0].Gid
 			}
 		case *pb.UserOpt_ByID:
-			us.Uid = int(u.ByID)
-			us.Gid = int(u.ByID)
+			us.UID = int(u.ByID)
+			us.GID = int(u.ByID)
 		}
 	}
 
@@ -95,6 +100,10 @@ func readUser(chopt *pb.ChownOpt, mu, mg fileoptypes.Mount) (*copy.User, error) 
 			}
 
 			gfile, err := os.Open(groupPath)
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+				// Couldn't open the file. Considering this case as not finding the group in the file.
+				break
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -108,10 +117,10 @@ func readUser(chopt *pb.ChownOpt, mu, mg fileoptypes.Mount) (*copy.User, error) 
 			}
 
 			if len(groups) > 0 {
-				us.Gid = groups[0].Gid
+				us.GID = groups[0].Gid
 			}
 		case *pb.UserOpt_ByID:
-			us.Gid = int(u.ByID)
+			us.GID = int(u.ByID)
 		}
 	}
 

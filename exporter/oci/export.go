@@ -9,16 +9,21 @@ import (
 	archiveexporter "github.com/containerd/containerd/images/archive"
 	"github.com/containerd/containerd/leases"
 	"github.com/docker/distribution/reference"
-	"github.com/moby/buildkit/cache/blobs"
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/exporter"
 	"github.com/moby/buildkit/exporter/containerimage"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/filesync"
+	"github.com/moby/buildkit/util/buildinfo"
+	"github.com/moby/buildkit/util/compression"
+	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/progress"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 )
 
@@ -30,6 +35,8 @@ const (
 	VariantOCI          = "oci"
 	VariantDocker       = "docker"
 	ociTypes            = "oci-mediatypes"
+	keyForceCompression = "force-compression"
+	keyBuildInfo        = "buildinfo"
 )
 
 type Opt struct {
@@ -52,8 +59,10 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 	var ot *bool
 	i := &imageExporterInstance{
 		imageExporter:    e,
-		layerCompression: blobs.DefaultCompression,
+		layerCompression: compression.Default,
+		buildInfoMode:    buildinfo.ExportDefault,
 	}
+	var esgz bool
 	for k, v := range opt {
 		switch k {
 		case keyImageName:
@@ -61,12 +70,27 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 		case keyLayerCompression:
 			switch v {
 			case "gzip":
-				i.layerCompression = blobs.Gzip
+				i.layerCompression = compression.Gzip
+			case "estargz":
+				i.layerCompression = compression.EStargz
+				esgz = true
+			case "zstd":
+				i.layerCompression = compression.Zstd
 			case "uncompressed":
-				i.layerCompression = blobs.Uncompressed
+				i.layerCompression = compression.Uncompressed
 			default:
 				return nil, errors.Errorf("unsupported layer compression type: %v", v)
 			}
+		case keyForceCompression:
+			if v == "" {
+				i.forceCompression = true
+				continue
+			}
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
+			}
+			i.forceCompression = b
 		case ociTypes:
 			ot = new(bool)
 			if v == "" {
@@ -78,6 +102,15 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
 			}
 			*ot = b
+		case keyBuildInfo:
+			if v == "" {
+				continue
+			}
+			bimode, err := buildinfo.ParseExportMode(v)
+			if err != nil {
+				return nil, err
+			}
+			i.buildInfoMode = bimode
 		default:
 			if i.meta == nil {
 				i.meta = make(map[string][]byte)
@@ -90,6 +123,10 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 	} else {
 		i.ociTypes = *ot
 	}
+	if esgz && !i.ociTypes {
+		logrus.Warn("forcibly turning on oci-mediatype mode for estargz")
+		i.ociTypes = true
+	}
 	return i, nil
 }
 
@@ -98,7 +135,9 @@ type imageExporterInstance struct {
 	meta             map[string][]byte
 	name             string
 	ociTypes         bool
-	layerCompression blobs.CompressionType
+	layerCompression compression.Type
+	forceCompression bool
+	buildInfoMode    buildinfo.ExportMode
 }
 
 func (e *imageExporterInstance) Name() string {
@@ -123,20 +162,34 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 	}
 	defer done(context.TODO())
 
-	desc, err := e.opt.ImageWriter.Commit(ctx, src, e.ociTypes, e.layerCompression)
+	desc, err := e.opt.ImageWriter.Commit(ctx, src, e.ociTypes, e.layerCompression, e.buildInfoMode, e.forceCompression, sessionID)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		e.opt.ImageWriter.ContentStore().Delete(context.TODO(), desc.Digest)
 	}()
+
+	if e.buildInfoMode&buildinfo.ExportMetadata == 0 {
+		for k := range src.Metadata {
+			if !strings.HasPrefix(k, exptypes.ExporterBuildInfo) {
+				continue
+			}
+			delete(src.Metadata, k)
+		}
+	}
+
 	if desc.Annotations == nil {
 		desc.Annotations = map[string]string{}
 	}
-	desc.Annotations[ocispec.AnnotationCreated] = time.Now().UTC().Format(time.RFC3339)
+	desc.Annotations[ocispecs.AnnotationCreated] = time.Now().UTC().Format(time.RFC3339)
 
 	resp := make(map[string]string)
-	resp["containerimage.digest"] = desc.Digest.String()
+	resp[exptypes.ExporterImageDigestKey] = desc.Digest.String()
+	if v, ok := desc.Annotations[exptypes.ExporterConfigDigestKey]; ok {
+		resp[exptypes.ExporterImageConfigDigestKey] = v
+		delete(desc.Annotations, exptypes.ExporterConfigDigestKey)
+	}
 
 	if n, ok := src.Metadata["image.name"]; e.name == "*" && ok {
 		e.name = string(n)
@@ -163,7 +216,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	caller, err := e.opt.SessionManager.Get(timeoutCtx, sessionID)
+	caller, err := e.opt.SessionManager.Get(timeoutCtx, sessionID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -172,8 +225,43 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 	if err != nil {
 		return nil, err
 	}
+
+	mprovider := contentutil.NewMultiProvider(e.opt.ImageWriter.ContentStore())
+	if src.Ref != nil {
+		remote, err := src.Ref.GetRemote(ctx, false, e.layerCompression, e.forceCompression, session.NewGroup(sessionID))
+		if err != nil {
+			return nil, err
+		}
+		// unlazy before tar export as the tar writer does not handle
+		// layer blobs in parallel (whereas unlazy does)
+		if unlazier, ok := remote.Provider.(cache.Unlazier); ok {
+			if err := unlazier.Unlazy(ctx); err != nil {
+				return nil, err
+			}
+		}
+		for _, desc := range remote.Descriptors {
+			mprovider.Add(desc.Digest, remote.Provider)
+		}
+	}
+	if len(src.Refs) > 0 {
+		for _, r := range src.Refs {
+			remote, err := r.GetRemote(ctx, false, e.layerCompression, e.forceCompression, session.NewGroup(sessionID))
+			if err != nil {
+				return nil, err
+			}
+			if unlazier, ok := remote.Provider.(cache.Unlazier); ok {
+				if err := unlazier.Unlazy(ctx); err != nil {
+					return nil, err
+				}
+			}
+			for _, desc := range remote.Descriptors {
+				mprovider.Add(desc.Digest, remote.Provider)
+			}
+		}
+	}
+
 	report := oneOffProgress(ctx, "sending tarball")
-	if err := archiveexporter.Export(ctx, e.opt.ImageWriter.ContentStore(), w, expOpts...); err != nil {
+	if err := archiveexporter.Export(ctx, mprovider, w, expOpts...); err != nil {
 		w.Close()
 		if grpcerrors.Code(err) == codes.AlreadyExists {
 			return resp, report(nil)
@@ -188,7 +276,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 }
 
 func oneOffProgress(ctx context.Context, id string) func(err error) error {
-	pw, _, _ := progress.FromContext(ctx)
+	pw, _, _ := progress.NewFromContext(ctx)
 	now := time.Now()
 	st := progress.Status{
 		Started: &now,

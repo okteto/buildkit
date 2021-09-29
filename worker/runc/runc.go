@@ -21,8 +21,9 @@ import (
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/util/winlayers"
 	"github.com/moby/buildkit/worker/base"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	bolt "go.etcd.io/bbolt"
+	"golang.org/x/sync/semaphore"
 )
 
 // SnapshotterFactory instantiates a snapshotter
@@ -32,7 +33,7 @@ type SnapshotterFactory struct {
 }
 
 // NewWorkerOpt creates a WorkerOpt.
-func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, processMode oci.ProcessMode, labels map[string]string, idmap *idtools.IdentityMapping, nopt netproviders.Opt, dns *oci.DNSConfig, binary string) (base.WorkerOpt, error) {
+func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, processMode oci.ProcessMode, labels map[string]string, idmap *idtools.IdentityMapping, nopt netproviders.Opt, dns *oci.DNSConfig, binary, apparmorProfile string, parallelismSem *semaphore.Weighted, traceSocket string) (base.WorkerOpt, error) {
 	var opt base.WorkerOpt
 	name := "runc-" + snFactory.Name
 	root = filepath.Join(root, name)
@@ -62,6 +63,8 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		ProcessMode:     processMode,
 		IdentityMapping: idmap,
 		DNS:             dns,
+		ApparmorProfile: apparmorProfile,
+		TracingSocket:   traceSocket,
 	}, np)
 	if err != nil {
 		return opt, err
@@ -100,7 +103,15 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 	}
 	snap := containerdsnapshot.NewSnapshotter(snFactory.Name, mdb.Snapshotter(snFactory.Name), "buildkit", idmap)
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
-	if err := cache.MigrateV2(context.TODO(), filepath.Join(root, "metadata.db"), filepath.Join(root, "metadata_v2.db"), c, snap, lm); err != nil {
+
+	if err := cache.MigrateV2(
+		context.TODO(),
+		filepath.Join(root, "metadata.db"),
+		filepath.Join(root, "metadata_v2.db"),
+		c,
+		snap,
+		lm,
+	); err != nil {
 		return opt, err
 	}
 
@@ -119,10 +130,11 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		Applier:         winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c)),
 		Differ:          winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c)),
 		ImageStore:      nil, // explicitly
-		Platforms:       []specs.Platform{platforms.Normalize(platforms.DefaultSpec())},
+		Platforms:       []ocispecs.Platform{platforms.Normalize(platforms.DefaultSpec())},
 		IdentityMapping: idmap,
 		LeaseManager:    lm,
 		GarbageCollect:  mdb.GarbageCollect,
+		ParallelismSem:  parallelismSem,
 	}
 	return opt, nil
 }

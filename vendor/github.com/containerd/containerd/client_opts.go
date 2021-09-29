@@ -23,6 +23,7 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/snapshots"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"google.golang.org/grpc"
 )
@@ -175,6 +176,18 @@ func WithPullLabels(labels map[string]string) RemoteOpt {
 	}
 }
 
+// WithChildLabelMap sets the map function used to define the labels set
+// on referenced child content in the content store. This can be used
+// to overwrite the default GC labels or filter which labels get set
+// for content.
+// The default is `images.ChildGCLabels`.
+func WithChildLabelMap(fn func(ocispec.Descriptor) []string) RemoteOpt {
+	return func(_ *Client, c *RemoteContext) error {
+		c.ChildLabelMap = fn
+		return nil
+	}
+}
+
 // WithSchema1Conversion is used to convert Docker registry schema 1
 // manifests to oci manifests on pull. Without this option schema 1
 // manifests will return a not supported error.
@@ -211,6 +224,14 @@ func WithImageHandlerWrapper(w func(images.Handler) images.Handler) RemoteOpt {
 func WithMaxConcurrentDownloads(max int) RemoteOpt {
 	return func(client *Client, c *RemoteContext) error {
 		c.MaxConcurrentDownloads = max
+		return nil
+	}
+}
+
+// WithMaxConcurrentUploadedLayers sets max concurrent uploaded layer limit.
+func WithMaxConcurrentUploadedLayers(max int) RemoteOpt {
+	return func(client *Client, c *RemoteContext) error {
+		c.MaxConcurrentUploadedLayers = max
 		return nil
 	}
 }

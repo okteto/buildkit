@@ -32,7 +32,7 @@ import (
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/runtime/v2/runc/options"
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/fifo"
 	"github.com/containerd/typeurl"
 	prototypes "github.com/gogo/protobuf/types"
 	ver "github.com/opencontainers/image-spec/specs-go"
@@ -290,6 +290,7 @@ func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...N
 		client: c.client,
 		io:     i,
 		id:     c.id,
+		c:      c,
 	}
 	if info.Checkpoint != nil {
 		request.Checkpoint = info.Checkpoint
@@ -407,6 +408,7 @@ func (c *container) loadTask(ctx context.Context, ioAttach cio.Attach) (Task, er
 		io:     i,
 		id:     response.Process.ID,
 		pid:    response.Process.Pid,
+		c:      c,
 	}
 	return t, nil
 }
@@ -433,12 +435,12 @@ func loadFifos(response *tasks.GetResponse) *cio.FIFOSet {
 			err  error
 			dirs = map[string]struct{}{}
 		)
-		for _, fifo := range fifos {
-			if isFifo, _ := sys.IsFifo(fifo); isFifo {
-				if rerr := os.Remove(fifo); err == nil {
+		for _, f := range fifos {
+			if isFifo, _ := fifo.IsFifo(f); isFifo {
+				if rerr := os.Remove(f); err == nil {
 					err = rerr
 				}
-				dirs[filepath.Dir(fifo)] = struct{}{}
+				dirs[filepath.Dir(f)] = struct{}{}
 			}
 		}
 		for dir := range dirs {

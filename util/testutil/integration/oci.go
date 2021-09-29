@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -23,21 +24,28 @@ func InitOCIWorker() {
 		}
 	}
 
+	if s := os.Getenv("BUILDKIT_INTEGRATION_SNAPSHOTTER"); s != "" {
+		Register(&oci{snapshotter: s})
+	}
 }
 
 type oci struct {
-	uid int
-	gid int
+	uid         int
+	gid         int
+	snapshotter string
 }
 
 func (s *oci) Name() string {
 	if s.uid != 0 {
 		return "oci-rootless"
 	}
+	if s.snapshotter != "" {
+		return fmt.Sprintf("oci-snapshotter-%s", s.snapshotter)
+	}
 	return "oci"
 }
 
-func (s *oci) New(cfg *BackendConfig) (Backend, func() error, error) {
+func (s *oci) New(ctx context.Context, cfg *BackendConfig) (Backend, func() error, error) {
 	if err := lookupBinary("buildkitd"); err != nil {
 		return nil, nil, err
 	}
@@ -47,22 +55,28 @@ func (s *oci) New(cfg *BackendConfig) (Backend, func() error, error) {
 	// Include use of --oci-worker-labels to trigger https://github.com/moby/buildkit/pull/603
 	buildkitdArgs := []string{"buildkitd", "--oci-worker=true", "--containerd-worker=false", "--oci-worker-gc=false", "--oci-worker-labels=org.mobyproject.buildkit.worker.sandbox=true"}
 
+	if s.snapshotter != "" {
+		buildkitdArgs = append(buildkitdArgs,
+			fmt.Sprintf("--oci-worker-snapshotter=%s", s.snapshotter))
+	}
+
 	if s.uid != 0 {
 		if s.gid == 0 {
 			return nil, nil, errors.Errorf("unsupported id pair: uid=%d, gid=%d", s.uid, s.gid)
 		}
 		// TODO: make sure the user exists and subuid/subgid are configured.
-		buildkitdArgs = append([]string{"sudo", "-u", fmt.Sprintf("#%d", s.uid), "-i", "--", "rootlesskit"}, buildkitdArgs...)
+		buildkitdArgs = append([]string{"sudo", "-u", fmt.Sprintf("#%d", s.uid), "-i", "--", "exec", "rootlesskit"}, buildkitdArgs...)
 	}
 
-	buildkitdSock, stop, err := runBuildkitd(cfg, buildkitdArgs, cfg.Logs, s.uid, s.gid)
+	buildkitdSock, stop, err := runBuildkitd(ctx, cfg, buildkitdArgs, cfg.Logs, s.uid, s.gid, nil)
 	if err != nil {
 		printLogs(cfg.Logs, log.Println)
 		return nil, nil, err
 	}
 
 	return backend{
-		address:  buildkitdSock,
-		rootless: s.uid != 0,
+		address:     buildkitdSock,
+		rootless:    s.uid != 0,
+		snapshotter: s.snapshotter,
 	}, stop, nil
 }

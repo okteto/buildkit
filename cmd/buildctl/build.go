@@ -6,7 +6,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/containerd/console"
+	"github.com/containerd/continuity"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/cmd/buildctl/build"
@@ -15,7 +15,7 @@ import (
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/buildkit/solver/pb"
-	"github.com/moby/buildkit/util/progress/progressui"
+	"github.com/moby/buildkit/util/progress/progresswriter"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -101,6 +101,10 @@ var buildCommand = cli.Command{
 		cli.StringSliceFlag{
 			Name:  "ssh",
 			Usage: "Allow forwarding SSH agent to the builder. Format default|<id>[=<socket>|<key>[,<key>]]",
+		},
+		cli.StringFlag{
+			Name:  "metadata-file",
+			Usage: "Output build metadata (e.g., image digest) to a file as JSON",
 		},
 	},
 }
@@ -204,7 +208,6 @@ func buildAction(clicontext *cli.Context) error {
 		return err
 	}
 
-	ch := make(chan *client.SolveStatus)
 	eg, ctx := errgroup.WithContext(bccommon.CommandContext(clicontext))
 
 	solveOpt := client.SolveOpt{
@@ -246,53 +249,75 @@ func buildAction(clicontext *cli.Context) error {
 		}
 	}
 
+	// not using shared context to not disrupt display but let is finish reporting errors
+	pw, err := progresswriter.NewPrinter(context.TODO(), os.Stderr, clicontext.String("progress"))
+	if err != nil {
+		return err
+	}
+
+	if traceEnc != nil {
+		traceCh := make(chan *client.SolveStatus)
+		pw = progresswriter.Tee(pw, traceCh)
+		eg.Go(func() error {
+			for s := range traceCh {
+				if err := traceEnc.Encode(s); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	mw := progresswriter.NewMultiWriter(pw)
+
+	var writers []progresswriter.Writer
+	for _, at := range attachable {
+		if s, ok := at.(interface {
+			SetLogger(progresswriter.Logger)
+		}); ok {
+			w := mw.WithPrefix("", false)
+			s.SetLogger(func(s *client.SolveStatus) {
+				w.Status() <- s
+			})
+			writers = append(writers, w)
+		}
+	}
+
 	eg.Go(func() error {
-		resp, err := c.Solve(ctx, def, solveOpt, ch)
+		defer func() {
+			for _, w := range writers {
+				close(w.Status())
+			}
+		}()
+		resp, err := c.Solve(ctx, def, solveOpt, progresswriter.ResetTime(mw.WithPrefix("", false)).Status())
 		if err != nil {
 			return err
 		}
 		for k, v := range resp.ExporterResponse {
 			logrus.Debugf("exporter response: %s=%s", k, v)
 		}
-		return err
-	})
 
-	displayCh := ch
-	if traceEnc != nil {
-		displayCh = make(chan *client.SolveStatus)
-		eg.Go(func() error {
-			defer close(displayCh)
-			for s := range ch {
-				if err := traceEnc.Encode(s); err != nil {
-					logrus.Error(err)
-				}
-				displayCh <- s
-			}
-			return nil
-		})
-	}
-
-	eg.Go(func() error {
-		var c console.Console
-		progressOpt := clicontext.String("progress")
-
-		switch progressOpt {
-		case "auto", "tty":
-			cf, err := console.ConsoleFromFile(os.Stderr)
-			if err != nil && progressOpt == "tty" {
+		metadataFile := clicontext.String("metadata-file")
+		if metadataFile != "" && resp.ExporterResponse != nil {
+			if err := writeMetadataFile(metadataFile, resp.ExporterResponse); err != nil {
 				return err
 			}
-			c = cf
-		case "plain":
-		default:
-			return errors.Errorf("invalid progress value : %s", progressOpt)
 		}
 
-		// not using shared context to not disrupt display but let is finish reporting errors
-		return progressui.DisplaySolveStatus(context.TODO(), "", c, os.Stderr, displayCh)
+		return nil
 	})
 
-	err = eg.Wait()
+	eg.Go(func() error {
+		<-pw.Done()
+		return pw.Err()
+	})
 
-	return err
+	return eg.Wait()
+}
+
+func writeMetadataFile(filename string, exporterResponse map[string]string) error {
+	b, err := json.Marshal(exporterResponse)
+	if err != nil {
+		return err
+	}
+	return continuity.AtomicWriteFile(filename, b, 0666)
 }

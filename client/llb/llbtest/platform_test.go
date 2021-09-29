@@ -10,7 +10,8 @@ import (
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/llbsolver"
 	"github.com/moby/buildkit/solver/pb"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/moby/buildkit/util/system"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,13 +32,13 @@ func TestCustomPlatform(t *testing.T) {
 
 	require.Equal(t, depth(e), 5)
 
-	expected := specs.Platform{OS: "windows", Architecture: "amd64"}
+	expected := ocispecs.Platform{OS: "windows", Architecture: "amd64"}
 	require.Equal(t, expected, platform(e))
 	e = parent(e, 0)
 	require.Equal(t, expected, platform(e))
 	e = parent(e, 0)
 
-	expected = specs.Platform{OS: "linux", Architecture: "arm", Variant: "v7"}
+	expected = ocispecs.Platform{OS: "linux", Architecture: "arm", Variant: "v7"}
 	require.Equal(t, expected, platform(e))
 	e = parent(e, 0)
 	require.Equal(t, expected, platform(e))
@@ -79,7 +80,7 @@ func TestPlatformOnMarshal(t *testing.T) {
 	e, err := llbsolver.Load(def.ToPB())
 	require.NoError(t, err)
 
-	expected := specs.Platform{OS: "windows", Architecture: "amd64"}
+	expected := ocispecs.Platform{OS: "windows", Architecture: "amd64"}
 	require.Equal(t, expected, platform(e))
 	e = parent(e, 0)
 	require.Equal(t, expected, platform(e))
@@ -101,7 +102,7 @@ func TestPlatformMixed(t *testing.T) {
 
 	require.Equal(t, depth(e), 4)
 
-	expectedAmd := specs.Platform{OS: "linux", Architecture: "amd64"}
+	expectedAmd := ocispecs.Platform{OS: "linux", Architecture: "amd64"}
 	require.Equal(t, []string{"cmd-main"}, args(e))
 	require.Equal(t, expectedAmd, platform(e))
 
@@ -109,7 +110,7 @@ func TestPlatformMixed(t *testing.T) {
 	require.Equal(t, "docker-image://docker.io/library/image1:latest", id(e1))
 	require.Equal(t, expectedAmd, platform(e1))
 
-	expectedArm := specs.Platform{OS: "linux", Architecture: "arm", Variant: "v6"}
+	expectedArm := ocispecs.Platform{OS: "linux", Architecture: "arm", Variant: "v6"}
 	e2 := mount(e, "/mnt")
 	require.Equal(t, []string{"cmd-sub"}, args(e2))
 	require.Equal(t, expectedArm, platform(e2))
@@ -131,7 +132,7 @@ func TestFallbackPath(t *testing.T) {
 	_, ok := getenv(e, "PATH")
 	require.False(t, ok)
 
-	// For an empty capset we expect a default non-empty PATH, and
+	// For an empty capset we expect a system-specific default PATH, and
 	// no requirement for the cap.
 	cs := pb.Caps.CapSet(nil)
 	require.Error(t, cs.Supports(pb.CapExecMetaSetsDefaultPath))
@@ -142,7 +143,7 @@ func TestFallbackPath(t *testing.T) {
 	require.False(t, def.Metadata[e.Vertex.Digest()].Caps[pb.CapExecMetaSetsDefaultPath])
 	v, ok := getenv(e, "PATH")
 	require.True(t, ok)
-	require.NotEqual(t, "", v)
+	require.Equal(t, system.DefaultPathEnvUnix, v)
 
 	// All capabilities, including pb.CapExecMetaSetsDefaultPath,
 	// so should get no PATH (not present at all, rather than
@@ -180,10 +181,10 @@ func toOp(e solver.Edge) *pb.Op {
 	return e.Vertex.Sys().(*pb.Op)
 }
 
-func platform(e solver.Edge) specs.Platform {
+func platform(e solver.Edge) ocispecs.Platform {
 	op := toOp(e)
 	p := *op.Platform
-	return specs.Platform{
+	return ocispecs.Platform{
 		OS:           p.OS,
 		Architecture: p.Architecture,
 		Variant:      p.Variant,

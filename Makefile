@@ -1,4 +1,5 @@
-DESTDIR=/usr/local
+prefix=/usr/local
+bindir=$(prefix)/bin
 
 binaries: FORCE
 	hack/binaries
@@ -6,10 +7,11 @@ binaries: FORCE
 images: FORCE
 # moby/buildkit:local and moby/buildkit:local-rootless are created on Docker
 	hack/images local moby/buildkit
+	TARGET=rootless hack/images local moby/buildkit
 
 install: FORCE
-	mkdir -p $(DESTDIR)/bin
-	install bin/* $(DESTDIR)/bin
+	mkdir -p $(DESTDIR)$(bindir)
+	install bin/* $(DESTDIR)$(bindir)
 
 clean: FORCE
 	rm -rf ./bin
@@ -22,6 +24,12 @@ lint:
 
 validate-vendor:
 	./hack/validate-vendor
+
+validate-shfmt:
+	./hack/validate-shfmt
+
+shfmt:
+	./hack/shfmt
 
 validate-generated-files:
 	./hack/validate-generated-files

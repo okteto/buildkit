@@ -12,8 +12,8 @@ import (
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver/pb"
-	"github.com/moby/buildkit/util/binfmt_misc"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/moby/buildkit/util/archutil"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	copy "github.com/tonistiigi/fsutil/copy"
 )
@@ -27,6 +27,7 @@ var qemuArchMap = map[string]string{
 	"arm":     "arm",
 	"s390x":   "s390x",
 	"ppc64le": "ppc64le",
+	"386":     "i386",
 }
 
 type emulator struct {
@@ -83,14 +84,14 @@ func (m *staticEmulatorMount) IdentityMapping() *idtools.IdentityMapping {
 }
 
 func getEmulator(p *pb.Platform, idmap *idtools.IdentityMapping) (*emulator, error) {
-	all := binfmt_misc.SupportedPlatforms(false)
+	all := archutil.SupportedPlatforms(false)
 	m := make(map[string]struct{}, len(all))
 
 	for _, p := range all {
 		m[p] = struct{}{}
 	}
 
-	pp := platforms.Normalize(specs.Platform{
+	pp := platforms.Normalize(ocispecs.Platform{
 		Architecture: p.Architecture,
 		OS:           p.OS,
 		Variant:      p.Variant,

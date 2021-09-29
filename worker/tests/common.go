@@ -13,6 +13,7 @@ import (
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/source"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/pkg/errors"
@@ -23,7 +24,9 @@ import (
 func NewBusyboxSourceSnapshot(ctx context.Context, t *testing.T, w *base.Worker, sm *session.Manager) cache.ImmutableRef {
 	img, err := source.NewImageIdentifier("docker.io/library/busybox:latest")
 	require.NoError(t, err)
-	src, err := w.SourceManager.Resolve(ctx, img, sm)
+	src, err := w.SourceManager.Resolve(ctx, img, sm, nil)
+	require.NoError(t, err)
+	_, _, _, _, err = src.CacheKey(ctx, nil, 0)
 	require.NoError(t, err)
 	snap, err := src.Snapshot(ctx, nil)
 	require.NoError(t, err)
@@ -41,16 +44,48 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 	require.NoError(t, err)
 
 	snap := NewBusyboxSourceSnapshot(ctx, t, w, sm)
-	root, err := w.CacheManager.New(ctx, snap)
+	root, err := w.CacheMgr.New(ctx, snap, nil)
 	require.NoError(t, err)
 
 	id := identity.NewID()
 
+	// verify pid1 exits when stdin sees EOF
+	ctxTimeout, cancelTimeout := context.WithTimeout(ctx, 5*time.Second)
+	started := make(chan struct{})
+	pipeR, pipeW := io.Pipe()
+	go func() {
+		select {
+		case <-ctxTimeout.Done():
+			t.Error("Unexpected timeout waiting for pid1 to start")
+		case <-started:
+			pipeW.Write([]byte("hello"))
+			pipeW.Close()
+		}
+	}()
+	stdout := bytes.NewBuffer(nil)
+	stderr := bytes.NewBuffer(nil)
+	err = w.WorkerOpt.Executor.Run(ctxTimeout, id, execMount(root), nil, executor.ProcessInfo{
+		Meta: executor.Meta{
+			Args: []string{"cat"},
+			Cwd:  "/",
+			Env:  []string{"PATH=/bin:/usr/bin:/sbin:/usr/sbin"},
+		},
+		Stdin:  pipeR,
+		Stdout: &nopCloser{stdout},
+		Stderr: &nopCloser{stderr},
+	}, started)
+	cancelTimeout()
+	t.Logf("Stdout: %s", stdout.String())
+	t.Logf("Stderr: %s", stderr.String())
+	require.NoError(t, err)
+	require.Equal(t, "hello", stdout.String())
+	require.Empty(t, stderr.String())
+
 	// first start pid1 in the background
 	eg := errgroup.Group{}
-	started := make(chan struct{})
+	started = make(chan struct{})
 	eg.Go(func() error {
-		return w.Executor.Run(ctx, id, root, nil, executor.ProcessInfo{
+		return w.WorkerOpt.Executor.Run(ctx, id, execMount(root), nil, executor.ProcessInfo{
 			Meta: executor.Meta{
 				Args: []string{"sleep", "10"},
 				Cwd:  "/",
@@ -65,11 +100,11 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 		t.Error("Unexpected timeout waiting for pid1 to start")
 	}
 
-	stdout := bytes.NewBuffer(nil)
-	stderr := bytes.NewBuffer(nil)
+	stdout.Reset()
+	stderr.Reset()
 
 	// verify pid1 is the sleep command via Exec
-	err = w.Executor.Exec(ctx, id, executor.ProcessInfo{
+	err = w.WorkerOpt.Executor.Exec(ctx, id, executor.ProcessInfo{
 		Meta: executor.Meta{
 			Args: []string{"ps", "-o", "pid,comm"},
 		},
@@ -87,7 +122,7 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 	stdin := bytes.NewReader([]byte("hello"))
 	stdout.Reset()
 	stderr.Reset()
-	err = w.Executor.Exec(ctx, id, executor.ProcessInfo{
+	err = w.WorkerOpt.Executor.Exec(ctx, id, executor.ProcessInfo{
 		Meta: executor.Meta{
 			Args: []string{"sh", "-c", "cat > /tmp/msg"},
 		},
@@ -102,7 +137,7 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 	// verify contents of /tmp/msg
 	stdout.Reset()
 	stderr.Reset()
-	err = w.Executor.Exec(ctx, id, executor.ProcessInfo{
+	err = w.WorkerOpt.Executor.Exec(ctx, id, executor.ProcessInfo{
 		Meta: executor.Meta{
 			Args: []string{"cat", "/tmp/msg"},
 		},
@@ -120,7 +155,7 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 
 	err = eg.Wait()
 	// we expect pid1 to get canceled after we test the exec
-	require.EqualError(t, errors.Cause(err), context.Canceled.Error())
+	require.True(t, errors.Is(err, context.Canceled))
 
 	err = snap.Release(ctx)
 	require.NoError(t, err)
@@ -132,7 +167,7 @@ func TestWorkerExecFailures(t *testing.T, w *base.Worker) {
 	require.NoError(t, err)
 
 	snap := NewBusyboxSourceSnapshot(ctx, t, w, sm)
-	root, err := w.CacheManager.New(ctx, snap)
+	root, err := w.CacheMgr.New(ctx, snap, nil)
 	require.NoError(t, err)
 
 	id := identity.NewID()
@@ -141,7 +176,7 @@ func TestWorkerExecFailures(t *testing.T, w *base.Worker) {
 	eg := errgroup.Group{}
 	started := make(chan struct{})
 	eg.Go(func() error {
-		return w.Executor.Run(ctx, id, root, nil, executor.ProcessInfo{
+		return w.WorkerOpt.Executor.Run(ctx, id, execMount(root), nil, executor.ProcessInfo{
 			Meta: executor.Meta{
 				Args: []string{"/bin/false"},
 				Cwd:  "/",
@@ -156,7 +191,7 @@ func TestWorkerExecFailures(t *testing.T, w *base.Worker) {
 	}
 
 	// this should fail since pid1 has already exited
-	err = w.Executor.Exec(ctx, id, executor.ProcessInfo{
+	err = w.WorkerOpt.Executor.Exec(ctx, id, executor.ProcessInfo{
 		Meta: executor.Meta{
 			Args: []string{"/bin/true"},
 		},
@@ -170,7 +205,7 @@ func TestWorkerExecFailures(t *testing.T, w *base.Worker) {
 	eg = errgroup.Group{}
 	started = make(chan struct{})
 	eg.Go(func() error {
-		return w.Executor.Run(ctx, id, root, nil, executor.ProcessInfo{
+		return w.WorkerOpt.Executor.Run(ctx, id, execMount(root), nil, executor.ProcessInfo{
 			Meta: executor.Meta{
 				Args: []string{"bogus"},
 			},
@@ -184,7 +219,7 @@ func TestWorkerExecFailures(t *testing.T, w *base.Worker) {
 	}
 
 	// this should fail since pid1 never started
-	err = w.Executor.Exec(ctx, id, executor.ProcessInfo{
+	err = w.WorkerOpt.Executor.Exec(ctx, id, executor.ProcessInfo{
 		Meta: executor.Meta{
 			Args: []string{"/bin/true"},
 		},
@@ -204,4 +239,16 @@ type nopCloser struct {
 
 func (n *nopCloser) Close() error {
 	return nil
+}
+
+func execMount(m cache.Mountable) executor.Mount {
+	return executor.Mount{Src: &mountable{m: m}}
+}
+
+type mountable struct {
+	m cache.Mountable
+}
+
+func (m *mountable) Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
+	return m.m.Mount(ctx, readonly, nil)
 }

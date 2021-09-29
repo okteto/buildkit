@@ -63,7 +63,7 @@ func TestParseCases(t *testing.T) {
 				// CRLF --> CR to match Unix behavior
 				content = bytes.Replace(content, []byte{'\x0d', '\x0a'}, []byte{'\x0a'}, -1)
 			}
-			require.Equal(t, result.AST.Dump()+"\n", string(content), dockerfile)
+			require.Equal(t, string(content), result.AST.Dump()+"\n", dockerfile)
 		})
 	}
 }
@@ -137,6 +137,9 @@ func TestParseWarnsOnEmptyContinutationLine(t *testing.T) {
 	dockerfile := bytes.NewBufferString(`
 FROM alpine:3.6
 
+RUN valid \
+    continuation
+
 RUN something \
 
     following \
@@ -146,6 +149,7 @@ RUN something \
 RUN another \
 
     thing
+
 RUN non-indented \
 # this is a comment
    after-comment

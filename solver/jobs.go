@@ -14,15 +14,15 @@ import (
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/tracing"
 	digest "github.com/opencontainers/go-digest"
-	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ResolveOpFunc finds an Op implementation for a Vertex
 type ResolveOpFunc func(Vertex, Builder) (Op, error)
 
 type Builder interface {
-	Build(ctx context.Context, e Edge) (CachedResult, error)
+	Build(ctx context.Context, e Edge) (CachedResult, BuildInfo, error)
 	InContext(ctx context.Context, f func(ctx context.Context, g session.Group) error) error
 	EachValue(ctx context.Context, key string, fn func(interface{}) error) error
 }
@@ -47,10 +47,9 @@ type state struct {
 	parents  map[digest.Digest]struct{}
 	childVtx map[digest.Digest]struct{}
 
-	mpw     *progress.MultiWriter
-	allPw   map[progress.Writer]struct{}
-	mspan   *tracing.MultiSpan
-	allSpan map[opentracing.Span]struct{}
+	mpw   *progress.MultiWriter
+	allPw map[progress.Writer]struct{}
+	mspan *tracing.MultiSpan
 
 	vtx          Vertex
 	clientVertex client.Vertex
@@ -198,19 +197,24 @@ type subBuilder struct {
 	exporters []ExportableCacheKey
 }
 
-func (sb *subBuilder) Build(ctx context.Context, e Edge) (CachedResult, error) {
+func (sb *subBuilder) Build(ctx context.Context, e Edge) (CachedResult, BuildInfo, error) {
+	// TODO(@crazy-max): Handle BuildInfo from subbuild
 	res, err := sb.solver.subBuild(ctx, e, sb.vtx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sb.mu.Lock()
 	sb.exporters = append(sb.exporters, res.CacheKeys()[0]) // all keys already have full export chain
 	sb.mu.Unlock()
-	return res, nil
+	return res, nil, nil
 }
 
 func (sb *subBuilder) InContext(ctx context.Context, f func(context.Context, session.Group) error) error {
-	return f(opentracing.ContextWithSpan(progress.WithProgress(ctx, sb.mpw), sb.mspan), sb.state)
+	ctx = progress.WithProgress(ctx, sb.mpw)
+	if sb.mspan.Span != nil {
+		ctx = trace.ContextWithSpan(ctx, sb.mspan)
+	}
+	return f(ctx, sb.state)
 }
 
 func (sb *subBuilder) EachValue(ctx context.Context, key string, fn func(interface{}) error) error {
@@ -228,8 +232,9 @@ type Job struct {
 	list   *Solver
 	pr     *progress.MultiReader
 	pw     progress.Writer
-	span   opentracing.Span
+	span   trace.Span
 	values sync.Map
+	id     string
 
 	progressCloser func()
 	SessionID      string
@@ -265,6 +270,17 @@ func (jl *Solver) setEdge(e Edge, newEdge *edge) {
 	}
 
 	st.setEdge(e.Index, newEdge)
+}
+
+func (jl *Solver) getState(e Edge) *state {
+	jl.mu.RLock()
+	defer jl.mu.RUnlock()
+
+	st, ok := jl.actives[e.Vertex.Digest()]
+	if !ok {
+		return nil
+	}
+	return st
 }
 
 func (jl *Solver) getEdge(e Edge) *edge {
@@ -346,7 +362,6 @@ func (jl *Solver) loadUnlocked(v, parent Vertex, j *Job, cache map[Vertex]Vertex
 			parents:      map[digest.Digest]struct{}{},
 			childVtx:     map[digest.Digest]struct{}{},
 			allPw:        map[progress.Writer]struct{}{},
-			allSpan:      map[opentracing.Span]struct{}{},
 			mpw:          progress.NewMultiWriter(progress.WithMetadata("vertex", dgst)),
 			mspan:        tracing.NewMultiSpan(),
 			vtx:          v,
@@ -403,8 +418,9 @@ func (jl *Solver) connectProgressFromState(target, src *state) {
 			target.mpw.Add(j.pw)
 			target.allPw[j.pw] = struct{}{}
 			j.pw.Write(target.clientVertex.Digest.String(), target.clientVertex)
-			target.mspan.Add(j.span)
-			target.allSpan[j.span] = struct{}{}
+			if j.span != nil && j.span.SpanContext().IsValid() {
+				target.mspan.Add(j.span)
+			}
 		}
 	}
 	for p := range src.parents {
@@ -421,14 +437,16 @@ func (jl *Solver) NewJob(id string) (*Job, error) {
 	}
 
 	pr, ctx, progressCloser := progress.NewContext(context.Background())
-	pw, _, _ := progress.FromContext(ctx) // TODO: expose progress.Pipe()
+	pw, _, _ := progress.NewFromContext(ctx) // TODO: expose progress.Pipe()
 
+	_, span := trace.NewNoopTracerProvider().Tracer("").Start(ctx, "")
 	j := &Job{
 		list:           jl,
 		pr:             progress.NewMultiReader(pr),
 		pw:             pw,
 		progressCloser: progressCloser,
-		span:           (&opentracing.NoopTracer{}).StartSpan(""),
+		span:           span,
+		id:             id,
 	}
 	jl.jobs[id] = j
 
@@ -438,7 +456,7 @@ func (jl *Solver) NewJob(id string) (*Job, error) {
 }
 
 func (jl *Solver) Get(id string) (*Job, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
 	go func() {
@@ -478,17 +496,43 @@ func (jl *Solver) deleteIfUnreferenced(k digest.Digest, st *state) {
 	}
 }
 
-func (j *Job) Build(ctx context.Context, e Edge) (CachedResult, error) {
-	if span := opentracing.SpanFromContext(ctx); span != nil {
+func (j *Job) Build(ctx context.Context, e Edge) (CachedResult, BuildInfo, error) {
+	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
 		j.span = span
 	}
 
 	v, err := j.list.load(e.Vertex, nil, j)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	e.Vertex = v
-	return j.list.s.build(ctx, e)
+
+	res, err := j.list.s.build(ctx, e)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	j.list.mu.Lock()
+	defer j.list.mu.Unlock()
+	return res, j.walkBuildInfo(ctx, e, make(BuildInfo)), nil
+}
+
+func (j *Job) walkBuildInfo(ctx context.Context, e Edge, bi BuildInfo) BuildInfo {
+	for _, inp := range e.Vertex.Inputs() {
+		if st, ok := j.list.actives[inp.Vertex.Digest()]; ok {
+			st.mu.Lock()
+			for _, cacheRes := range st.op.cacheRes {
+				for key, val := range cacheRes.BuildInfo {
+					if _, ok := bi[key]; !ok {
+						bi[key] = val
+					}
+				}
+			}
+			st.mu.Unlock()
+			bi = j.walkBuildInfo(ctx, inp, bi)
+		}
+	}
+	return bi
 }
 
 func (j *Job) Discard() error {
@@ -508,11 +552,16 @@ func (j *Job) Discard() error {
 		if _, ok := st.allPw[j.pw]; ok {
 			delete(st.allPw, j.pw)
 		}
-		if _, ok := st.allSpan[j.span]; ok {
-			delete(st.allSpan, j.span)
-		}
 		st.mu.Unlock()
 	}
+
+	go func() {
+		// don't clear job right away. there might still be a status request coming to read progress
+		time.Sleep(10 * time.Second)
+		j.list.mu.Lock()
+		defer j.list.mu.Unlock()
+		delete(j.list.jobs, j.id)
+	}()
 	return nil
 }
 
@@ -543,7 +592,7 @@ type activeOp interface {
 	Exec(ctx context.Context, inputs []Result) (outputs []Result, exporters []ExportableCacheKey, err error)
 	IgnoreCache() bool
 	Cache() CacheManager
-	CalcSlowCache(context.Context, Index, ResultBasedCacheFunc, Result) (digest.Digest, error)
+	CalcSlowCache(context.Context, Index, PreprocessFunc, ResultBasedCacheFunc, Result) (digest.Digest, error)
 }
 
 func newSharedOp(resolver ResolveOpFunc, cacheManager CacheManager, st *state) *sharedOp {
@@ -592,40 +641,71 @@ func (s *sharedOp) Cache() CacheManager {
 }
 
 func (s *sharedOp) LoadCache(ctx context.Context, rec *CacheRecord) (Result, error) {
-	ctx = opentracing.ContextWithSpan(progress.WithProgress(ctx, s.st.mpw), s.st.mspan)
+	ctx = progress.WithProgress(ctx, s.st.mpw)
+	if s.st.mspan.Span != nil {
+		ctx = trace.ContextWithSpan(ctx, s.st.mspan)
+	}
 	// no cache hit. start evaluating the node
 	span, ctx := tracing.StartSpan(ctx, "load cache: "+s.st.vtx.Name())
 	notifyStarted(ctx, &s.st.clientVertex, true)
-	res, err := s.Cache().Load(ctx, rec)
+	res, err := s.Cache().Load(withAncestorCacheOpts(ctx, s.st), rec)
 	tracing.FinishWithError(span, err)
 	notifyCompleted(ctx, &s.st.clientVertex, err, true)
 	return res, err
 }
 
-func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, f ResultBasedCacheFunc, res Result) (dgst digest.Digest, err error) {
+// CalcSlowCache computes the digest of an input that is ready and has been
+// evaluated, hence "slow" cache.
+func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, p PreprocessFunc, f ResultBasedCacheFunc, res Result) (dgst digest.Digest, err error) {
 	defer func() {
+		err = WrapSlowCache(err, index, NewSharedResult(res).Clone())
+		err = errdefs.WithOp(err, s.st.vtx.Sys())
 		err = errdefs.WrapVertex(err, s.st.origDigest)
 	}()
 	key, err := s.g.Do(ctx, fmt.Sprintf("slow-compute-%d", index), func(ctx context.Context) (interface{}, error) {
 		s.slowMu.Lock()
 		// TODO: add helpers for these stored values
-		if res := s.slowCacheRes[index]; res != "" {
+		if res, ok := s.slowCacheRes[index]; ok {
 			s.slowMu.Unlock()
 			return res, nil
 		}
 		if err := s.slowCacheErr[index]; err != nil {
 			s.slowMu.Unlock()
-			return err, nil
+			return nil, err
 		}
 		s.slowMu.Unlock()
-		ctx = opentracing.ContextWithSpan(progress.WithProgress(ctx, s.st.mpw), s.st.mspan)
-		key, err := f(ctx, res)
+
 		complete := true
+		if p != nil {
+			st := s.st.solver.getState(s.st.vtx.Inputs()[index])
+			if st == nil {
+				return nil, errors.Errorf("failed to get state for index %d on %v", index, s.st.vtx.Name())
+			}
+			ctx2 := progress.WithProgress(ctx, st.mpw)
+			if st.mspan.Span != nil {
+				ctx2 = trace.ContextWithSpan(ctx2, st.mspan)
+			}
+			err = p(ctx2, res, st)
+			if err != nil {
+				f = nil
+				ctx = ctx2
+			}
+		}
+
+		var key digest.Digest
+		if f != nil {
+			ctx = progress.WithProgress(ctx, s.st.mpw)
+			if s.st.mspan.Span != nil {
+				ctx = trace.ContextWithSpan(ctx, s.st.mspan)
+			}
+			key, err = f(withAncestorCacheOpts(ctx, s.st), res, s.st)
+		}
 		if err != nil {
 			select {
 			case <-ctx.Done():
 				if strings.Contains(err.Error(), context.Canceled.Error()) {
 					complete = false
+					releaseError(err)
 					err = errors.Wrap(ctx.Err(), err.Error())
 				}
 			default:
@@ -642,7 +722,10 @@ func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, f ResultBased
 		return key, err
 	})
 	if err != nil {
-		ctx = opentracing.ContextWithSpan(progress.WithProgress(ctx, s.st.mpw), s.st.mspan)
+		ctx = progress.WithProgress(ctx, s.st.mpw)
+		if s.st.mspan.Span != nil {
+			ctx = trace.ContextWithSpan(ctx, s.st.mspan)
+		}
 		notifyStarted(ctx, &s.st.clientVertex, false)
 		notifyCompleted(ctx, &s.st.clientVertex, err, false)
 		return "", err
@@ -652,20 +735,25 @@ func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, f ResultBased
 
 func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp, err error) {
 	defer func() {
+		err = errdefs.WithOp(err, s.st.vtx.Sys())
 		err = errdefs.WrapVertex(err, s.st.origDigest)
 	}()
 	op, err := s.getOp()
 	if err != nil {
 		return nil, err
 	}
-	res, err := s.g.Do(ctx, "cachemap", func(ctx context.Context) (ret interface{}, retErr error) {
+	res, err := s.g.Do(ctx, fmt.Sprintf("cachemap-%d", index), func(ctx context.Context) (ret interface{}, retErr error) {
 		if s.cacheRes != nil && s.cacheDone || index < len(s.cacheRes) {
 			return s.cacheRes, nil
 		}
 		if s.cacheErr != nil {
 			return nil, s.cacheErr
 		}
-		ctx = opentracing.ContextWithSpan(progress.WithProgress(ctx, s.st.mpw), s.st.mspan)
+		ctx = progress.WithProgress(ctx, s.st.mpw)
+		if s.st.mspan.Span != nil {
+			ctx = trace.ContextWithSpan(ctx, s.st.mspan)
+		}
+		ctx = withAncestorCacheOpts(ctx, s.st)
 		if len(s.st.vtx.Inputs()) == 0 {
 			// no cache hit. start evaluating the node
 			span, ctx := tracing.StartSpan(ctx, "cache request: "+s.st.vtx.Name())
@@ -682,6 +770,7 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 			case <-ctx.Done():
 				if strings.Contains(err.Error(), context.Canceled.Error()) {
 					complete = false
+					releaseError(err)
 					err = errors.Wrap(ctx.Err(), err.Error())
 				}
 			default:
@@ -709,6 +798,7 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 
 func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result, exporters []ExportableCacheKey, err error) {
 	defer func() {
+		err = errdefs.WithOp(err, s.st.vtx.Sys())
 		err = errdefs.WrapVertex(err, s.st.origDigest)
 	}()
 	op, err := s.getOp()
@@ -719,8 +809,17 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 		if s.execRes != nil || s.execErr != nil {
 			return s.execRes, s.execErr
 		}
+		release, err := op.Acquire(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "acquire op resources")
+		}
+		defer release()
 
-		ctx = opentracing.ContextWithSpan(progress.WithProgress(ctx, s.st.mpw), s.st.mspan)
+		ctx = progress.WithProgress(ctx, s.st.mpw)
+		if s.st.mspan.Span != nil {
+			ctx = trace.ContextWithSpan(ctx, s.st.mspan)
+		}
+		ctx = withAncestorCacheOpts(ctx, s.st)
 
 		// no cache hit. start evaluating the node
 		span, ctx := tracing.StartSpan(ctx, s.st.vtx.Name())
@@ -737,6 +836,7 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 			case <-ctx.Done():
 				if strings.Contains(err.Error(), context.Canceled.Error()) {
 					complete = false
+					releaseError(err)
 					err = errors.Wrap(ctx.Err(), err.Error())
 				}
 			default:
@@ -826,7 +926,7 @@ func (v *vertexWithCacheOptions) Inputs() []Edge {
 }
 
 func notifyStarted(ctx context.Context, v *client.Vertex, cached bool) {
-	pw, _, _ := progress.FromContext(ctx)
+	pw, _, _ := progress.NewFromContext(ctx)
 	defer pw.Close()
 	now := time.Now()
 	v.Started = &now
@@ -836,7 +936,7 @@ func notifyStarted(ctx context.Context, v *client.Vertex, cached bool) {
 }
 
 func notifyCompleted(ctx context.Context, v *client.Vertex, err error, cached bool) {
-	pw, _, _ := progress.FromContext(ctx)
+	pw, _, _ := progress.NewFromContext(ctx)
 	defer pw.Close()
 	now := time.Now()
 	if v.Started == nil {
@@ -848,4 +948,41 @@ func notifyCompleted(ctx context.Context, v *client.Vertex, err error, cached bo
 		v.Error = err.Error()
 	}
 	pw.Write(v.Digest.String(), *v)
+}
+
+type SlowCacheError struct {
+	error
+	Index  Index
+	Result Result
+}
+
+func (e *SlowCacheError) Unwrap() error {
+	return e.error
+}
+
+func (e *SlowCacheError) ToSubject() errdefs.IsSolve_Subject {
+	return &errdefs.Solve_Cache{
+		Cache: &errdefs.ContentCache{
+			Index: int64(e.Index),
+		},
+	}
+}
+
+func WrapSlowCache(err error, index Index, res Result) error {
+	if err == nil {
+		return nil
+	}
+	return &SlowCacheError{Index: index, Result: res, error: err}
+}
+
+func releaseError(err error) {
+	if err == nil {
+		return
+	}
+	if re, ok := err.(interface {
+		Release() error
+	}); ok {
+		re.Release()
+	}
+	releaseError(errors.Unwrap(err))
 }

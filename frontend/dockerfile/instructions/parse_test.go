@@ -1,6 +1,7 @@
 package instructions
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -140,6 +141,39 @@ func TestParseOptInterval(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestCommentsDetection(t *testing.T) {
+	dt := `# foo sets foo
+ARG foo=bar
+
+# base defines first stage
+FROM busybox AS base
+# this is irrelevant
+ARG foo
+# bar defines bar
+# baz is something else
+ARG bar baz=123
+`
+
+	ast, err := parser.Parse(bytes.NewBuffer([]byte(dt)))
+	require.NoError(t, err)
+
+	stages, meta, err := Parse(ast.AST)
+	require.NoError(t, err)
+
+	require.Equal(t, "defines first stage", stages[0].Comment)
+	require.Equal(t, "foo", meta[0].Args[0].Key)
+	require.Equal(t, "sets foo", meta[0].Args[0].Comment)
+
+	st := stages[0]
+
+	require.Equal(t, "foo", st.Commands[0].(*ArgCommand).Args[0].Key)
+	require.Equal(t, "", st.Commands[0].(*ArgCommand).Args[0].Comment)
+	require.Equal(t, "bar", st.Commands[1].(*ArgCommand).Args[0].Key)
+	require.Equal(t, "defines bar", st.Commands[1].(*ArgCommand).Args[0].Comment)
+	require.Equal(t, "baz", st.Commands[1].(*ArgCommand).Args[1].Key)
+	require.Equal(t, "is something else", st.Commands[1].(*ArgCommand).Args[1].Comment)
+}
+
 func TestErrorCases(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -159,19 +193,9 @@ func TestErrorCases(t *testing.T) {
 			expectedError: "FROM isn't allowed as an ONBUILD trigger",
 		},
 		{
-			name:          "ONBUILD forbidden MAINTAINER",
-			dockerfile:    "ONBUILD MAINTAINER docker.io",
-			expectedError: "MAINTAINER isn't allowed as an ONBUILD trigger",
-		},
-		{
-			name:          "ARG two arguments",
-			dockerfile:    "ARG foo bar",
-			expectedError: "ARG requires exactly one argument",
-		},
-		{
 			name:          "MAINTAINER unknown flag",
 			dockerfile:    "MAINTAINER --boo joe@example.com",
-			expectedError: "Unknown flag: boo",
+			expectedError: "unknown flag: boo",
 		},
 		{
 			name:          "Chaining ONBUILD",
@@ -180,8 +204,13 @@ func TestErrorCases(t *testing.T) {
 		},
 		{
 			name:          "Invalid instruction",
-			dockerfile:    `foo bar`,
+			dockerfile:    `FOO bar`,
 			expectedError: "unknown instruction: FOO",
+		},
+		{
+			name:          "Invalid instruction",
+			dockerfile:    `foo bar`,
+			expectedError: "unknown instruction: foo",
 		},
 	}
 	for _, c := range cases {
@@ -196,4 +225,17 @@ func TestErrorCases(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), c.expectedError)
 	}
+}
+
+func TestRunCmdFlagsUsed(t *testing.T) {
+	dockerfile := "RUN --mount=type=tmpfs,target=/foo/ echo hello"
+	r := strings.NewReader(dockerfile)
+	ast, err := parser.Parse(r)
+	require.NoError(t, err)
+
+	n := ast.AST.Children[0]
+	c, err := ParseInstruction(n)
+	require.NoError(t, err)
+	require.IsType(t, c, &RunCommand{})
+	require.Equal(t, []string{"mount"}, c.(*RunCommand).FlagsUsed)
 }

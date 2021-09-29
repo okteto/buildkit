@@ -1,56 +1,32 @@
-# syntax = docker/dockerfile:1.1-experimental
+# syntax = docker/dockerfile:1.3
 
-ARG RUNC_VERSION=v1.0.0-rc91
-ARG CONTAINERD_VERSION=v1.3.6
-# containerd v1.2 for integration tests
-ARG CONTAINERD_OLD_VERSION=v1.2.13
+ARG RUNC_VERSION=v1.0.1
+ARG CONTAINERD_VERSION=v1.5.5
+# containerd v1.4 for integration tests
+ARG CONTAINERD_ALT_VERSION=v1.4.6
 # available targets: buildkitd, buildkitd.oci_only, buildkitd.containerd_only
 ARG BUILDKIT_TARGET=buildkitd
 ARG REGISTRY_VERSION=2.7.1
-ARG ROOTLESSKIT_VERSION=v0.9.5
-ARG CNI_VERSION=v0.8.6
+ARG ROOTLESSKIT_VERSION=v0.14.2
+ARG CNI_VERSION=v0.9.1
 ARG SHADOW_VERSION=4.8.1
-ARG FUSEOVERLAYFS_VERSION=v1.1.2
+ARG STARGZ_SNAPSHOTTER_VERSION=v0.5.0
+
+ARG ALPINE_VERSION=3.14
 
 # git stage is used for checking out remote repository sources
-FROM --platform=$BUILDPLATFORM alpine AS git
-RUN apk add --no-cache git xz
+FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS git
+RUN apk add --no-cache git
 
-# xgo is a helper for golang cross-compilation
-FROM --platform=$BUILDPLATFORM tonistiigi/xx:golang@sha256:6f7d999551dd471b58f70716754290495690efa8421e0a1fcf18eb11d0c0a537 AS xgo
+# xx is a helper for cross-compilation
+FROM --platform=$BUILDPLATFORM tonistiigi/xx@sha256:1e96844fadaa2f9aea021b2b05299bc02fe4c39a92d8e735b93e8e2b15610128 AS xx
+
+FROM --platform=$BUILDPLATFORM golang:1.17-alpine AS golatest
 
 # gobuild is base stage for compiling go/cgo
-FROM --platform=$BUILDPLATFORM golang:1.13-buster AS gobuild-minimal
-COPY --from=xgo / /
-RUN apt-get update && apt-get install --no-install-recommends -y libseccomp-dev file
-
-# on amd64 you can also cross-compile to other platforms
-FROM gobuild-minimal AS gobuild-cross-amd64
-RUN dpkg --add-architecture s390x && \
-  dpkg --add-architecture ppc64el && \
-  dpkg --add-architecture armel && \
-  dpkg --add-architecture armhf && \
-  dpkg --add-architecture arm64 && \
-  apt-get update && \
-  apt-get --no-install-recommends install -y \
-  gcc-s390x-linux-gnu libc6-dev-s390x-cross libseccomp-dev:s390x \
-  crossbuild-essential-ppc64el libseccomp-dev:ppc64el \
-  crossbuild-essential-armel libseccomp-dev:armel \
-  crossbuild-essential-armhf libseccomp-dev:armhf \
-  crossbuild-essential-arm64 libseccomp-dev:arm64 \
-  --no-install-recommends
-
-# define all valid target configurations for compilation
-FROM gobuild-minimal AS gobuild-amd64-amd64
-FROM gobuild-minimal AS gobuild-arm-arm
-FROM gobuild-minimal AS gobuild-s390x-s390x
-FROM gobuild-minimal AS gobuild-ppc64le-ppc64le
-FROM gobuild-minimal AS gobuild-arm64-arm64
-FROM gobuild-cross-amd64 AS gobuild-amd64-arm
-FROM gobuild-cross-amd64 AS gobuild-amd64-s390x
-FROM gobuild-cross-amd64 AS gobuild-amd64-ppc64le
-FROM gobuild-cross-amd64 AS gobuild-amd64-arm64
-FROM gobuild-$BUILDARCH-$TARGETARCH AS gobuild-base
+FROM golatest AS gobuild-base
+RUN apk add --no-cache file bash clang lld pkgconfig git make
+COPY --from=xx / /
 
 # runc source
 FROM git AS runc-src
@@ -63,9 +39,13 @@ RUN git clone https://github.com/opencontainers/runc.git runc \
 FROM gobuild-base AS runc
 WORKDIR $GOPATH/src/github.com/opencontainers/runc
 ARG TARGETPLATFORM
+# gcc is only installed for libgcc
+# lld has issues building static binaries for ppc so prefer ld for it
+RUN set -e; xx-apk add musl-dev gcc libseccomp-dev libseccomp-static; \
+  [ "$(xx-info arch)" != "ppc64le" ] || XX_CC_PREFER_LINKER=ld xx-clang --setup-target-triple
 RUN --mount=from=runc-src,src=/usr/src/runc,target=. --mount=target=/root/.cache,type=cache \
-  CGO_ENABLED=1 go build -ldflags '-w -extldflags -static' -tags 'seccomp netgo cgo static_build osusergo' -o /usr/bin/runc ./ && \
-  file /usr/bin/runc | grep "statically linked"
+  CGO_ENABLED=1 xx-go build -mod=vendor -ldflags '-extldflags -static' -tags 'apparmor seccomp netgo cgo static_build osusergo' -o /usr/bin/runc ./ && \
+  xx-verify --static /usr/bin/runc
 
 FROM gobuild-base AS buildkit-base
 WORKDIR /src
@@ -86,23 +66,23 @@ ARG TARGETPLATFORM
 RUN --mount=target=. --mount=target=/root/.cache,type=cache \
   --mount=target=/go/pkg/mod,type=cache \
   --mount=source=/tmp/.ldflags,target=/tmp/.ldflags,from=buildkit-version \
-  set -x; go build -ldflags "$(cat /tmp/.ldflags)" -o /usr/bin/buildctl ./cmd/buildctl && \
-  file /usr/bin/buildctl && file /usr/bin/buildctl | egrep "statically linked|Mach-O|Windows"
+  xx-go build -ldflags "$(cat /tmp/.ldflags)" -o /usr/bin/buildctl ./cmd/buildctl && \
+  xx-verify --static /usr/bin/buildctl
 
 # build buildkitd binary
 FROM buildkit-base AS buildkitd
-ARG TARGETPLATFORM
 ARG BUILDKITD_TAGS
+ARG TARGETPLATFORM
 RUN --mount=target=. --mount=target=/root/.cache,type=cache \
   --mount=target=/go/pkg/mod,type=cache \
   --mount=source=/tmp/.ldflags,target=/tmp/.ldflags,from=buildkit-version \
-  go build -ldflags "$(cat /tmp/.ldflags) -w -extldflags -static" -tags "osusergo netgo static_build seccomp ${BUILDKITD_TAGS}" -o /usr/bin/buildkitd ./cmd/buildkitd && \
-  file /usr/bin/buildkitd | egrep "statically linked|Windows"
+  CGO_ENABLED=0 xx-go build -ldflags "$(cat /tmp/.ldflags) -extldflags '-static'" -tags "osusergo netgo static_build seccomp ${BUILDKITD_TAGS}" -o /usr/bin/buildkitd ./cmd/buildkitd && \
+  xx-verify --static /usr/bin/buildkitd
 
 FROM scratch AS binaries-linux-helper
 COPY --from=runc /usr/bin/runc /buildkit-runc
-# built from https://github.com/tonistiigi/binfmt/tree/85394e2a1bf0ac9e6c291945e869322bea969445/binfmt
-COPY --from=tonistiigi/binfmt:buildkit / /
+# built from https://github.com/tonistiigi/binfmt/releases/tag/buildkit%2Fv6.0.0-15
+COPY --from=tonistiigi/binfmt:buildkit@sha256:81a03e6630e9c39df109bf24ae8c807881c4fd1703084827d855f8093cc7ab7a / /
 FROM binaries-linux-helper AS binaries-linux
 COPY --from=buildctl /usr/bin/buildctl /
 COPY --from=buildkitd /usr/bin/buildkitd /
@@ -115,7 +95,7 @@ COPY --from=buildctl /usr/bin/buildctl /buildctl.exe
 
 FROM binaries-$TARGETOS AS binaries
 
-FROM --platform=$BUILDPLATFORM alpine AS releaser
+FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS releaser
 RUN apk add --no-cache tar gzip
 WORKDIR /work
 ARG TARGETPLATFORM
@@ -126,18 +106,24 @@ RUN --mount=from=binaries \
 FROM scratch AS release
 COPY --from=releaser /out/ /
 
-FROM tonistiigi/git@sha256:393483e1cef35f09e1a8fe0a0bd93a78b1b6ecec5b5afa5fa5d600fa3ab1fdd8 AS buildkit-export
+# tonistiigi/alpine supports riscv64
+FROM tonistiigi/alpine:${ALPINE_VERSION} AS buildkit-export
+RUN apk add --no-cache fuse3 git openssh pigz xz \
+  && ln -s fusermount3 /usr/bin/fusermount
 COPY examples/buildctl-daemonless/buildctl-daemonless.sh /usr/bin/
 VOLUME /var/lib/buildkit
 
 FROM git AS containerd-src
 ARG CONTAINERD_VERSION
+ARG CONTAINERD_ALT_VERSION
 WORKDIR /usr/src
 RUN git clone https://github.com/containerd/containerd.git containerd
 
 FROM gobuild-base AS containerd-base
-RUN apt-get --no-install-recommends install -y btrfs-progs libbtrfs-dev
 WORKDIR /go/src/github.com/containerd/containerd
+ARG TARGETPLATFORM
+ENV CGO_ENABLED=1 BUILDTAGS=no_btrfs
+RUN xx-apk add musl-dev gcc && xx-go --wrap
 
 FROM containerd-base AS containerd
 ARG CONTAINERD_VERSION
@@ -149,14 +135,15 @@ RUN --mount=from=containerd-src,src=/usr/src/containerd,readwrite --mount=target
   && make bin/ctr \
   && mv bin /out
 
-# containerd v1.2 for integration tests
-FROM containerd-base as containerd-old
-ARG CONTAINERD_OLD_VERSION
+# containerd v1.4 for integration tests
+FROM containerd-base as containerd-alt
+ARG CONTAINERD_ALT_VERSION
+ARG GO111MODULE=off
 RUN --mount=from=containerd-src,src=/usr/src/containerd,readwrite --mount=target=/root/.cache,type=cache \
   git fetch origin \
-  && git checkout -q "$CONTAINERD_OLD_VERSION" \
+  && git checkout -q "$CONTAINERD_ALT_VERSION" \
   && make bin/containerd \
-  && make bin/containerd-shim \
+  && make bin/containerd-shim-runc-v2 \
   && mv bin /out
 
 ARG REGISTRY_VERSION
@@ -169,17 +156,20 @@ WORKDIR /go/src/github.com/rootless-containers/rootlesskit
 ARG TARGETPLATFORM
 RUN  --mount=target=/root/.cache,type=cache \
   git checkout -q "$ROOTLESSKIT_VERSION"  && \
-  CGO_ENABLED=0 go build -o /rootlesskit ./cmd/rootlesskit && \
-  file /rootlesskit | grep "statically linked"
+  CGO_ENABLED=0 xx-go build -o /rootlesskit ./cmd/rootlesskit && \
+  xx-verify --static /rootlesskit
 
-FROM --platform=$BUILDPLATFORM alpine AS fuse-overlayfs
-RUN apk add --no-cache curl
-ARG FUSEOVERLAYFS_VERSION
-ARG TARGETARCH
-RUN echo $TARGETARCH | sed -e s/^amd64$/x86_64/ -e s/^arm64$/aarch64/ -e s/^arm$/armv7l/ > /uname_m && \
-  mkdir /out && \
-  curl -sSL -o /out/fuse-overlayfs https://github.com/containers/fuse-overlayfs/releases/download/${FUSEOVERLAYFS_VERSION}/fuse-overlayfs-$(cat /uname_m) && \
-  chmod +x /out/fuse-overlayfs
+FROM gobuild-base AS stargz-snapshotter
+ARG STARGZ_SNAPSHOTTER_VERSION
+RUN git clone https://github.com/containerd/stargz-snapshotter.git /go/src/github.com/containerd/stargz-snapshotter
+WORKDIR /go/src/github.com/containerd/stargz-snapshotter
+ARG TARGETPLATFORM
+RUN --mount=target=/root/.cache,type=cache \
+  git checkout -q "$STARGZ_SNAPSHOTTER_VERSION" && \
+  xx-go --wrap && \
+  mkdir /out && CGO_ENABLED=0 PREFIX=/out/ make && \
+  xx-verify --static /out/containerd-stargz-grpc && \
+  xx-verify --static /out/ctr-remote
 
 # Copy together all binaries needed for oci worker mode
 FROM buildkit-export AS buildkit-buildkitd.oci_only
@@ -206,7 +196,7 @@ COPY --from=buildkitd /usr/bin/buildkitd /buildkitd.exe
 
 FROM buildkit-buildkitd-$TARGETOS AS buildkit-buildkitd
 
-FROM alpine AS containerd-runtime
+FROM alpine:${ALPINE_VERSION} AS containerd-runtime
 COPY --from=runc /usr/bin/runc /usr/bin/
 COPY --from=containerd /out/containerd* /usr/bin/
 COPY --from=containerd /out/ctr /usr/bin/
@@ -214,7 +204,7 @@ VOLUME /var/lib/containerd
 VOLUME /run/containerd
 ENTRYPOINT ["containerd"]
 
-FROM --platform=$BUILDPLATFORM alpine AS cni-plugins
+FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS cni-plugins
 RUN apk add --no-cache curl
 ARG CNI_VERSION
 ARG TARGETOS
@@ -224,16 +214,20 @@ RUN curl -Ls https://github.com/containernetworking/plugins/releases/download/$C
 
 FROM buildkit-base AS integration-tests-base
 ENV BUILDKIT_INTEGRATION_ROOTLESS_IDPAIR="1000:1000"
-RUN apt-get --no-install-recommends install -y uidmap sudo vim iptables \ 
+RUN apk add --no-cache shadow shadow-uidmap sudo vim iptables fuse \
   && useradd --create-home --home-dir /home/user --uid 1000 -s /bin/sh user \
   && echo "XDG_RUNTIME_DIR=/run/user/1000; export XDG_RUNTIME_DIR" >> /home/user/.profile \
   && mkdir -m 0700 -p /run/user/1000 \
   && chown -R user /run/user/1000 /home/user \
-  && update-alternatives --set iptables /usr/sbin/iptables-legacy
+  && ln -s /sbin/iptables-legacy /usr/bin/iptables \
+  && xx-go --wrap
 # musl is needed to directly use the registry binary that is built on alpine
-#ENV BUILDKIT_INTEGRATION_CONTAINERD_EXTRA="containerd-1.2=/opt/containerd-old/bin"
+ENV BUILDKIT_INTEGRATION_CONTAINERD_EXTRA="containerd-1.4=/opt/containerd-alt/bin"
+ENV BUILDKIT_INTEGRATION_SNAPSHOTTER=stargz
+ENV CGO_ENABLED=0
+COPY --from=stargz-snapshotter /out/* /usr/bin/
 COPY --from=rootlesskit /rootlesskit /usr/bin/
-COPY --from=containerd-old /out/containerd* /opt/containerd-old/bin/
+COPY --from=containerd-alt /out/containerd* /opt/containerd-alt/bin/
 COPY --from=registry /bin/registry /usr/bin
 COPY --from=runc /usr/bin/runc /usr/bin
 COPY --from=containerd /out/containerd* /usr/bin/
@@ -248,25 +242,28 @@ ENV BUILDKIT_RUN_NETWORK_INTEGRATION_TESTS=1 BUILDKIT_CNI_INIT_LOCK_PATH=/run/bu
 FROM integration-tests AS dev-env
 VOLUME /var/lib/buildkit
 
-# newuidmap & newgidmap binaries (shadow-uidmap 4.7-r1) shipped with alpine cannot be executed without CAP_SYS_ADMIN,
+# newuidmap & newgidmap binaries (shadow-uidmap 4.8.1-r0) shipped with alpine cannot be executed without CAP_SYS_ADMIN,
 # because the binaries are built without libcap-dev.
 # So we need to build the binaries with libcap enabled.
-FROM alpine:3.12 AS idmap
-RUN apk add --no-cache autoconf automake build-base byacc gettext gettext-dev gcc git libcap-dev libtool libxslt
-RUN git clone https://github.com/shadow-maint/shadow.git /shadow
-WORKDIR /shadow
+# TODO: ask the Alpine upstream to enable libcap: https://github.com/moby/buildkit/issues/2038
+FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS idmap
+RUN apk add --no-cache git autoconf automake clang lld gettext-dev libtool make byacc binutils
+COPY --from=xx / /
 ARG SHADOW_VERSION
-RUN git checkout $SHADOW_VERSION
-RUN ./autogen.sh --disable-nls --disable-man --without-audit --without-selinux --without-acl --without-attr --without-tcb --without-nscd \
-  && make \
+RUN git clone https://github.com/shadow-maint/shadow.git /shadow && cd /shadow && git checkout $SHADOW_VERSION
+WORKDIR /shadow
+ARG TARGETPLATFORM
+RUN xx-apk add --no-cache musl-dev gcc libcap-dev
+RUN CC=$(xx-clang --print-target-triple)-clang ./autogen.sh --disable-nls --disable-man --without-audit --without-selinux --without-acl --without-attr --without-tcb --without-nscd --host $(xx-clang --print-target-triple) \
+  && make -j $(nproc) \
+  && xx-verify src/newuidmap src/newuidmap \
   && cp src/newuidmap src/newgidmap /usr/bin
 
 # Rootless mode.
-FROM alpine:3.12 AS rootless
-RUN apk add --no-cache fuse3 git xz
+FROM tonistiigi/alpine:${ALPINE_VERSION} AS rootless
+RUN apk add --no-cache fuse3 fuse-overlayfs git openssh pigz xz
 COPY --from=idmap /usr/bin/newuidmap /usr/bin/newuidmap
 COPY --from=idmap /usr/bin/newgidmap /usr/bin/newgidmap
-COPY --from=fuse-overlayfs /out/fuse-overlayfs /usr/bin/
 # we could just set CAP_SETUID filecap rather than `chmod u+s`, but requires kernel >= 4.14
 RUN chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap \
   && adduser -D -u 1000 user \

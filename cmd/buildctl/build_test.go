@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -16,6 +17,7 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/stretchr/testify/require"
 )
@@ -33,7 +35,7 @@ func testBuildWithLocalFiles(t *testing.T, sb integration.Sandbox) {
 
 	st.AddMount("/mnt", llb.Local("src"), llb.Readonly)
 
-	rdr, err := marshal(st.Root())
+	rdr, err := marshal(sb.Context(), st.Root())
 	require.NoError(t, err)
 
 	cmd := sb.Cmd(fmt.Sprintf("build --progress=plain --local src=%s", dir))
@@ -49,7 +51,7 @@ func testBuildLocalExporter(t *testing.T, sb integration.Sandbox) {
 
 	out := st.AddMount("/out", llb.Scratch())
 
-	rdr, err := marshal(out)
+	rdr, err := marshal(sb.Context(), out)
 	require.NoError(t, err)
 
 	tmpdir, err := ioutil.TempDir("", "buildkit-buildctl")
@@ -76,7 +78,7 @@ func testBuildContainerdExporter(t *testing.T, sb integration.Sandbox) {
 	st := llb.Image("busybox").
 		Run(llb.Shlex("sh -c 'echo -n bar > /foo'"))
 
-	rdr, err := marshal(st.Root())
+	rdr, err := marshal(sb.Context(), st.Root())
 	require.NoError(t, err)
 
 	imageName := "example.com/moby/imageexporter:test"
@@ -102,13 +104,72 @@ func testBuildContainerdExporter(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	// NOTE: by default, it is overlayfs
-	ok, err := img.IsUnpacked(ctx, "overlayfs")
+	snapshotter := "overlayfs"
+	if sn := sb.Snapshotter(); sn != "" {
+		snapshotter = sn
+	}
+	ok, err := img.IsUnpacked(ctx, snapshotter)
 	require.NoError(t, err)
 	require.Equal(t, ok, true)
 }
 
-func marshal(st llb.State) (io.Reader, error) {
-	def, err := st.Marshal(context.TODO())
+func testBuildMetadataFile(t *testing.T, sb integration.Sandbox) {
+	st := llb.Image("busybox").
+		Run(llb.Shlex("sh -c 'echo -n bar > /foo'"))
+
+	rdr, err := marshal(sb.Context(), st.Root())
+	require.NoError(t, err)
+
+	tmpDir, err := ioutil.TempDir("", "buildkit-buildctl")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	imageName := "example.com/moby/metadata:test"
+	metadataFile := filepath.Join(tmpDir, "metadata.json")
+
+	buildCmd := []string{
+		"build", "--progress=plain",
+		"--output type=image,name=" + imageName + ",push=false",
+		"--metadata-file", metadataFile,
+	}
+
+	cmd := sb.Cmd(strings.Join(buildCmd, " "))
+	cmd.Stdin = rdr
+	err = cmd.Run()
+	require.NoError(t, err)
+
+	require.FileExists(t, metadataFile)
+	metadataBytes, err := ioutil.ReadFile(metadataFile)
+	require.NoError(t, err)
+
+	var metadata map[string]string
+	err = json.Unmarshal(metadataBytes, &metadata)
+	require.NoError(t, err)
+
+	require.Equal(t, imageName, metadata["image.name"])
+
+	digest := metadata[exptypes.ExporterImageDigestKey]
+	require.NotEmpty(t, digest)
+
+	cdAddress := sb.ContainerdAddress()
+	if cdAddress == "" {
+		t.Log("no containerd worker, skipping digest verification")
+	} else {
+		client, err := containerd.New(cdAddress, containerd.WithTimeout(60*time.Second))
+		require.NoError(t, err)
+		defer client.Close()
+
+		ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+
+		img, err := client.GetImage(ctx, imageName)
+		require.NoError(t, err)
+
+		require.Equal(t, img.Metadata().Target.Digest.String(), digest)
+	}
+}
+
+func marshal(ctx context.Context, st llb.State) (io.Reader, error) {
+	def, err := st.Marshal(ctx)
 	if err != nil {
 		return nil, err
 	}

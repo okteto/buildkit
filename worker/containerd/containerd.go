@@ -9,6 +9,7 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/gc"
 	"github.com/containerd/containerd/leases"
+	gogoptypes "github.com/gogo/protobuf/types"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/executor/containerdexecutor"
@@ -17,22 +18,24 @@ import (
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/util/winlayers"
+	"github.com/moby/buildkit/worker"
 	"github.com/moby/buildkit/worker/base"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/semaphore"
 )
 
 // NewWorkerOpt creates a WorkerOpt.
-func NewWorkerOpt(root string, address, snapshotterName, ns string, labels map[string]string, dns *oci.DNSConfig, nopt netproviders.Opt, opts ...containerd.ClientOpt) (base.WorkerOpt, error) {
+func NewWorkerOpt(root string, address, snapshotterName, ns string, labels map[string]string, dns *oci.DNSConfig, nopt netproviders.Opt, apparmorProfile string, parallelismSem *semaphore.Weighted, traceSocket string, opts ...containerd.ClientOpt) (base.WorkerOpt, error) {
 	opts = append(opts, containerd.WithDefaultNamespace(ns))
 	client, err := containerd.New(address, opts...)
 	if err != nil {
 		return base.WorkerOpt{}, errors.Wrapf(err, "failed to connect client to %q . make sure containerd is running", address)
 	}
-	return newContainerd(root, client, snapshotterName, ns, labels, dns, nopt)
+	return newContainerd(root, client, snapshotterName, ns, labels, dns, nopt, apparmorProfile, parallelismSem, traceSocket)
 }
 
-func newContainerd(root string, client *containerd.Client, snapshotterName, ns string, labels map[string]string, dns *oci.DNSConfig, nopt netproviders.Opt) (base.WorkerOpt, error) {
+func newContainerd(root string, client *containerd.Client, snapshotterName, ns string, labels map[string]string, dns *oci.DNSConfig, nopt netproviders.Opt, apparmorProfile string, parallelismSem *semaphore.Weighted, traceSocket string) (base.WorkerOpt, error) {
 	if strings.Contains(snapshotterName, "/") {
 		return base.WorkerOpt{}, errors.Errorf("bad snapshotter name: %q", snapshotterName)
 	}
@@ -48,7 +51,15 @@ func newContainerd(root string, client *containerd.Client, snapshotterName, ns s
 	if err != nil {
 		return base.WorkerOpt{}, err
 	}
+
+	serverInfo, err := client.IntrospectionService().Server(context.TODO(), &gogoptypes.Empty{})
+	if err != nil {
+		return base.WorkerOpt{}, err
+	}
+
 	xlabels := base.Labels("containerd", snapshotterName)
+	xlabels[worker.LabelContainerdNamespace] = ns
+	xlabels[worker.LabelContainerdUUID] = serverInfo.UUID
 	for k, v := range labels {
 		xlabels[k] = v
 	}
@@ -73,10 +84,10 @@ func newContainerd(root string, client *containerd.Client, snapshotterName, ns s
 		return base.WorkerOpt{}, errors.New("failed to find any runtime plugins")
 	}
 
-	var platforms []specs.Platform
+	var platforms []ocispecs.Platform
 	for _, plugin := range resp.Plugins {
 		for _, p := range plugin.Platforms {
-			platforms = append(platforms, specs.Platform{
+			platforms = append(platforms, ocispecs.Platform{
 				OS:           p.OS,
 				Architecture: p.Architecture,
 				Variant:      p.Variant,
@@ -91,7 +102,14 @@ func newContainerd(root string, client *containerd.Client, snapshotterName, ns s
 
 	snap := containerdsnapshot.NewSnapshotter(snapshotterName, client.SnapshotService(snapshotterName), ns, nil)
 
-	if err := cache.MigrateV2(context.TODO(), filepath.Join(root, "metadata.db"), filepath.Join(root, "metadata_v2.db"), cs, snap, lm); err != nil {
+	if err := cache.MigrateV2(
+		context.TODO(),
+		filepath.Join(root, "metadata.db"),
+		filepath.Join(root, "metadata_v2.db"),
+		cs,
+		snap,
+		lm,
+	); err != nil {
 		return base.WorkerOpt{}, err
 	}
 
@@ -104,7 +122,7 @@ func newContainerd(root string, client *containerd.Client, snapshotterName, ns s
 		ID:             id,
 		Labels:         xlabels,
 		MetadataStore:  md,
-		Executor:       containerdexecutor.New(client, root, "", np, dns),
+		Executor:       containerdexecutor.New(client, root, "", np, dns, apparmorProfile, traceSocket),
 		Snapshotter:    snap,
 		ContentStore:   cs,
 		Applier:        winlayers.NewFileSystemApplierWithWindows(cs, df),
@@ -113,6 +131,7 @@ func newContainerd(root string, client *containerd.Client, snapshotterName, ns s
 		Platforms:      platforms,
 		LeaseManager:   lm,
 		GarbageCollect: gc,
+		ParallelismSem: parallelismSem,
 	}
 	return opt, nil
 }

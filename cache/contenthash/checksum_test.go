@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/containerd/containerd/snapshots/native"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
+	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/util/leaseutil"
@@ -29,9 +31,11 @@ import (
 )
 
 const (
-	dgstFileData0     = digest.Digest("sha256:cd8e75bca50f2d695f220d0cb0997d8ead387e4f926e8669a92d7f104cc9885b")
-	dgstDirD0         = digest.Digest("sha256:d47454417d2c554067fbefe5f5719edc49f3cfe969c36b62e34a187a4da0cc9a")
-	dgstDirD0Modified = digest.Digest("sha256:555ffa3028630d97ba37832b749eda85ab676fd64ffb629fbf0f4ec8c1e3bff1")
+	dgstFileData0       = digest.Digest("sha256:cd8e75bca50f2d695f220d0cb0997d8ead387e4f926e8669a92d7f104cc9885b")
+	dgstDirD0           = digest.Digest("sha256:d47454417d2c554067fbefe5f5719edc49f3cfe969c36b62e34a187a4da0cc9a")
+	dgstDirD0FileByFile = digest.Digest("sha256:231c3293e329de47fec9e79056686477891fd1f244ed7b1c1fa668489a1f0d50")
+	dgstDirD0Modified   = digest.Digest("sha256:555ffa3028630d97ba37832b749eda85ab676fd64ffb629fbf0f4ec8c1e3bff1")
+	dgstDoubleStar      = digest.Digest("sha256:853b46abef38d02c9e29fdd1557c6002903b262541e60064bc84518d4d3a6f11")
 )
 
 func TestChecksumSymlinkNoParentScan(t *testing.T) {
@@ -55,10 +59,10 @@ func TestChecksumSymlinkNoParentScan(t *testing.T) {
 
 	ref := createRef(t, cm, ch)
 
-	cc, err := newCacheContext(ref.Metadata(), nil)
+	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
-	dgst, err := cc.Checksum(context.TODO(), ref, "aa/ln/bb/cc/dd", true)
+	dgst, err := cc.Checksum(context.TODO(), ref, "aa/ln/bb/cc/dd", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 }
@@ -83,39 +87,39 @@ func TestChecksumHardlinks(t *testing.T) {
 
 	ref := createRef(t, cm, ch)
 
-	cc, err := newCacheContext(ref.Metadata(), nil)
+	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
-	dgst, err := cc.Checksum(context.TODO(), ref, "abc/foo", false)
-	require.NoError(t, err)
-	require.Equal(t, dgstFileData0, dgst)
-
-	dgst, err = cc.Checksum(context.TODO(), ref, "ln", false)
+	dgst, err := cc.Checksum(context.TODO(), ref, "abc/foo", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "ln2", false)
+	dgst, err = cc.Checksum(context.TODO(), ref, "ln", ChecksumOpts{}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstFileData0, dgst)
+
+	dgst, err = cc.Checksum(context.TODO(), ref, "ln2", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
 	// validate same results with handleChange
 	ref2 := createRef(t, cm, nil)
 
-	cc2, err := newCacheContext(ref2.Metadata(), nil)
+	cc2, err := newCacheContext(ref2)
 	require.NoError(t, err)
 
 	err = emit(cc2.HandleChange, changeStream(ch))
 	require.NoError(t, err)
 
-	dgst, err = cc2.Checksum(context.TODO(), ref, "abc/foo", false)
+	dgst, err = cc2.Checksum(context.TODO(), ref, "abc/foo", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = cc2.Checksum(context.TODO(), ref, "ln", false)
+	dgst, err = cc2.Checksum(context.TODO(), ref, "ln", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = cc2.Checksum(context.TODO(), ref, "ln2", false)
+	dgst, err = cc2.Checksum(context.TODO(), ref, "ln2", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
@@ -133,20 +137,20 @@ func TestChecksumHardlinks(t *testing.T) {
 
 	data1Expected := "sha256:c2b5e234f5f38fc5864da7def04782f82501a40d46192e4207d5b3f0c3c4732b"
 
-	dgst, err = cc2.Checksum(context.TODO(), ref, "abc/foo", false)
+	dgst, err = cc2.Checksum(context.TODO(), ref, "abc/foo", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, data1Expected, string(dgst))
 
-	dgst, err = cc2.Checksum(context.TODO(), ref, "ln", false)
+	dgst, err = cc2.Checksum(context.TODO(), ref, "ln", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, data1Expected, string(dgst))
 
-	dgst, err = cc2.Checksum(context.TODO(), ref, "ln2", false)
+	dgst, err = cc2.Checksum(context.TODO(), ref, "ln2", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 }
 
-func TestChecksumWildcard(t *testing.T) {
+func TestChecksumWildcardOrFilter(t *testing.T) {
 	t.Parallel()
 	tmpdir, err := ioutil.TempDir("", "buildkit-state")
 	require.NoError(t, err)
@@ -172,33 +176,55 @@ func TestChecksumWildcard(t *testing.T) {
 
 	ref := createRef(t, cm, ch)
 
-	cc, err := newCacheContext(ref.Metadata(), nil)
+	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
-	dgst, err := cc.ChecksumWildcard(context.TODO(), ref, "f*o", false)
+	dgst, err := cc.Checksum(context.TODO(), ref, "f*o", ChecksumOpts{Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, digest.FromBytes(append([]byte("foo"), []byte(dgstFileData0)...)), dgst)
+
+	expFoos := digest.Digest("sha256:7f51c821895cfc116d3f64231dfb438e87a237ecbbe027cd96b7ee5e763cc569")
+
+	dgst, err = cc.Checksum(context.TODO(), ref, "f*", ChecksumOpts{Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, expFoos, dgst)
+
+	dgst, err = cc.Checksum(context.TODO(), ref, "x/d?", ChecksumOpts{Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstDirD0FileByFile, dgst)
+
+	dgst, err = cc.Checksum(context.TODO(), ref, "x/d?/def", ChecksumOpts{FollowLinks: true, Wildcard: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	expFoos := digest.Digest("sha256:c9f914ad7ad8fe6092ce67484b43ca39c2087aabf9e4a1b223249b0f8b09b9f2")
+	expFoos2 := digest.Digest("sha256:8afc09c7018d65d5eb318a9ef55cb704dec1f06d288181d913fc27a571aa042d")
 
-	dgst, err = cc.ChecksumWildcard(context.TODO(), ref, "f*", false)
+	dgst, err = cc.Checksum(context.TODO(), ref, "y*", ChecksumOpts{FollowLinks: true, Wildcard: true}, nil)
 	require.NoError(t, err)
-	require.Equal(t, expFoos, dgst)
-
-	dgst, err = cc.ChecksumWildcard(context.TODO(), ref, "x/d?", false)
-	require.NoError(t, err)
-	require.Equal(t, dgstDirD0, dgst)
-
-	dgst, err = cc.ChecksumWildcard(context.TODO(), ref, "x/d?/def", true)
-	require.NoError(t, err)
-	require.Equal(t, dgstFileData0, dgst)
-
-	dgst, err = cc.ChecksumWildcard(context.TODO(), ref, "y*", true)
-	require.NoError(t, err)
-	require.Equal(t, expFoos, dgst)
+	require.Equal(t, expFoos2, dgst)
 
 	err = ref.Release(context.TODO())
 	require.NoError(t, err)
+}
+
+func TestChecksumWildcardWithBadMountable(t *testing.T) {
+	t.Parallel()
+	tmpdir, err := ioutil.TempDir("", "buildkit-state")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	cm, _ := setupCacheManager(t, tmpdir, "native", snapshotter)
+	defer cm.Close()
+
+	ref := createRef(t, cm, nil)
+
+	cc, err := newCacheContext(ref)
+	require.NoError(t, err)
+
+	_, err = cc.Checksum(context.TODO(), newBadMountable(), "*", ChecksumOpts{Wildcard: true}, nil)
+	require.Error(t, err)
 }
 
 func TestSymlinksNoFollow(t *testing.T) {
@@ -223,36 +249,36 @@ func TestSymlinksNoFollow(t *testing.T) {
 
 	ref := createRef(t, cm, ch)
 
-	cc, err := newCacheContext(ref.Metadata(), nil)
+	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
 	expectedSym := digest.Digest("sha256:a2ba571981f48ec34eb79c9a3ab091b6491e825c2f7e9914ea86e8e958be7fae")
 
-	dgst, err := cc.ChecksumWildcard(context.TODO(), ref, "sym", false)
+	dgst, err := cc.Checksum(context.TODO(), ref, "sym", ChecksumOpts{Wildcard: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, expectedSym, dgst)
 
-	dgst, err = cc.ChecksumWildcard(context.TODO(), ref, "sym2", false)
+	dgst, err = cc.Checksum(context.TODO(), ref, "sym2", ChecksumOpts{Wildcard: true}, nil)
 	require.NoError(t, err)
 	require.NotEqual(t, expectedSym, dgst)
 
-	dgst, err = cc.ChecksumWildcard(context.TODO(), ref, "foo/ghi", false)
+	dgst, err = cc.Checksum(context.TODO(), ref, "foo/ghi", ChecksumOpts{Wildcard: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, expectedSym, dgst)
 
-	_, err = cc.ChecksumWildcard(context.TODO(), ref, "foo/ghi", true) // same because broken symlink
+	_, err = cc.Checksum(context.TODO(), ref, "foo/ghi", ChecksumOpts{FollowLinks: true, Wildcard: true}, nil) // same because broken symlink
 	require.Error(t, err)
 	require.Equal(t, true, errors.Is(err, errNotFound))
 
-	_, err = cc.ChecksumWildcard(context.TODO(), ref, "y1", true)
+	_, err = cc.Checksum(context.TODO(), ref, "y1", ChecksumOpts{FollowLinks: true, Wildcard: true}, nil)
 	require.Error(t, err)
 	require.Equal(t, true, errors.Is(err, errNotFound))
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "sym", false)
+	dgst, err = cc.Checksum(context.TODO(), ref, "sym", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, expectedSym, dgst)
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "foo/ghi", false)
+	dgst, err = cc.Checksum(context.TODO(), ref, "foo/ghi", ChecksumOpts{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, expectedSym, dgst)
 
@@ -285,51 +311,51 @@ func TestChecksumBasicFile(t *testing.T) {
 	// for the digest values, the actual values are not important in development
 	// phase but consistency is
 
-	cc, err := newCacheContext(ref.Metadata(), nil)
+	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
-	_, err = cc.Checksum(context.TODO(), ref, "nosuch", true)
+	_, err = cc.Checksum(context.TODO(), ref, "nosuch", ChecksumOpts{FollowLinks: true}, nil)
 	require.Error(t, err)
 
-	dgst, err := cc.Checksum(context.TODO(), ref, "foo", true)
+	dgst, err := cc.Checksum(context.TODO(), ref, "foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstFileData0, dgst)
 
 	// second file returns different hash
-	dgst, err = cc.Checksum(context.TODO(), ref, "bar", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "bar", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, digest.Digest("sha256:c2b5e234f5f38fc5864da7def04782f82501a40d46192e4207d5b3f0c3c4732b"), dgst)
 
 	// same file inside a directory
-	dgst, err = cc.Checksum(context.TODO(), ref, "d0/abc", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "d0/abc", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstFileData0, dgst)
 
 	// repeat because codepath is different
-	dgst, err = cc.Checksum(context.TODO(), ref, "d0/abc", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "d0/abc", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstFileData0, dgst)
 
 	// symlink to the same file is followed, returns same hash
-	dgst, err = cc.Checksum(context.TODO(), ref, "d0/def", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "d0/def", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstFileData0, dgst)
 
-	_, err = cc.Checksum(context.TODO(), ref, "d0/ghi", true)
+	_, err = cc.Checksum(context.TODO(), ref, "d0/ghi", ChecksumOpts{FollowLinks: true}, nil)
 	require.Error(t, err)
 	require.Equal(t, true, errors.Is(err, errNotFound))
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "/", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "/", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, digest.Digest("sha256:427c9cf9ae98c0f81fb57a3076b965c7c149b6b0a85625ad4e884236649a42c6"), dgst)
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "d0", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstDirD0, dgst)
@@ -346,10 +372,10 @@ func TestChecksumBasicFile(t *testing.T) {
 
 	ref = createRef(t, cm, ch)
 
-	cc, err = newCacheContext(ref.Metadata(), nil)
+	cc, err = newCacheContext(ref)
 	require.NoError(t, err)
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "/", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "/", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstDirD0, dgst)
@@ -365,10 +391,10 @@ func TestChecksumBasicFile(t *testing.T) {
 
 	ref = createRef(t, cm, ch)
 
-	cc, err = newCacheContext(ref.Metadata(), nil)
+	cc, err = newCacheContext(ref)
 	require.NoError(t, err)
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "/", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "/", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstDirD0Modified, dgst)
@@ -391,23 +417,308 @@ func TestChecksumBasicFile(t *testing.T) {
 
 	ref = createRef(t, cm, ch)
 
-	cc, err = newCacheContext(ref.Metadata(), nil)
+	cc, err = newCacheContext(ref)
 	require.NoError(t, err)
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "abc/aa/foo", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "abc/aa/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, digest.Digest("sha256:1c67653c3cf95b12a0014e2c4cd1d776b474b3218aee54155d6ae27b9b999c54"), dgst)
 	require.NotEqual(t, dgstDirD0, dgst)
 
 	// this will force rescan
-	dgst, err = cc.Checksum(context.TODO(), ref, "d0", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstDirD0, dgst)
 
 	err = ref.Release(context.TODO())
 	require.NoError(t, err)
+}
+
+func TestChecksumIncludeExclude(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wildcard_false", func(t *testing.T) { testChecksumIncludeExclude(t, false) })
+	t.Run("wildcard_true", func(t *testing.T) { testChecksumIncludeExclude(t, true) })
+}
+
+func testChecksumIncludeExclude(t *testing.T, wildcard bool) {
+	t.Parallel()
+
+	tmpdir, err := ioutil.TempDir("", "buildkit-state")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	cm, _ := setupCacheManager(t, tmpdir, "native", snapshotter)
+	defer cm.Close()
+
+	ch := []string{
+		"ADD foo file data0",
+		"ADD bar file data1",
+		"ADD d0 dir",
+		"ADD d0/abc file abc",
+		"ADD d1 dir",
+		"ADD d1/def file def",
+	}
+
+	ref := createRef(t, cm, ch)
+
+	cc, err := newCacheContext(ref)
+	require.NoError(t, err)
+
+	opts := func(opts ChecksumOpts) ChecksumOpts {
+		opts.Wildcard = wildcard
+		return opts
+	}
+
+	dgstFoo, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"foo"}}), nil)
+	require.NoError(t, err)
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstFoo)
+
+	dgstFooBar, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"foo", "bar"}}), nil)
+	require.NoError(t, err)
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstFooBar)
+
+	require.NotEqual(t, dgstFoo, dgstFooBar)
+
+	dgstD0, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d0"}}), nil)
+	require.NoError(t, err)
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstD0)
+	dgstD1, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d1"}}), nil)
+	require.NoError(t, err)
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstD1)
+
+	dgstD0Star, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d0/*"}}), nil)
+	require.NoError(t, err)
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstD0Star)
+	dgstD0AStar, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d0/a*"}}), nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD0Star, dgstD0AStar)
+	dgstD1Star, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d1/*"}}), nil)
+	require.NoError(t, err)
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstD1Star)
+
+	// Nothing matches pattern, but d2's metadata should be captured in the
+	// checksum if d2 exists
+	dgstD2Foo, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d2/foo"}}), nil)
+	require.NoError(t, err)
+	require.Equal(t, digest.FromBytes([]byte{}), dgstD2Foo)
+
+	err = ref.Release(context.TODO())
+	require.NoError(t, err)
+
+	// add some files
+	ch = []string{
+		"ADD foo file data0",
+		"ADD bar file data1",
+		"ADD baz file data2",
+		"ADD d0 dir",
+		"ADD d0/abc file abc",
+		"ADD d0/xyz file xyz",
+		"ADD d1 dir",
+		"ADD d1/def file def",
+		"ADD d2 dir",
+	}
+
+	ref = createRef(t, cm, ch)
+
+	cc, err = newCacheContext(ref)
+	require.NoError(t, err)
+
+	dgstFoo2, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"foo"}}), nil)
+	require.NoError(t, err)
+	dgstFooBar2, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"foo", "bar"}}), nil)
+	require.NoError(t, err)
+
+	require.Equal(t, dgstFoo, dgstFoo2)
+	require.Equal(t, dgstFooBar, dgstFooBar2)
+
+	dgstD02, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d0"}}), nil)
+	require.NoError(t, err)
+	require.NotEqual(t, dgstD0, dgstD02)
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstD02)
+
+	dgstD12, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d1"}}), nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD1, dgstD12)
+
+	dgstD0Star2, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d0/*"}}), nil)
+	require.NoError(t, err)
+	require.NotEqual(t, dgstD0Star, dgstD0Star2)
+
+	dgstD0AStar2, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d0/a*"}}), nil)
+	require.NoError(t, err)
+	// new file does not match the include pattern, so the digest should stay the same
+	require.Equal(t, dgstD0AStar, dgstD0AStar2)
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstD0AStar2)
+
+	dgstStarStarABC, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"**/abc"}}), nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD0AStar, dgstStarStarABC)
+
+	dgstD1Star2, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d1/*"}}), nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD1Star, dgstD1Star2)
+
+	dgstD0StarExclude, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d0/*"}, ExcludePatterns: []string{"d0/xyz"}}), nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD0Star, dgstD0StarExclude)
+
+	dgstD2Foo2, err := cc.Checksum(context.TODO(), ref, "", opts(ChecksumOpts{IncludePatterns: []string{"d2/foo"}}), nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD2Foo, dgstD2Foo2)
+
+	dgstD2Foo3, err := cc.Checksum(context.TODO(), ref, "d2", opts(ChecksumOpts{IncludePatterns: []string{"foo"}}), nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD2Foo, dgstD2Foo3)
+
+	err = ref.Release(context.TODO())
+	require.NoError(t, err)
+}
+
+func TestChecksumIncludeDoubleStar(t *testing.T) {
+	t.Parallel()
+	tmpdir, err := ioutil.TempDir("", "buildkit-state")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	cm, _ := setupCacheManager(t, tmpdir, "native", snapshotter)
+	defer cm.Close()
+
+	ch := []string{
+		"ADD prefix dir",
+		"ADD prefix/a dir",
+		"ADD prefix/a/b dir",
+		"ADD prefix/a/b/c dir",
+	}
+
+	ref := createRef(t, cm, ch)
+
+	cc, err := newCacheContext(ref)
+	require.NoError(t, err)
+
+	dgst, err := cc.Checksum(context.TODO(), ref, "prefix/a", ChecksumOpts{IncludePatterns: []string{"**/foo/**"}}, nil)
+	require.NoError(t, err)
+	// Nothing included
+	require.Equal(t, digest.FromBytes([]byte{}), dgst)
+
+	// Same, with Wildcard = true
+	dgst, err = cc.Checksum(context.TODO(), ref, "prefix/a", ChecksumOpts{IncludePatterns: []string{"**/foo/**"}, Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, digest.FromBytes([]byte{}), dgst)
+
+	ch = []string{
+		"ADD prefix dir",
+		"ADD prefix/a dir",
+		"ADD prefix/a/b dir",
+		"ADD prefix/a/b/c dir",
+		"ADD prefix/a/b/c/foo dir",
+		"ADD prefix/a/b/c/foo/bar file abc",
+	}
+
+	ref = createRef(t, cm, ch)
+
+	cc, err = newCacheContext(ref)
+	require.NoError(t, err)
+
+	dgst, err = cc.Checksum(context.TODO(), ref, "prefix/a", ChecksumOpts{IncludePatterns: []string{"**/foo/**", "**/report"}}, nil)
+	require.NoError(t, err)
+	// Now there is a file included
+	require.Equal(t, dgstDoubleStar, dgst)
+
+	// Same, with Wildcard = true
+	dgst, err = cc.Checksum(context.TODO(), ref, "prefix/a", ChecksumOpts{IncludePatterns: []string{"**/foo/**", "**/report"}, Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstDoubleStar, dgst)
+
+	// **/... pattern (https://github.com/moby/moby/issues/41433)
+	dgst, err = cc.Checksum(context.TODO(), ref, "prefix/a", ChecksumOpts{IncludePatterns: []string{"**/foo", "**/report"}}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstDoubleStar, dgst)
+
+	// Same, with Wildcard = true
+	dgst, err = cc.Checksum(context.TODO(), ref, "prefix/a", ChecksumOpts{IncludePatterns: []string{"**/foo", "**/report"}, Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstDoubleStar, dgst)
+
+}
+
+func TestChecksumIncludeSymlink(t *testing.T) {
+	t.Parallel()
+	tmpdir, err := ioutil.TempDir("", "buildkit-state")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	cm, _ := setupCacheManager(t, tmpdir, "native", snapshotter)
+	defer cm.Close()
+
+	ch := []string{
+		"ADD data dir",
+		"ADD data/d0 dir",
+		"ADD data/d0/d1 dir",
+		"ADD data/d0/d1/d2 dir",
+		"ADD mnt dir",
+		"ADD mnt/data symlink ../data",
+		"ADD data/d0/d1/d2/foo file abc",
+		"ADD data/symlink-to-d0 symlink d0",
+	}
+
+	ref := createRef(t, cm, ch)
+
+	cc, err := newCacheContext(ref)
+	require.NoError(t, err)
+
+	dgstD0, err := cc.Checksum(context.TODO(), ref, "data/d0", ChecksumOpts{IncludePatterns: []string{"**/foo"}}, nil)
+	require.NoError(t, err)
+	// File should be included
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstD0)
+
+	dgstMntD0, err := cc.Checksum(context.TODO(), ref, "mnt/data/d0", ChecksumOpts{IncludePatterns: []string{"**/foo"}}, nil)
+	require.NoError(t, err)
+	// File should be included despite symlink
+	require.Equal(t, dgstD0, dgstMntD0)
+
+	dgstD2, err := cc.Checksum(context.TODO(), ref, "data/d0/d1/d2", ChecksumOpts{IncludePatterns: []string{"**/foo"}}, nil)
+	require.NoError(t, err)
+	// File should be included
+	require.NotEqual(t, digest.FromBytes([]byte{}), dgstD2)
+
+	dgstMntD2, err := cc.Checksum(context.TODO(), ref, "mnt/data/d0/d1/d2", ChecksumOpts{IncludePatterns: []string{"**/foo"}}, nil)
+	require.NoError(t, err)
+	// File should be included despite symlink
+	require.Equal(t, dgstD2, dgstMntD2)
+
+	// Same, with Wildcard = true
+	dgstMntD0Wildcard, err := cc.Checksum(context.TODO(), ref, "mnt/data/d0", ChecksumOpts{IncludePatterns: []string{"**/foo"}, Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD0, dgstMntD0Wildcard)
+
+	dgstMntD0Wildcard2, err := cc.Checksum(context.TODO(), ref, "mnt/data/d*", ChecksumOpts{IncludePatterns: []string{"**/foo"}, Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD0, dgstMntD0Wildcard2)
+
+	dgstMntD2Wildcard, err := cc.Checksum(context.TODO(), ref, "mnt/data/d0/d1/d2", ChecksumOpts{IncludePatterns: []string{"**/foo"}, Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD2, dgstMntD2Wildcard)
+
+	dgstMntD2Wildcard2, err := cc.Checksum(context.TODO(), ref, "mnt/data/d0/d1/d*", ChecksumOpts{IncludePatterns: []string{"**/foo"}, Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD2, dgstMntD2Wildcard2)
+
+	dgstMntInnerWildcard, err := cc.Checksum(context.TODO(), ref, "mnt/data/d0/d*/d2", ChecksumOpts{IncludePatterns: []string{"**/foo"}, Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD2, dgstMntInnerWildcard)
+
+	dgstMntInnerWildcard2, err := cc.Checksum(context.TODO(), ref, "mnt/data/symlink-to-d0/d*/d2", ChecksumOpts{IncludePatterns: []string{"**/foo"}, Wildcard: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, dgstD2, dgstMntInnerWildcard2)
 }
 
 func TestHandleChange(t *testing.T) {
@@ -435,25 +746,25 @@ func TestHandleChange(t *testing.T) {
 	// for the digest values, the actual values are not important in development
 	// phase but consistency is
 
-	cc, err := newCacheContext(ref.Metadata(), nil)
+	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
 	err = emit(cc.HandleChange, changeStream(ch))
 	require.NoError(t, err)
 
-	dgstFoo, err := cc.Checksum(context.TODO(), ref, "foo", true)
+	dgstFoo, err := cc.Checksum(context.TODO(), ref, "foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstFileData0, dgstFoo)
 
 	// symlink to the same file is followed, returns same hash
-	dgst, err := cc.Checksum(context.TODO(), ref, "d0/def", true)
+	dgst, err := cc.Checksum(context.TODO(), ref, "d0/def", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstFoo, dgst)
 
 	// symlink to the same file is followed, returns same hash
-	dgst, err = cc.Checksum(context.TODO(), ref, "d0", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgstDirD0, dgst)
@@ -465,7 +776,7 @@ func TestHandleChange(t *testing.T) {
 	err = emit(cc.HandleChange, changeStream(ch))
 	require.NoError(t, err)
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "d0", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstDirD0Modified, dgst)
 
@@ -476,11 +787,11 @@ func TestHandleChange(t *testing.T) {
 	err = emit(cc.HandleChange, changeStream(ch))
 	require.NoError(t, err)
 
-	_, err = cc.Checksum(context.TODO(), ref, "d0", true)
+	_, err = cc.Checksum(context.TODO(), ref, "d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.Error(t, err)
 	require.Equal(t, true, errors.Is(err, errNotFound))
 
-	_, err = cc.Checksum(context.TODO(), ref, "d0/abc", true)
+	_, err = cc.Checksum(context.TODO(), ref, "d0/abc", ChecksumOpts{FollowLinks: true}, nil)
 	require.Error(t, err)
 	require.Equal(t, true, errors.Is(err, errNotFound))
 
@@ -511,13 +822,13 @@ func TestHandleRecursiveDir(t *testing.T) {
 
 	ref := createRef(t, cm, nil)
 
-	cc, err := newCacheContext(ref.Metadata(), nil)
+	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
 	err = emit(cc.HandleChange, changeStream(ch))
 	require.NoError(t, err)
 
-	dgst, err := cc.Checksum(context.TODO(), ref, "d0/foo/bar", true)
+	dgst, err := cc.Checksum(context.TODO(), ref, "d0/foo/bar", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	ch = []string{
@@ -529,11 +840,11 @@ func TestHandleRecursiveDir(t *testing.T) {
 	err = emit(cc.HandleChange, changeStream(ch))
 	require.NoError(t, err)
 
-	dgst2, err := cc.Checksum(context.TODO(), ref, "d1", true)
+	dgst2, err := cc.Checksum(context.TODO(), ref, "d1", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgst2, dgst)
 
-	_, err = cc.Checksum(context.TODO(), ref, "", true)
+	_, err = cc.Checksum(context.TODO(), ref, "", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 }
 
@@ -558,13 +869,13 @@ func TestChecksumUnorderedFiles(t *testing.T) {
 
 	ref := createRef(t, cm, nil)
 
-	cc, err := newCacheContext(ref.Metadata(), nil)
+	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
 	err = emit(cc.HandleChange, changeStream(ch))
 	require.NoError(t, err)
 
-	dgst, err := cc.Checksum(context.TODO(), ref, "d0", true)
+	dgst, err := cc.Checksum(context.TODO(), ref, "d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, dgst, digest.Digest("sha256:14276c302c940a80f82ca5477bf766c98a24702d6a9948ee71bb277cdad3ae05"))
@@ -578,13 +889,13 @@ func TestChecksumUnorderedFiles(t *testing.T) {
 
 	ref = createRef(t, cm, nil)
 
-	cc, err = newCacheContext(ref.Metadata(), nil)
+	cc, err = newCacheContext(ref)
 	require.NoError(t, err)
 
 	err = emit(cc.HandleChange, changeStream(ch))
 	require.NoError(t, err)
 
-	dgst2, err := cc.Checksum(context.TODO(), ref, "d0", true)
+	dgst2, err := cc.Checksum(context.TODO(), ref, "d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
 	require.NotEqual(t, dgst, dgst2)
@@ -609,11 +920,11 @@ func TestSymlinkInPathScan(t *testing.T) {
 	}
 	ref := createRef(t, cm, ch)
 
-	dgst, err := Checksum(context.TODO(), ref, "d0/def/foo", true)
+	dgst, err := Checksum(context.TODO(), ref, "d0/def/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = Checksum(context.TODO(), ref, "d0/def/foo", true)
+	dgst, err = Checksum(context.TODO(), ref, "d0/def/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
@@ -643,10 +954,10 @@ func TestSymlinkNeedsScan(t *testing.T) {
 	ref := createRef(t, cm, ch)
 
 	// scan the d0 path containing the symlink that doesn't get followed
-	_, err = Checksum(context.TODO(), ref, "d0/d1", true)
+	_, err = Checksum(context.TODO(), ref, "d0/d1", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 
-	dgst, err := Checksum(context.TODO(), ref, "d0/d1/def/foo", true)
+	dgst, err := Checksum(context.TODO(), ref, "d0/d1/def/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
@@ -673,7 +984,7 @@ func TestSymlinkAbsDirSuffix(t *testing.T) {
 	}
 	ref := createRef(t, cm, ch)
 
-	dgst, err := Checksum(context.TODO(), ref, "link/foo", true)
+	dgst, err := Checksum(context.TODO(), ref, "link/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
@@ -708,27 +1019,27 @@ func TestSymlinkThroughParent(t *testing.T) {
 	}
 	ref := createRef(t, cm, ch)
 
-	dgst, err := Checksum(context.TODO(), ref, "link1/sub/foo", true)
+	dgst, err := Checksum(context.TODO(), ref, "link1/sub/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = Checksum(context.TODO(), ref, "link2/sub/foo", true)
+	dgst, err = Checksum(context.TODO(), ref, "link2/sub/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = Checksum(context.TODO(), ref, "link3/sub/foo", true)
+	dgst, err = Checksum(context.TODO(), ref, "link3/sub/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = Checksum(context.TODO(), ref, "link4/sub/foo", true)
+	dgst, err = Checksum(context.TODO(), ref, "link4/sub/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = Checksum(context.TODO(), ref, "link5/sub/foo", true)
+	dgst, err = Checksum(context.TODO(), ref, "link5/sub/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = Checksum(context.TODO(), ref, "link1/sub/link/sub/foo", true)
+	dgst, err = Checksum(context.TODO(), ref, "link1/sub/link/sub/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
@@ -765,33 +1076,33 @@ func TestSymlinkInPathHandleChange(t *testing.T) {
 
 	ref := createRef(t, cm, nil)
 
-	cc, err := newCacheContext(ref.Metadata(), nil)
+	cc, err := newCacheContext(ref)
 	require.NoError(t, err)
 
 	err = emit(cc.HandleChange, changeStream(ch))
 	require.NoError(t, err)
 
-	dgst, err := cc.Checksum(context.TODO(), ref, "d1/def/foo", true)
+	dgst, err := cc.Checksum(context.TODO(), ref, "d1/def/foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgst, err = cc.Checksum(context.TODO(), ref, "d1/def/bar/abc", true)
+	dgst, err = cc.Checksum(context.TODO(), ref, "d1/def/bar/abc", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
-	dgstFileData0, err := cc.Checksum(context.TODO(), ref, "sub/d0", true)
+	dgstFileData0, err := cc.Checksum(context.TODO(), ref, "sub/d0", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgstDirD0)
 
-	dgstFileData0, err = cc.Checksum(context.TODO(), ref, "d1/def/baz", true)
+	dgstFileData0, err = cc.Checksum(context.TODO(), ref, "d1/def/baz", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgstDirD0)
 
-	dgstFileData0, err = cc.Checksum(context.TODO(), ref, "d1/def/bay", true)
+	dgstFileData0, err = cc.Checksum(context.TODO(), ref, "d1/def/bay", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgstDirD0)
 
-	dgstFileData0, err = cc.Checksum(context.TODO(), ref, "link", true)
+	dgstFileData0, err = cc.Checksum(context.TODO(), ref, "link", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgstDirD0)
 
@@ -822,7 +1133,7 @@ func TestPersistence(t *testing.T) {
 	ref := createRef(t, cm, ch)
 	id := ref.ID()
 
-	dgst, err := Checksum(context.TODO(), ref, "foo", true)
+	dgst, err := Checksum(context.TODO(), ref, "foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
@@ -832,7 +1143,7 @@ func TestPersistence(t *testing.T) {
 	ref, err = cm.Get(context.TODO(), id)
 	require.NoError(t, err)
 
-	dgst, err = Checksum(context.TODO(), ref, "foo", true)
+	dgst, err = Checksum(context.TODO(), ref, "foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 
@@ -852,16 +1163,21 @@ func TestPersistence(t *testing.T) {
 	ref, err = cm.Get(context.TODO(), id)
 	require.NoError(t, err)
 
-	dgst, err = Checksum(context.TODO(), ref, "foo", true)
+	dgst, err = Checksum(context.TODO(), ref, "foo", ChecksumOpts{FollowLinks: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, dgstFileData0, dgst)
 }
 
 func createRef(t *testing.T, cm cache.Manager, files []string) cache.ImmutableRef {
-	mref, err := cm.New(context.TODO(), nil, cache.CachePolicyRetain)
+	if runtime.GOOS == "windows" && len(files) > 0 {
+		// lm.Mount() will fail
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	mref, err := cm.New(context.TODO(), nil, nil, cache.CachePolicyRetain)
 	require.NoError(t, err)
 
-	mounts, err := mref.Mount(context.TODO(), false)
+	mounts, err := mref.Mount(context.TODO(), false, nil)
 	require.NoError(t, err)
 
 	lm := snapshot.LocalMounter(mounts)
@@ -880,9 +1196,6 @@ func createRef(t *testing.T, cm cache.Manager, files []string) cache.ImmutableRe
 }
 
 func setupCacheManager(t *testing.T, tmpdir string, snapshotterName string, snapshotter snapshots.Snapshotter) (cache.Manager, func()) {
-	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
-	require.NoError(t, err)
-
 	store, err := local.NewStore(tmpdir)
 	require.NoError(t, err)
 
@@ -892,6 +1205,9 @@ func setupCacheManager(t *testing.T, tmpdir string, snapshotterName string, snap
 	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{
 		snapshotterName: snapshotter,
 	})
+
+	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
+	require.NoError(t, err)
 
 	cm, err := cache.NewManager(cache.ManagerOpt{
 		Snapshotter:    snapshot.FromContainerdSnapshotter(snapshotterName, containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter(snapshotterName)), nil),
@@ -905,6 +1221,18 @@ func setupCacheManager(t *testing.T, tmpdir string, snapshotterName string, snap
 	return cm, func() {
 		db.Close()
 	}
+}
+
+type badMountable struct{}
+
+func (bm *badMountable) Mount(ctx context.Context, readonly bool, _ session.Group) (snapshot.Mountable, error) {
+	return nil, errors.New("tried to mount bad mountable")
+}
+
+// newBadMountable returns a cache.Mountable that will fail to mount, for use in APIs
+// that require a Mountable, but which should never actually try to access the filesystem.
+func newBadMountable() cache.Mountable {
+	return &badMountable{}
 }
 
 // these test helpers are from tonistiigi/fsutil

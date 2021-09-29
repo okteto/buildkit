@@ -40,7 +40,7 @@ func (c dockerd) Name() string {
 	return dockerdBinary
 }
 
-func (c dockerd) New(cfg *BackendConfig) (b Backend, cl func() error, err error) {
+func (c dockerd) New(ctx context.Context, cfg *BackendConfig) (b Backend, cl func() error, err error) {
 	if err := requireRoot(); err != nil {
 		return nil, nil, err
 	}
@@ -139,8 +139,6 @@ func (c dockerd) New(cfg *BackendConfig) (b Backend, cl func() error, err error)
 				return conn.Close()
 			})
 		}
-		cancel()
-		return nil
 	})
 
 	return backend{

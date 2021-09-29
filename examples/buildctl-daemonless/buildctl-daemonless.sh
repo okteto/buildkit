@@ -19,7 +19,7 @@ set -eu
 # * addr
 # * log
 tmp=$(mktemp -d /tmp/buildctl-daemonless.XXXXXX)
-trap "kill \$(cat $tmp/pid); rm -rf $tmp" EXIT
+trap "kill \$(cat $tmp/pid); wait \$(cat $tmp/pid) || true; rm -rf $tmp" EXIT
 
 startBuildkitd() {
     addr=
@@ -45,6 +45,8 @@ waitForBuildkitd() {
     until $BUILDCTL --addr=$addr debug workers >/dev/null 2>&1; do
         if [ $try -gt $max ]; then
             echo >&2 "could not connect to $addr after $max trials"
+            echo >&2 "========== log =========="
+            cat >&2 $tmp/log
             exit 1
         fi
         sleep $(awk "BEGIN{print (100 + $try * 20) * 0.001}")
@@ -55,3 +57,4 @@ waitForBuildkitd() {
 startBuildkitd
 waitForBuildkitd
 $BUILDCTL --addr=$(cat $tmp/addr) "$@"
+

@@ -14,27 +14,39 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/remotes/docker"
+	"github.com/gofrs/flock"
+	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/contentutil"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/semaphore"
 )
+
+var sandboxLimiter *semaphore.Weighted
+
+func init() {
+	sandboxLimiter = semaphore.NewWeighted(int64(runtime.GOMAXPROCS(0)))
+}
 
 // Backend is the minimal interface that describes a testing backend.
 type Backend interface {
 	Address() string
 	ContainerdAddress() string
 	Rootless() bool
+	Snapshotter() string
 }
 
 type Sandbox interface {
 	Backend
 
+	Context() context.Context
 	Cmd(...string) *exec.Cmd
 	PrintLogs(*testing.T)
 	NewRegistry() (string, error)
@@ -48,7 +60,7 @@ type BackendConfig struct {
 }
 
 type Worker interface {
-	New(*BackendConfig) (Backend, func() error, error)
+	New(context.Context, *BackendConfig) (Backend, func() error, error)
 	Name() string
 }
 
@@ -144,11 +156,16 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 				name := fn + "/worker=" + br.Name() + mv.functionSuffix()
 				func(fn, testName string, br Worker, tc Test, mv matrixValue) {
 					ok := t.Run(testName, func(t *testing.T) {
+						ctx := appcontext.Context()
+
 						defer cleanOnComplete()()
 						if !strings.HasSuffix(fn, "NoParallel") {
 							t.Parallel()
 						}
-						sb, closer, err := newSandbox(br, mirror, mv)
+						require.NoError(t, sandboxLimiter.Acquire(context.TODO(), 1))
+						defer sandboxLimiter.Release(1)
+
+						sb, closer, err := newSandbox(ctx, br, mirror, mv)
 						require.NoError(t, err)
 						defer func() {
 							assert.NoError(t, closer())
@@ -186,7 +203,7 @@ func copyImagesLocal(t *testing.T, host string, images map[string]string) error 
 		}
 		localImageCache[host][to] = struct{}{}
 
-		var desc ocispec.Descriptor
+		var desc ocispecs.Descriptor
 		var provider content.Provider
 		var err error
 		if strings.HasPrefix(from, "local:") {
@@ -204,6 +221,13 @@ func copyImagesLocal(t *testing.T, host string, images map[string]string) error 
 				return err
 			}
 		}
+
+		// already exists check
+		_, _, err = docker.NewResolver(docker.ResolverOptions{}).Resolve(context.TODO(), host+"/"+to)
+		if err == nil {
+			continue
+		}
+
 		ingester, err := contentutil.IngesterFromRef(host + "/" + to)
 		if err != nil {
 			return err
@@ -267,20 +291,17 @@ func writeConfig(updaters []ConfigUpdater) (string, error) {
 func runMirror(t *testing.T, mirroredImages map[string]string) (host string, _ func() error, err error) {
 	mirrorDir := os.Getenv("BUILDKIT_REGISTRY_MIRROR_DIR")
 
-	var f *os.File
+	var lock *flock.Flock
 	if mirrorDir != "" {
-		f, err = os.Create(filepath.Join(mirrorDir, "lock"))
-		if err != nil {
+		lock = flock.New(filepath.Join(mirrorDir, "lock"))
+		if err := lock.Lock(); err != nil {
 			return "", nil, err
 		}
 		defer func() {
 			if err != nil {
-				f.Close()
+				lock.Unlock()
 			}
 		}()
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-			return "", nil, err
-		}
 	}
 
 	mirror, cleanup, err := NewRegistry(mirrorDir)
@@ -298,7 +319,7 @@ func runMirror(t *testing.T, mirroredImages map[string]string) (host string, _ f
 	}
 
 	if mirrorDir != "" {
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+		if err := lock.Unlock(); err != nil {
 			return "", nil, err
 		}
 	}
@@ -363,4 +384,45 @@ func prepareValueMatrix(tc testConf) []matrixValue {
 		m = append(m, matrixValue{})
 	}
 	return m
+}
+
+func runStargzSnapshotter(cfg *BackendConfig) (address string, cl func() error, err error) {
+	binary := "containerd-stargz-grpc"
+	if err := lookupBinary(binary); err != nil {
+		return "", nil, err
+	}
+
+	deferF := &multiCloser{}
+	cl = deferF.F()
+
+	defer func() {
+		if err != nil {
+			deferF.F()()
+			cl = nil
+		}
+	}()
+
+	tmpStargzDir, err := ioutil.TempDir("", "bktest_containerd_stargz_grpc")
+	if err != nil {
+		return "", nil, err
+	}
+	deferF.append(func() error { return os.RemoveAll(tmpStargzDir) })
+
+	address = filepath.Join(tmpStargzDir, "containerd-stargz-grpc.sock")
+	stargzRootDir := filepath.Join(tmpStargzDir, "root")
+	cmd := exec.Command(binary,
+		"--log-level", "debug",
+		"--address", address,
+		"--root", stargzRootDir)
+	snStop, err := startCmd(cmd, cfg.Logs)
+	if err != nil {
+		return "", nil, err
+	}
+	if err = waitUnix(address, 10*time.Second); err != nil {
+		snStop()
+		return "", nil, errors.Wrapf(err, "containerd-stargz-grpc did not start up: %s", formatLogs(cfg.Logs))
+	}
+	deferF.append(snStop)
+
+	return
 }

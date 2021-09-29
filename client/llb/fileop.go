@@ -2,7 +2,7 @@ package llb
 
 import (
 	"context"
-	_ "crypto/sha256"
+	_ "crypto/sha256" // for opencontainers/go-digest
 	"os"
 	"path"
 	"strconv"
@@ -54,6 +54,10 @@ type CopyInput interface {
 
 type subAction interface {
 	toProtoAction(context.Context, string, pb.InputIndex) (pb.IsFileAction, error)
+}
+
+type capAdder interface {
+	addCaps(*FileOp)
 }
 
 type FileAction struct {
@@ -252,13 +256,13 @@ func (co ChownOpt) SetCopyOption(mi *CopyInfo) {
 	mi.ChownOpt = &co
 }
 
-func (cp *ChownOpt) marshal(base pb.InputIndex) *pb.ChownOpt {
-	if cp == nil {
+func (co *ChownOpt) marshal(base pb.InputIndex) *pb.ChownOpt {
+	if co == nil {
 		return nil
 	}
 	return &pb.ChownOpt{
-		User:  cp.User.marshal(base),
-		Group: cp.Group.marshal(base),
+		User:  co.User.marshal(base),
+		Group: co.Group.marshal(base),
 	}
 }
 
@@ -427,6 +431,8 @@ type CopyInfo struct {
 	Mode                *os.FileMode
 	FollowSymlinks      bool
 	CopyDirContentsOnly bool
+	IncludePatterns     []string
+	ExcludePatterns     []string
 	AttemptUnpack       bool
 	CreateDestPath      bool
 	AllowWildcard       bool
@@ -458,6 +464,8 @@ func (a *fileActionCopy) toProtoAction(ctx context.Context, parent string, base 
 		Src:                              src,
 		Dest:                             normalizePath(parent, a.dest, true),
 		Owner:                            a.info.ChownOpt.marshal(base),
+		IncludePatterns:                  a.info.IncludePatterns,
+		ExcludePatterns:                  a.info.ExcludePatterns,
 		AllowWildcard:                    a.info.AllowWildcard,
 		AllowEmptyWildcard:               a.info.AllowEmptyWildcard,
 		FollowSymlink:                    a.info.FollowSymlinks,
@@ -476,17 +484,17 @@ func (a *fileActionCopy) toProtoAction(ctx context.Context, parent string, base 
 	}, nil
 }
 
-func (c *fileActionCopy) sourcePath(ctx context.Context) (string, error) {
-	p := path.Clean(c.src)
+func (a *fileActionCopy) sourcePath(ctx context.Context) (string, error) {
+	p := path.Clean(a.src)
 	if !path.IsAbs(p) {
-		if c.state != nil {
-			dir, err := c.state.GetDir(ctx)
+		if a.state != nil {
+			dir, err := a.state.GetDir(ctx)
 			if err != nil {
 				return "", err
 			}
 			p = path.Join("/", dir, p)
-		} else if c.fas != nil {
-			dir, err := c.fas.state.GetDir(ctx)
+		} else if a.fas != nil {
+			dir, err := a.fas.state.GetDir(ctx)
 			if err != nil {
 				return "", err
 			}
@@ -494,6 +502,12 @@ func (c *fileActionCopy) sourcePath(ctx context.Context) (string, error) {
 		}
 	}
 	return p, nil
+}
+
+func (a *fileActionCopy) addCaps(f *FileOp) {
+	if len(a.info.IncludePatterns) != 0 || len(a.info.ExcludePatterns) != 0 {
+		addCap(&f.constraints, pb.CapFileCopyIncludeExcludePatterns)
+	}
 }
 
 type CreatedTime time.Time
@@ -530,7 +544,7 @@ type FileOp struct {
 	isValidated bool
 }
 
-func (f *FileOp) Validate(context.Context) error {
+func (f *FileOp) Validate(context.Context, *Constraints) error {
 	if f.isValidated {
 		return nil
 	}
@@ -653,13 +667,21 @@ func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 	if f.Cached(c) {
 		return f.Load()
 	}
-	if err := f.Validate(ctx); err != nil {
+	if err := f.Validate(ctx, c); err != nil {
 		return "", nil, nil, nil, err
 	}
 
 	addCap(&f.constraints, pb.CapFileBase)
 
 	pfo := &pb.FileOp{}
+
+	if f.constraints.Platform == nil {
+		p, err := getPlatform(*f.action.state)(ctx, c)
+		if err != nil {
+			return "", nil, nil, nil, err
+		}
+		f.constraints.Platform = p
+	}
 
 	pop, md := MarshalConstraints(c, &f.constraints)
 	pop.Op = &pb.Op_File{
@@ -674,6 +696,10 @@ func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 	pop.Inputs = state.inputs
 
 	for i, st := range state.actions {
+		if adder, isCapAdder := st.action.(capAdder); isCapAdder {
+			adder.addCaps(f)
+		}
+
 		output := pb.OutputIndex(-1)
 		if i+1 == len(state.actions) {
 			output = 0

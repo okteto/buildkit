@@ -54,6 +54,7 @@ func (b *buildOp) CacheMap(ctx context.Context, g session.Group, index int) (*so
 		Deps: make([]struct {
 			Selector          digest.Digest
 			ComputeDigestFunc solver.ResultBasedCacheFunc
+			PreprocessFunc    solver.PreprocessFunc
 		}, len(b.v.Inputs())),
 	}, true, nil
 }
@@ -80,7 +81,7 @@ func (b *buildOp) Exec(ctx context.Context, g session.Group, inputs []solver.Res
 		return nil, errors.Errorf("invalid reference for build %T", inp.Sys())
 	}
 
-	mount, err := ref.ImmutableRef.Mount(ctx, true)
+	mount, err := ref.ImmutableRef.Mount(ctx, true, g)
 	if err != nil {
 		return nil, err
 	}
@@ -139,4 +140,9 @@ func (b *buildOp) Exec(ctx context.Context, g session.Group, inputs []solver.Res
 	}
 
 	return []solver.Result{r}, err
+}
+
+func (b *buildOp) Acquire(ctx context.Context) (solver.ReleaseFunc, error) {
+	// buildOp itself does not count towards parallelism budget.
+	return func() {}, nil
 }

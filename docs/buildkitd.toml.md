@@ -49,6 +49,12 @@ insecure-entitlements = [ "network.host", "security.insecure" ]
   # alternate OCI worker binary name(example 'crun'), by default either 
   # buildkit-runc or runc binary is used
   binary = ""
+  # name of the apparmor profile that should be used to constrain build containers.
+  # the profile should already be loaded (by a higher level system) before creating a worker.
+  apparmor-profile = ""
+  # limit the number of parallel build steps that can run at the same time
+  max-parallelism = 4
+
   [worker.oci.labels]
     "foo" = "bar"
 
@@ -66,7 +72,7 @@ insecure-entitlements = [ "network.host", "security.insecure" ]
   platforms = [ "linux/amd64", "linux/arm64" ]
   namespace = "buildkit"
   gc = true
-  # gckeepstorage sets storage limit for default gc profile, in bytes.
+  # gckeepstorage sets storage limit for default gc profile, in MB.
   gckeepstorage = 9000
   [worker.containerd.labels]
     "foo" = "bar"

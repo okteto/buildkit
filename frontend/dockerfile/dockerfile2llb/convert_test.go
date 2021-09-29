@@ -1,12 +1,17 @@
 package dockerfile2llb
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
 	"github.com/moby/buildkit/util/appcontext"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func toEnvMap(args []instructions.KeyValuePairOptional, env []string) map[string]string {
@@ -26,7 +31,7 @@ func toEnvMap(args []instructions.KeyValuePairOptional, env []string) map[string
 
 func TestDockerfileParsing(t *testing.T) {
 	t.Parallel()
-	df := `FROM busybox
+	df := `FROM scratch
 ENV FOO bar
 COPY f1 f2 /sub/
 RUN ls -l
@@ -34,7 +39,7 @@ RUN ls -l
 	_, _, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	assert.NoError(t, err)
 
-	df = `FROM busybox AS foo
+	df = `FROM scratch AS foo
 ENV FOO bar
 FROM foo
 COPY --from=foo f1 /
@@ -43,7 +48,7 @@ COPY --from=0 f2 /
 	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	assert.NoError(t, err)
 
-	df = `FROM busybox AS foo
+	df = `FROM scratch AS foo
 ENV FOO bar
 FROM foo
 COPY --from=foo f1 /
@@ -59,13 +64,13 @@ COPY --from=0 f2 /
 	})
 	assert.Error(t, err)
 
-	df = `FROM busybox
+	df = `FROM scratch
 	ADD http://github.com/moby/buildkit/blob/master/README.md /
 		`
 	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	assert.NoError(t, err)
 
-	df = `FROM busybox
+	df = `FROM scratch
 	COPY http://github.com/moby/buildkit/blob/master/README.md /
 		`
 	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
@@ -187,4 +192,35 @@ COPY --from=stage1 f2 /sub/
 `
 	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	assert.EqualError(t, err, "circular dependency detected on stage: stage0")
+}
+
+// moby/buildkit#2311
+func TestTargetBuildInfo(t *testing.T) {
+	df := `
+FROM busybox
+ADD https://raw.githubusercontent.com/moby/buildkit/master/README.md /
+`
+	_, image, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{
+		TargetPlatform: &ocispecs.Platform{
+			Architecture: "amd64", OS: "linux",
+		},
+		BuildPlatforms: []ocispecs.Platform{
+			{
+				Architecture: "amd64", OS: "linux",
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, image.BuildInfo)
+
+	var bi []exptypes.BuildInfo
+	err = json.Unmarshal(image.BuildInfo, &bi)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(bi))
+
+	assert.Equal(t, exptypes.BuildInfoTypeDockerImage, bi[0].Type)
+	assert.Equal(t, "busybox", bi[0].Ref)
+	assert.True(t, strings.HasPrefix(bi[0].Alias, "docker.io/library/busybox@"))
+	assert.NotEmpty(t, bi[0].Pin)
 }

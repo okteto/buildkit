@@ -181,7 +181,7 @@ func (cs *contentStore) Walk(ctx context.Context, fn content.WalkFunc, fs ...str
 			if err := readInfo(&info, bkt.Bucket(k)); err != nil {
 				return err
 			}
-			if filter.Match(adaptContentInfo(info)) {
+			if filter.Match(content.AdaptInfo(info)) {
 				infos = append(infos, info)
 			}
 			return nil
@@ -708,7 +708,7 @@ func (cs *contentStore) checkAccess(ctx context.Context, dgst digest.Digest) err
 
 func validateInfo(info *content.Info) error {
 	for k, v := range info.Labels {
-		if err := labels.Validate(k, v); err == nil {
+		if err := labels.Validate(k, v); err != nil {
 			return errors.Wrapf(err, "info.Labels")
 		}
 	}
