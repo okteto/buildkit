@@ -1,3 +1,5 @@
+# cloud.google.com/go v0.57.0
+cloud.google.com/go/compute/metadata
 # github.com/AkihiroSuda/containerd-fuse-overlayfs v1.0.0
 github.com/AkihiroSuda/containerd-fuse-overlayfs
 # github.com/Azure/go-ansiterm v0.0.0-20170929234023-d6e3b3328b78
@@ -245,6 +247,8 @@ github.com/google/shlex
 github.com/google/uuid
 # github.com/grpc-ecosystem/go-grpc-middleware v1.2.0
 github.com/grpc-ecosystem/go-grpc-middleware
+github.com/grpc-ecosystem/go-grpc-middleware/auth
+github.com/grpc-ecosystem/go-grpc-middleware/util/metautils
 # github.com/grpc-ecosystem/grpc-opentracing v0.0.0-20180507213350-8e809c8a8645
 github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc
 # github.com/hanwen/go-fuse/v2 v2.0.3
@@ -371,6 +375,12 @@ golang.org/x/net/internal/socks
 golang.org/x/net/internal/timeseries
 golang.org/x/net/proxy
 golang.org/x/net/trace
+# golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
+golang.org/x/oauth2
+golang.org/x/oauth2/google
+golang.org/x/oauth2/internal
+golang.org/x/oauth2/jws
+golang.org/x/oauth2/jwt
 # golang.org/x/sync v0.0.0-20200625203802-6e8e738ad208
 golang.org/x/sync/errgroup
 golang.org/x/sync/semaphore
@@ -388,6 +398,17 @@ golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
 # golang.org/x/time v0.0.0-20200416051211-89c76fbcd5d1
 golang.org/x/time/rate
+# google.golang.org/appengine v1.6.6
+google.golang.org/appengine
+google.golang.org/appengine/internal
+google.golang.org/appengine/internal/app_identity
+google.golang.org/appengine/internal/base
+google.golang.org/appengine/internal/datastore
+google.golang.org/appengine/internal/log
+google.golang.org/appengine/internal/modules
+google.golang.org/appengine/internal/remote_api
+google.golang.org/appengine/internal/urlfetch
+google.golang.org/appengine/urlfetch
 # google.golang.org/genproto v0.0.0-20200527145253-8367513e4ece => google.golang.org/genproto v0.0.0-20200224152610-e50cd9704f63
 google.golang.org/genproto/googleapis/rpc/status
 # google.golang.org/grpc v1.29.1
@@ -441,3 +462,6 @@ gotest.tools/v3/internal/difflib
 gotest.tools/v3/internal/format
 gotest.tools/v3/internal/source
 gotest.tools/v3/poll
+# grpc.go4.org v0.0.0-20170609214715-11d0a25b4919
+grpc.go4.org/credentials
+grpc.go4.org/credentials/oauth
