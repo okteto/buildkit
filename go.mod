@@ -69,14 +69,17 @@ require (
 	go.opentelemetry.io/proto/otlp v0.9.0
 	golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2
 	golang.org/x/net v0.0.0-20210520170846-37e1c6afe023
+	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 	golang.org/x/sys v0.0.0-20210630005230-0f9fa26af87c
 	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac
 	google.golang.org/genproto v0.0.0-20210602131652-f16073e35f0c
 	google.golang.org/grpc v1.40.0
+	grpc.go4.org v0.0.0-20170609214715-11d0a25b4919
 )
 
 require (
+	cloud.google.com/go v0.57.0 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.2.0 // indirect
@@ -115,6 +118,7 @@ require (
 	go.opentelemetry.io/otel/internal/metric v0.21.0 // indirect
 	go.opentelemetry.io/otel/metric v0.21.0 // indirect
 	golang.org/x/text v0.3.6 // indirect
+	google.golang.org/appengine v1.6.6 // indirect
 	google.golang.org/protobuf v1.26.0 // indirect
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
 	gotest.tools/v3 v3.0.3 // indirect

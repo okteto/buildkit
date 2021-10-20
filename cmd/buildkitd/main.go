@@ -25,6 +25,8 @@ import (
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/gofrs/flock"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
+	"github.com/moby/buildkit/auth"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/cache/remotecache/gha"
 	inlineremotecache "github.com/moby/buildkit/cache/remotecache/inline"
@@ -193,6 +195,11 @@ func main() {
 			Name:  "allow-insecure-entitlement",
 			Usage: "allows insecure entitlements e.g. network.host, security.insecure",
 		},
+		cli.StringFlag{
+			Name:  "authorization-endpoint",
+			Usage: "authorization endpoint (optional)",
+			Value: "",
+		},
 	)
 	app.Flags = append(app.Flags, appFlags...)
 
@@ -235,6 +242,16 @@ func main() {
 
 		unary := grpc_middleware.ChainUnaryServer(unaryInterceptor(ctx, tp), grpcerrors.UnaryServerInterceptor)
 		stream := grpc_middleware.ChainStreamServer(streamTracer, grpcerrors.StreamServerInterceptor)
+
+		if cfg.AuthorizationEndpoint != "" {
+			svc := auth.NewService(cfg.AuthorizationEndpoint)
+
+			unaryAuthorizer := grpc_auth.UnaryServerInterceptor(svc.EnsureValidToken)
+			unary = grpc_middleware.ChainUnaryServer(unary, unaryAuthorizer)
+
+			streamAuthorizer := grpc_auth.StreamServerInterceptor(svc.EnsureValidToken)
+			stream = grpc_middleware.ChainStreamServer(stream, streamAuthorizer)
+		}
 
 		opts := []grpc.ServerOption{grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream)}
 		server := grpc.NewServer(opts...)
