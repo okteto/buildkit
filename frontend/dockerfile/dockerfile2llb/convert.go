@@ -59,6 +59,8 @@ type ConvertOpt struct {
 	BuildPlatforms    []ocispecs.Platform
 	PrefixPlatform    bool
 	ExtraHosts        []llb.HostIP
+	ShmSize           int64
+	Ulimit            []pb.Ulimit
 	ForceNetMode      pb.NetMode
 	OverrideCopyImage string
 	LLBCaps           *apicaps.CapSet
@@ -389,6 +391,8 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 			buildPlatforms:    platformOpt.buildPlatforms,
 			targetPlatform:    platformOpt.targetPlatform,
 			extraHosts:        opt.ExtraHosts,
+			shmSize:           opt.ShmSize,
+			ulimit:            opt.Ulimit,
 			copyImage:         opt.OverrideCopyImage,
 			llbCaps:           opt.LLBCaps,
 			sourceMap:         opt.SourceMap,
@@ -519,6 +523,8 @@ type dispatchOpt struct {
 	targetPlatform    ocispecs.Platform
 	buildPlatforms    []ocispecs.Platform
 	extraHosts        []llb.HostIP
+	shmSize           int64
+	ulimit            []pb.Ulimit
 	copyImage         string
 	llbCaps           *apicaps.CapSet
 	sourceMap         *llb.SourceMap
@@ -786,6 +792,12 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 		opt = append(opt, networkOpt)
 	}
 
+	if dopt.llbCaps != nil && dopt.llbCaps.Supports(pb.CapExecMetaUlimit) == nil {
+		for _, u := range dopt.ulimit {
+			opt = append(opt, llb.AddUlimit(llb.UlimitName(u.Name), u.Soft, u.Hard))
+		}
+	}
+
 	shlex := *dopt.shlex
 	shlex.RawQuotes = true
 	shlex.SkipUnsetEnv = true
@@ -798,6 +810,13 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 	for _, h := range dopt.extraHosts {
 		opt = append(opt, llb.AddExtraHost(h.Host, h.IP))
 	}
+
+	if dopt.llbCaps != nil && dopt.llbCaps.Supports(pb.CapExecMountTmpfsSize) == nil {
+		if dopt.shmSize > 0 {
+			opt = append(opt, llb.AddMount("/dev/shm", llb.Scratch(), llb.Tmpfs(llb.TmpfsSize(dopt.shmSize))))
+		}
+	}
+
 	d.state = d.state.Run(opt...).Root()
 	return commitToHistory(&d.image, "RUN "+runCommandString(args, d.buildArgs, shell.BuildEnvs(env)), true, &d.state)
 }
