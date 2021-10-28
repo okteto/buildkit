@@ -73,6 +73,9 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 		if wt, ok := o.(*withTracerDelegate); ok {
 			tracerDelegate = wt
 		}
+		if rpc, ok := o.(*withRPCCreds); ok {
+			gopts = append(gopts, grpc.WithPerRPCCredentials(rpc.creds))
+		}
 	}
 
 	if !customTracer {
@@ -242,6 +245,14 @@ func WithTracerDelegate(td TracerDelegate) ClientOpt {
 
 type withTracerDelegate struct {
 	TracerDelegate
+}
+
+type withRPCCreds struct {
+	creds credentials.PerRPCCredentials
+}
+
+func WithRPCCreds(c credentials.PerRPCCredentials) ClientOpt {
+	return &withRPCCreds{c}
 }
 
 func resolveDialer(address string) (func(context.Context, string) (net.Conn, error), error) {

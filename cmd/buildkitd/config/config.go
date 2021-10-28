@@ -25,6 +25,8 @@ type Config struct {
 	Registries map[string]resolver.RegistryConfig `toml:"registry"`
 
 	DNS *DNSConfig `toml:"dns"`
+
+	AuthorizationEndpoint string `tolm:"authorization-endpoint"`
 }
 
 type GRPCConfig struct {
