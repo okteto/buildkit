@@ -67,13 +67,13 @@ require (
 	go.opentelemetry.io/proto/otlp v0.9.0
 	golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2
 	golang.org/x/net v0.0.0-20210226172049-e18ecbb05110
-	golang.org/x/oauth2 v0.0.0-20211005180243-6b3c2da341f1 // indirect
+	golang.org/x/oauth2 v0.0.0-20211005180243-6b3c2da341f1
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 	golang.org/x/sys v0.0.0-20210403161142-5e06dd20ab57
 	golang.org/x/time v0.0.0-20200630173020-3af7569d3a1e
 	google.golang.org/genproto v0.0.0-20201110150050-8816d57aaa9a
 	google.golang.org/grpc v1.38.0
-	grpc.go4.org v0.0.0-20170609214715-11d0a25b4919 // indirect
+	grpc.go4.org v0.0.0-20170609214715-11d0a25b4919
 )
 
 replace github.com/docker/docker => github.com/tonistiigi/docker v0.10.1-0.20210928031959-5fec36db36f9
