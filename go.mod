@@ -26,8 +26,8 @@ require (
 	github.com/gogo/googleapis v1.3.2
 	github.com/gogo/protobuf v1.3.1
 	// protobuf: the actual version is replaced in replace()
-	github.com/golang/protobuf v1.4.2
-	github.com/google/go-cmp v0.4.1
+	github.com/golang/protobuf v1.4.3
+	github.com/google/go-cmp v0.5.5
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/gorilla/mux v1.8.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.2.0
@@ -52,6 +52,7 @@ require (
 	github.com/opentracing/opentracing-go v1.2.0
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/profile v1.5.0
+	github.com/prometheus/client_golang v1.11.0
 	github.com/serialx/hashring v0.0.0-20190422032157-8b2912629002
 	github.com/sirupsen/logrus v1.7.0
 	github.com/stretchr/testify v1.5.1
@@ -64,8 +65,8 @@ require (
 	golang.org/x/crypto v0.0.0-20201117144127-c1f2f97bffc9
 	golang.org/x/net v0.0.0-20200707034311-ab3426394381
 	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
-	golang.org/x/sync v0.0.0-20200625203802-6e8e738ad208
-	golang.org/x/sys v0.0.0-20201013081832-0aaa2718063a
+	golang.org/x/sync v0.0.0-20201207232520-09787c993a3a
+	golang.org/x/sys v0.0.0-20210603081109-ebe580a85c40
 	golang.org/x/time v0.0.0-20200416051211-89c76fbcd5d1
 	// genproto: the actual version is replaced in replace()
 	google.golang.org/genproto v0.0.0-20200527145253-8367513e4ece
