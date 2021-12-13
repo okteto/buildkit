@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -54,6 +55,7 @@ import (
 	_ "github.com/moby/buildkit/util/tracing/detect/jaeger"
 	_ "github.com/moby/buildkit/util/tracing/env"
 	"github.com/moby/buildkit/util/tracing/transform"
+	"github.com/moby/buildkit/vendor/github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/moby/buildkit/version"
 	"github.com/moby/buildkit/worker"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -304,6 +306,12 @@ func main() {
 		if err := serveGRPC(cfg.GRPC, server, errCh); err != nil {
 			return err
 		}
+
+		http.Handle("/metrics", promhttp.Handler())
+		go func() {
+			logrus.Info("running metrics server on :2112")
+			http.ListenAndServe(":2112", nil)
+		}()
 
 		select {
 		case serverErr := <-errCh:
