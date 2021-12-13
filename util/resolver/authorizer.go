@@ -19,7 +19,16 @@ import (
 	sessionauth "github.com/moby/buildkit/session/auth"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sirupsen/logrus"
+)
+
+var (
+	fatalAuthErrorDetected = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "buildkitd_fatal_auth_error_total",
+		Help: "The total number of fatal auth errors.",
+	})
 )
 
 type authHandlerNS struct {
@@ -163,6 +172,7 @@ func (a *dockerAuthorizer) AddResponses(ctx context.Context, responses []*http.R
 
 				// this hacky way seems to be best method to detect that error is fatal and should not be retried with a new token
 				if c.Parameters["error"] == "insufficient_scope" && parseScopes(oldScopes).contains(parseScopes(strings.Split(c.Parameters["scope"], " "))) {
+					fatalAuthErrorDetected.Inc()
 					return err
 				}
 			}
