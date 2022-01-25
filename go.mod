@@ -5,10 +5,10 @@ go 1.13
 require (
 	github.com/BurntSushi/toml v0.3.1
 	github.com/Microsoft/go-winio v0.4.17
-	github.com/Microsoft/hcsshim v0.8.18
+	github.com/Microsoft/hcsshim v0.8.23
 	github.com/agext/levenshtein v1.2.3
 	github.com/containerd/console v1.0.2
-	github.com/containerd/containerd v1.5.3
+	github.com/containerd/containerd v1.5.8-0.20211112185055-5fde9a5b31df
 	github.com/containerd/continuity v0.1.0
 	github.com/containerd/fuse-overlayfs-snapshotter v1.0.2
 	github.com/containerd/go-cni v1.0.2
@@ -40,9 +40,9 @@ require (
 	github.com/morikuni/aec v1.0.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.0.1
-	github.com/opencontainers/runc v1.0.0-rc93
-	github.com/opencontainers/runtime-spec v1.0.3-0.20200929063507-e6143ca7d51d
-	github.com/opencontainers/selinux v1.8.0
+	github.com/opencontainers/runc v1.0.2
+	github.com/opencontainers/runtime-spec v1.0.3-0.20210326190908-1c3f411f0417
+	github.com/opencontainers/selinux v1.8.2
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/profile v1.5.0
 	github.com/prometheus/client_golang v1.11.0
