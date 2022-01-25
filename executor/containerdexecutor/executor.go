@@ -6,7 +6,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -119,27 +118,23 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 	defer lm.Unmount()
 	defer executor.MountStubsCleaner(rootfsPath, mounts)()
 
-	var sgids []uint32
-	uid, gid, err := oci.ParseUIDGID(meta.User)
+	uid, gid, sgids, err := oci.GetUser(rootfsPath, meta.User)
 	if err != nil {
-		uid, gid, sgids, err = oci.GetUser(rootfsPath, meta.User)
-		if err != nil {
-			return err
-		}
+		return err
+	}
 
-		identity := idtools.Identity{
-			UID: int(uid),
-			GID: int(gid),
-		}
+	identity := idtools.Identity{
+		UID: int(uid),
+		GID: int(gid),
+	}
 
-		newp, err := fs.RootPath(rootfsPath, meta.Cwd)
-		if err != nil {
-			return errors.Wrapf(err, "working dir %s points to invalid target", newp)
-		}
-		if _, err := os.Stat(newp); err != nil {
-			if err := idtools.MkdirAllAndChown(newp, 0755, identity); err != nil {
-				return errors.Wrapf(err, "failed to create working directory %s", newp)
-			}
+	newp, err := fs.RootPath(rootfsPath, meta.Cwd)
+	if err != nil {
+		return errors.Wrapf(err, "working dir %s points to invalid target", newp)
+	}
+	if _, err := os.Stat(newp); err != nil {
+		if err := idtools.MkdirAllAndChown(newp, 0755, identity); err != nil {
+			return errors.Wrapf(err, "failed to create working directory %s", newp)
 		}
 	}
 
@@ -162,18 +157,8 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 		opts = append(opts, containerdoci.WithRootFSReadonly())
 	}
 
-	if w.cgroupParent != "" {
-		var cgroupsPath string
-		lastSeparator := w.cgroupParent[len(w.cgroupParent)-1:]
-		if strings.Contains(w.cgroupParent, ".slice") && lastSeparator == ":" {
-			cgroupsPath = w.cgroupParent + id
-		} else {
-			cgroupsPath = filepath.Join("/", w.cgroupParent, "buildkit", id)
-		}
-		opts = append(opts, containerdoci.WithCgroup(cgroupsPath))
-	}
 	processMode := oci.ProcessSandbox // FIXME(AkihiroSuda)
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, processMode, nil, w.apparmorProfile, w.traceSocket, opts...)
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.cgroupParent, processMode, nil, w.apparmorProfile, w.traceSocket, opts...)
 	if err != nil {
 		return err
 	}

@@ -76,10 +76,11 @@ type Hashed interface {
 }
 
 type includedPath struct {
-	path                  string
-	record                *CacheRecord
-	matchedIncludePattern bool
-	matchedExcludePattern bool
+	path             string
+	record           *CacheRecord
+	included         bool
+	includeMatchInfo fileutils.MatchInfo
+	excludeMatchInfo fileutils.MatchInfo
 }
 
 type cacheManager struct {
@@ -519,7 +520,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		updated        bool
 		iter           *iradix.Iterator
 		k              []byte
-		kOk            bool
+		keyOk          bool
 		origPrefix     string
 		resolvedPrefix string
 	)
@@ -527,7 +528,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 	iter = root.Iterator()
 
 	if opts.Wildcard {
-		origPrefix, k, kOk, err = wildcardPrefix(root, p)
+		origPrefix, k, keyOk, err = wildcardPrefix(root, p)
 		if err != nil {
 			return nil, err
 		}
@@ -543,17 +544,17 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		if err != nil {
 			return nil, err
 		}
-		kOk = (cr != nil)
+		keyOk = (cr != nil)
 	}
 
 	if origPrefix != "" {
-		if kOk {
+		if keyOk {
 			iter.SeekLowerBound(append(append([]byte{}, k...), 0))
 		}
 
 		resolvedPrefix = string(convertKeyToPath(k))
 	} else {
-		k, _, kOk = iter.Next()
+		k, _, keyOk = iter.Next()
 	}
 
 	var (
@@ -561,7 +562,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		lastMatchedDir   string
 	)
 
-	for kOk {
+	for keyOk {
 		fn := string(convertKeyToPath(k))
 
 		// Convert the path prefix from what we found in the prefix
@@ -596,7 +597,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 			fn = fn[:len(fn)-1]
 			if fn == p && endsInSep {
 				// We don't include the metadata header for a source dir which ends with a separator
-				k, _, kOk = iter.Next()
+				k, _, keyOk = iter.Next()
 				continue
 			}
 		}
@@ -610,7 +611,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 					return nil, err
 				}
 				if !include {
-					k, _, kOk = iter.Next()
+					k, _, keyOk = iter.Next()
 					continue
 				}
 				lastMatchedDir = fn
@@ -644,7 +645,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		}
 
 		if !shouldInclude && !dirHeader {
-			k, _, kOk = iter.Next()
+			k, _, keyOk = iter.Next()
 			continue
 		}
 
@@ -664,18 +665,26 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		}
 		maybeIncludedPath.record = cr
 
-		if !shouldInclude {
-			if cr.Type == CacheRecordTypeDirHeader {
-				// We keep track of non-included parent dir headers in case an
-				// include pattern matches a file inside one of these dirs.
-				parentDirHeaders = append(parentDirHeaders, maybeIncludedPath)
+		if shouldInclude {
+			for _, parentDir := range parentDirHeaders {
+				if !parentDir.included {
+					includedPaths = append(includedPaths, parentDir)
+					parentDir.included = true
+				}
 			}
-		} else {
-			includedPaths = append(includedPaths, parentDirHeaders...)
-			parentDirHeaders = nil
 			includedPaths = append(includedPaths, maybeIncludedPath)
+			maybeIncludedPath.included = true
 		}
-		k, _, kOk = iter.Next()
+
+		if cr.Type == CacheRecordTypeDirHeader {
+			// We keep track of parent dir headers whether
+			// they are immediately included or not, in case
+			// an include pattern matches a file inside one
+			// of these dirs.
+			parentDirHeaders = append(parentDirHeaders, maybeIncludedPath)
+		}
+
+		k, _, keyOk = iter.Next()
 	}
 
 	cc.tree = txn.Commit()
@@ -692,19 +701,20 @@ func shouldIncludePath(
 	parentDir *includedPath,
 ) (bool, error) {
 	var (
-		m   bool
-		err error
+		m         bool
+		matchInfo fileutils.MatchInfo
+		err       error
 	)
 	if includePatternMatcher != nil {
 		if parentDir != nil {
-			m, err = includePatternMatcher.MatchesUsingParentResult(candidate, parentDir.matchedIncludePattern)
+			m, matchInfo, err = includePatternMatcher.MatchesUsingParentResults(candidate, parentDir.includeMatchInfo)
 		} else {
-			m, err = includePatternMatcher.MatchesOrParentMatches(candidate)
+			m, matchInfo, err = includePatternMatcher.MatchesUsingParentResults(candidate, fileutils.MatchInfo{})
 		}
 		if err != nil {
 			return false, errors.Wrap(err, "failed to match includepatterns")
 		}
-		maybeIncludedPath.matchedIncludePattern = m
+		maybeIncludedPath.includeMatchInfo = matchInfo
 		if !m {
 			return false, nil
 		}
@@ -712,14 +722,14 @@ func shouldIncludePath(
 
 	if excludePatternMatcher != nil {
 		if parentDir != nil {
-			m, err = excludePatternMatcher.MatchesUsingParentResult(candidate, parentDir.matchedExcludePattern)
+			m, matchInfo, err = excludePatternMatcher.MatchesUsingParentResults(candidate, parentDir.excludeMatchInfo)
 		} else {
-			m, err = excludePatternMatcher.MatchesOrParentMatches(candidate)
+			m, matchInfo, err = excludePatternMatcher.MatchesUsingParentResults(candidate, fileutils.MatchInfo{})
 		}
 		if err != nil {
 			return false, errors.Wrap(err, "failed to match excludepatterns")
 		}
-		maybeIncludedPath.matchedExcludePattern = m
+		maybeIncludedPath.excludeMatchInfo = matchInfo
 		if m {
 			return false, nil
 		}

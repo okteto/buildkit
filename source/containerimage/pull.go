@@ -217,7 +217,6 @@ func (p *puller) CacheKey(ctx context.Context, g session.Group, index int) (cach
 
 			p.descHandlers = cache.DescHandlers(make(map[digest.Digest]*cache.DescHandler))
 			for i, desc := range p.manifest.Descriptors {
-
 				// Hints for remote/stargz snapshotter for searching for remote snapshots
 				labels := snapshots.FilterInheritedLabels(desc.Annotations)
 				if labels == nil {
@@ -304,6 +303,7 @@ func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir cache.Immuta
 	}()
 
 	var parent cache.ImmutableRef
+	setWindowsLayerType := p.Platform.OS == "windows" && runtime.GOOS != "windows"
 	for _, layerDesc := range p.manifest.Descriptors {
 		parent = current
 		current, err = p.CacheAccessor.GetByBlob(ctx, layerDesc, parent,
@@ -313,6 +313,11 @@ func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir cache.Immuta
 		}
 		if err != nil {
 			return nil, err
+		}
+		if setWindowsLayerType {
+			if err := current.SetLayerType("windows"); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -340,12 +345,6 @@ func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir cache.Immuta
 		}
 	}
 
-	if current != nil && p.Platform.OS == "windows" && runtime.GOOS != "windows" {
-		if err := markRefLayerTypeWindows(current); err != nil {
-			return nil, err
-		}
-	}
-
 	if p.id.RecordType != "" && current.GetRecordType() == "" {
 		if err := current.SetRecordType(p.id.RecordType); err != nil {
 			return nil, err
@@ -353,16 +352,6 @@ func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir cache.Immuta
 	}
 
 	return current, nil
-}
-
-func markRefLayerTypeWindows(ref cache.ImmutableRef) error {
-	if parent := ref.Parent(); parent != nil {
-		defer parent.Release(context.TODO())
-		if err := markRefLayerTypeWindows(parent); err != nil {
-			return err
-		}
-	}
-	return ref.SetLayerType("windows")
 }
 
 // cacheKeyFromConfig returns a stable digest from image config. If image config

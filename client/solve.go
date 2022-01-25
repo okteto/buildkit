@@ -292,6 +292,17 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 					Timestamp: v.Timestamp,
 				})
 			}
+			for _, v := range resp.Warnings {
+				s.Warnings = append(s.Warnings, &VertexWarning{
+					Vertex:     v.Vertex,
+					Level:      int(v.Level),
+					Short:      v.Short,
+					Detail:     v.Detail,
+					URL:        v.Url,
+					SourceInfo: v.Info,
+					Range:      v.Ranges,
+				})
+			}
 			if statusChan != nil {
 				statusChan <- &s
 			}
@@ -448,7 +459,6 @@ func parseCacheOptions(ctx context.Context, opt SolveOpt) (*cacheOptions, error)
 				}
 			}
 			contentStores["local:"+csDir] = cs
-
 		}
 		if im.Type == "registry" {
 			legacyImportRef := attrs["ref"]

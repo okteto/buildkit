@@ -1,3 +1,4 @@
+//go:build linux && !no_containerd_worker
 // +build linux,!no_containerd_worker
 
 package containerd
@@ -21,10 +22,10 @@ func init() {
 
 func TestContainerdWorkerIntegration(t *testing.T) {
 	checkRequirement(t)
-	integration.Run(t, []integration.Test{
+	integration.Run(t, integration.TestFuncs(
 		testContainerdWorkerExec,
 		testContainerdWorkerExecFailures,
-	})
+	))
 }
 
 func newWorkerOpt(t *testing.T, addr string) (base.WorkerOpt, func()) {

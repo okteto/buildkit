@@ -1,3 +1,4 @@
+//go:build dfheredoc
 // +build dfheredoc
 
 package dockerfile
@@ -17,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var hdTests = []integration.Test{
+var hdTests = integration.TestFuncs(
 	testCopyHeredoc,
 	testRunBasicHeredoc,
 	testRunFakeHeredoc,
@@ -26,7 +27,7 @@ var hdTests = []integration.Test{
 	testHeredocIndent,
 	testHeredocVarSubstitution,
 	testOnBuildHeredoc,
-}
+)
 
 func init() {
 	heredocTests = append(heredocTests, hdTests...)
@@ -508,7 +509,7 @@ func testOnBuildHeredoc(t *testing.T, sb integration.Sandbox) {
 	f := getFrontend(t, sb)
 
 	registry, err := sb.NewRegistry()
-	if errors.Is(err, integration.ErrorRequirements) {
+	if errors.Is(err, integration.ErrRequirements) {
 		t.Skip(err.Error())
 	}
 	require.NoError(t, err)

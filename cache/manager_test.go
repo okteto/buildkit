@@ -26,9 +26,11 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/leases"
 	ctdmetadata "github.com/containerd/containerd/metadata"
+	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/native"
+	"github.com/containerd/continuity/fs/fstest"
 	"github.com/containerd/stargz-snapshotter/estargz"
 	"github.com/klauspost/compress/zstd"
 	"github.com/moby/buildkit/cache/metadata"
@@ -128,8 +130,11 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 		return nil, nil, err
 	}
 
-	store = containerdsnapshot.NewContentStore(mdb.ContentStore(), ns)
+	c := mdb.ContentStore()
+	store = containerdsnapshot.NewContentStore(c, ns)
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), ns)
+	applier := winlayers.NewFileSystemApplierWithWindows(store, apply.NewFileSystemApplier(store))
+	differ := winlayers.NewWalkingDiffWithWindows(store, walking.NewWalkingDiff(store))
 
 	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
 	if err != nil {
@@ -142,8 +147,8 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 		ContentStore:   store,
 		LeaseManager:   lm,
 		GarbageCollect: mdb.GarbageCollect,
-		Applier:        winlayers.NewFileSystemApplierWithWindows(store, apply.NewFileSystemApplier(store)),
-		Differ:         winlayers.NewWalkingDiffWithWindows(store, walking.NewWalkingDiff(store)),
+		Applier:        applier,
+		Differ:         differ,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -331,6 +336,75 @@ func TestLazyGetByBlob(t *testing.T) {
 
 	_, err = cm.GetByBlob(ctx, desc2, nil, descHandlers2)
 	require.NoError(t, err)
+}
+
+func TestMergeBlobchainID(t *testing.T) {
+	t.Parallel()
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir, err := ioutil.TempDir("", "cachemanager")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, cmOpt{
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	defer cleanup()
+	cm := co.manager
+
+	// create a merge ref that has 3 inputs, with each input being a 3 layer blob chain
+	var mergeInputs []ImmutableRef
+	var descs []ocispecs.Descriptor
+	descHandlers := DescHandlers(map[digest.Digest]*DescHandler{})
+	for i := 0; i < 3; i++ {
+		contentBuffer := contentutil.NewBuffer()
+		var curBlob ImmutableRef
+		for j := 0; j < 3; j++ {
+			blobBytes, desc, err := mapToBlob(map[string]string{strconv.Itoa(i): strconv.Itoa(j)}, true)
+			require.NoError(t, err)
+			cw, err := contentBuffer.Writer(ctx)
+			require.NoError(t, err)
+			_, err = cw.Write(blobBytes)
+			require.NoError(t, err)
+			err = cw.Commit(ctx, 0, cw.Digest())
+			require.NoError(t, err)
+			descHandlers[desc.Digest] = &DescHandler{
+				Provider: func(_ session.Group) content.Provider { return contentBuffer },
+			}
+			curBlob, err = cm.GetByBlob(ctx, desc, curBlob, descHandlers)
+			require.NoError(t, err)
+			descs = append(descs, desc)
+		}
+		mergeInputs = append(mergeInputs, curBlob.Clone())
+	}
+
+	mergeRef, err := cm.Merge(ctx, mergeInputs)
+	require.NoError(t, err)
+
+	_, err = mergeRef.GetRemotes(ctx, true, solver.CompressionOpt{Type: compression.Default}, false, nil)
+	require.NoError(t, err)
+
+	// verify the merge blobchain ID isn't just set to one of the inputs (regression test)
+	mergeBlobchainID := mergeRef.(*immutableRef).getBlobChainID()
+	for _, mergeInput := range mergeInputs {
+		inputBlobchainID := mergeInput.(*immutableRef).getBlobChainID()
+		require.NotEqual(t, mergeBlobchainID, inputBlobchainID)
+	}
+
+	// verify you get the merge ref when asking for an equivalent blob chain
+	var curBlob ImmutableRef
+	for _, desc := range descs[:len(descs)-1] {
+		curBlob, err = cm.GetByBlob(ctx, desc, curBlob, descHandlers)
+		require.NoError(t, err)
+	}
+	blobRef, err := cm.GetByBlob(ctx, descs[len(descs)-1], curBlob, descHandlers)
+	require.NoError(t, err)
+	require.Equal(t, mergeRef.ID(), blobRef.ID())
 }
 
 func TestSnapshotExtract(t *testing.T) {
@@ -529,7 +603,7 @@ func TestExtractOnMutable(t *testing.T) {
 	err = snap.(*immutableRef).setBlob(leaseCtx, compressionType, desc)
 	done(context.TODO())
 	require.NoError(t, err)
-	err = snap.(*immutableRef).setChains(leaseCtx)
+	err = snap.(*immutableRef).computeChainMetadata(leaseCtx, map[string]struct{}{snap.ID(): {}})
 	require.NoError(t, err)
 
 	snap2, err := cm.GetByBlob(ctx, desc2, snap)
@@ -652,7 +726,7 @@ func TestSetBlob(t *testing.T) {
 	}
 	err = snap.(*immutableRef).setBlob(ctx, compressionType, desc)
 	require.NoError(t, err)
-	err = snap.(*immutableRef).setChains(ctx)
+	err = snap.(*immutableRef).computeChainMetadata(ctx, map[string]struct{}{snap.ID(): {}})
 	require.NoError(t, err)
 
 	snapRef = snap.(*immutableRef)
@@ -682,7 +756,7 @@ func TestSetBlob(t *testing.T) {
 	}
 	err = snap2.(*immutableRef).setBlob(ctx, compressionType2, desc2)
 	require.NoError(t, err)
-	err = snap2.(*immutableRef).setChains(ctx)
+	err = snap2.(*immutableRef).computeChainMetadata(ctx, map[string]struct{}{snap.ID(): {}, snap2.ID(): {}})
 	require.NoError(t, err)
 
 	snapRef2 := snap2.(*immutableRef)
@@ -1273,7 +1347,7 @@ func TestGetRemotes(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, 1, len(remotes))
 				remote := remotes[0]
-				refChain := ir.parentRefChain()
+				refChain := ir.layerChain()
 				for i, desc := range remote.Descriptors {
 					switch compressionType {
 					case compression.Uncompressed:
@@ -1491,6 +1565,364 @@ func checkDescriptor(ctx context.Context, t *testing.T, cs content.Store, desc o
 	require.Equal(t, diffID.Digest().String(), uncompressedDgst)
 	if compressionType == compression.EStargz {
 		require.Equal(t, c.size(), uncompressedSize)
+	}
+}
+
+func TestMergeOp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented merge-op support on Windows")
+	}
+
+	// This just tests the basic Merge method and some of the logic with releasing merge refs.
+	// Tests for the fs merge logic are in client_test and snapshotter_test.
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir, err := ioutil.TempDir("", "cachemanager")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, cmOpt{
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	defer cleanup()
+	cm := co.manager
+
+	emptyMerge, err := cm.Merge(ctx, nil)
+	require.NoError(t, err)
+	require.Nil(t, emptyMerge)
+
+	var baseRefs []ImmutableRef
+	for i := 0; i < 6; i++ {
+		active, err := cm.New(ctx, nil, nil)
+		require.NoError(t, err)
+		m, err := active.Mount(ctx, false, nil)
+		require.NoError(t, err)
+		lm := snapshot.LocalMounter(m)
+		target, err := lm.Mount()
+		require.NoError(t, err)
+		err = fstest.Apply(
+			fstest.CreateFile(strconv.Itoa(i), []byte(strconv.Itoa(i)), 0777),
+		).Apply(target)
+		require.NoError(t, err)
+		err = lm.Unmount()
+		require.NoError(t, err)
+		snap, err := active.Commit(ctx)
+		require.NoError(t, err)
+		baseRefs = append(baseRefs, snap)
+		size, err := snap.(*immutableRef).size(ctx)
+		require.NoError(t, err)
+		require.EqualValues(t, 8192, size)
+	}
+
+	singleMerge, err := cm.Merge(ctx, baseRefs[:1])
+	require.NoError(t, err)
+	m, err := singleMerge.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	ms, unmount, err := m.Mount()
+	require.NoError(t, err)
+	require.Len(t, ms, 1)
+	require.Equal(t, ms[0].Type, "bind")
+	err = fstest.CheckDirectoryEqualWithApplier(ms[0].Source, fstest.Apply(
+		fstest.CreateFile(strconv.Itoa(0), []byte(strconv.Itoa(0)), 0777),
+	))
+	require.NoError(t, err)
+	require.NoError(t, unmount())
+	require.NoError(t, singleMerge.Release(ctx))
+
+	err = cm.Prune(ctx, nil, client.PruneInfo{Filter: []string{
+		"id==" + singleMerge.ID(),
+	}})
+	require.NoError(t, err)
+
+	merge1, err := cm.Merge(ctx, baseRefs[:3])
+	require.NoError(t, err)
+	_, err = merge1.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	size1, err := merge1.(*immutableRef).size(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 4096, size1) // hardlinking means all but the first snapshot doesn't take up space
+	checkDiskUsage(ctx, t, cm, 7, 0)
+
+	merge2, err := cm.Merge(ctx, baseRefs[3:])
+	require.NoError(t, err)
+	_, err = merge2.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	size2, err := merge2.(*immutableRef).size(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 4096, size2)
+	checkDiskUsage(ctx, t, cm, 8, 0)
+
+	for _, ref := range baseRefs {
+		require.NoError(t, ref.Release(ctx))
+	}
+	checkDiskUsage(ctx, t, cm, 8, 0)
+	// should still be able to use merges based on released refs
+
+	merge3, err := cm.Merge(ctx, []ImmutableRef{merge1, merge2})
+	require.NoError(t, err)
+	require.NoError(t, merge1.Release(ctx))
+	require.NoError(t, merge2.Release(ctx))
+	_, err = merge3.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	size3, err := merge3.(*immutableRef).size(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 4096, size3)
+	require.Len(t, merge3.(*immutableRef).mergeParents, 6)
+	checkDiskUsage(ctx, t, cm, 7, 2)
+
+	require.NoError(t, merge3.Release(ctx))
+	checkDiskUsage(ctx, t, cm, 0, 9)
+	err = cm.Prune(ctx, nil, client.PruneInfo{All: true})
+	require.NoError(t, err)
+	checkDiskUsage(ctx, t, cm, 0, 0)
+}
+
+func TestDiffOp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented diff-op support on Windows")
+	}
+
+	// This just tests the basic Diff method and some of the logic with releasing diff refs.
+	// Tests for the fs diff logic are in client_test and snapshotter_test.
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir, err := ioutil.TempDir("", "cachemanager")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, cmOpt{
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	defer cleanup()
+	cm := co.manager
+
+	newLower, err := cm.New(ctx, nil, nil)
+	require.NoError(t, err)
+	lowerA, err := newLower.Commit(ctx)
+	require.NoError(t, err)
+	newUpper, err := cm.New(ctx, nil, nil)
+	require.NoError(t, err)
+	upperA, err := newUpper.Commit(ctx)
+	require.NoError(t, err)
+
+	// verify that releasing parents does not invalidate a diff ref until it is released
+	diff, err := cm.Diff(ctx, lowerA, upperA)
+	require.NoError(t, err)
+	checkDiskUsage(ctx, t, cm, 3, 0)
+	require.NoError(t, lowerA.Release(ctx))
+	require.NoError(t, upperA.Release(ctx))
+	checkDiskUsage(ctx, t, cm, 3, 0)
+	require.NoError(t, cm.Prune(ctx, nil, client.PruneInfo{All: true}))
+	checkDiskUsage(ctx, t, cm, 3, 0)
+	_, err = diff.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	require.NoError(t, diff.Release(ctx))
+	checkDiskUsage(ctx, t, cm, 0, 3)
+	require.NoError(t, cm.Prune(ctx, nil, client.PruneInfo{All: true}))
+	checkDiskUsage(ctx, t, cm, 0, 0)
+
+	// test "unmerge" diffs that are defined as a merge of single-layer diffs
+	newRef, err := cm.New(ctx, nil, nil)
+	require.NoError(t, err)
+	a, err := newRef.Commit(ctx)
+	require.NoError(t, err)
+	newRef, err = cm.New(ctx, a, nil)
+	require.NoError(t, err)
+	b, err := newRef.Commit(ctx)
+	require.NoError(t, err)
+	newRef, err = cm.New(ctx, b, nil)
+	require.NoError(t, err)
+	c, err := newRef.Commit(ctx)
+	require.NoError(t, err)
+	newRef, err = cm.New(ctx, c, nil)
+	require.NoError(t, err)
+	d, err := newRef.Commit(ctx)
+	require.NoError(t, err)
+	newRef, err = cm.New(ctx, d, nil)
+	require.NoError(t, err)
+	e, err := newRef.Commit(ctx)
+	require.NoError(t, err)
+
+	diff, err = cm.Diff(ctx, c, e)
+	require.NoError(t, err)
+	checkDiskUsage(ctx, t, cm, 8, 0) // 5 base refs + 2 diffs + 1 merge
+	require.NoError(t, a.Release(ctx))
+	require.NoError(t, b.Release(ctx))
+	require.NoError(t, c.Release(ctx))
+	require.NoError(t, d.Release(ctx))
+	require.NoError(t, e.Release(ctx))
+	checkDiskUsage(ctx, t, cm, 8, 0)
+	require.NoError(t, cm.Prune(ctx, nil, client.PruneInfo{All: true}))
+	checkDiskUsage(ctx, t, cm, 8, 0)
+	_, err = diff.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	require.NoError(t, diff.Release(ctx))
+	checkDiskUsage(ctx, t, cm, 0, 8)
+	require.NoError(t, cm.Prune(ctx, nil, client.PruneInfo{All: true}))
+	checkDiskUsage(ctx, t, cm, 0, 0)
+}
+
+func TestLoadHalfFinalizedRef(t *testing.T) {
+	// This test simulates the situation where a ref w/ an equalMutable has its
+	// snapshot committed but there is a crash before the metadata is updated to
+	// clear the equalMutable field. It's expected that the mutable will be
+	// removed and the immutable ref will continue to be usable.
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir, err := ioutil.TempDir("", "cachemanager")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	defer cleanup()
+	cm := co.manager.(*cacheManager)
+
+	mref, err := cm.New(ctx, nil, nil, CachePolicyRetain)
+	require.NoError(t, err)
+	mutRef := mref.(*mutableRef)
+
+	iref, err := mutRef.Commit(ctx)
+	require.NoError(t, err)
+	immutRef := iref.(*immutableRef)
+
+	require.NoError(t, mref.Release(ctx))
+
+	_, err = co.lm.Create(ctx, func(l *leases.Lease) error {
+		l.ID = immutRef.ID()
+		l.Labels = map[string]string{
+			"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	err = co.lm.AddResource(ctx, leases.Lease{ID: immutRef.ID()}, leases.Resource{
+		ID:   immutRef.getSnapshotID(),
+		Type: "snapshots/" + cm.Snapshotter.Name(),
+	})
+	require.NoError(t, err)
+
+	err = cm.Snapshotter.Commit(ctx, immutRef.getSnapshotID(), mutRef.getSnapshotID())
+	require.NoError(t, err)
+
+	_, err = cm.Snapshotter.Stat(ctx, mutRef.getSnapshotID())
+	require.Error(t, err)
+
+	require.NoError(t, iref.Release(ctx))
+
+	require.NoError(t, cm.Close())
+	require.NoError(t, cleanup())
+
+	co, cleanup, err = newCacheManager(ctx, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	defer cleanup()
+	cm = co.manager.(*cacheManager)
+
+	_, err = cm.GetMutable(ctx, mutRef.ID())
+	require.ErrorIs(t, err, errNotFound)
+
+	iref, err = cm.Get(ctx, immutRef.ID())
+	require.NoError(t, err)
+	require.NoError(t, iref.Finalize(ctx))
+	immutRef = iref.(*immutableRef)
+
+	_, err = cm.Snapshotter.Stat(ctx, immutRef.getSnapshotID())
+	require.NoError(t, err)
+}
+
+func TestMountReadOnly(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "linux" {
+		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
+	}
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir, err := ioutil.TempDir("", "cachemanager")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, cmOpt{
+		snapshotter:     snapshotter,
+		snapshotterName: "overlay",
+	})
+	require.NoError(t, err)
+	defer cleanup()
+	cm := co.manager
+
+	mutRef, err := cm.New(ctx, nil, nil)
+	require.NoError(t, err)
+
+	for i := 0; i < 2; i++ {
+		rwMntable, err := mutRef.Mount(ctx, false, nil)
+		require.NoError(t, err)
+		rwMnts, release, err := rwMntable.Mount()
+		require.NoError(t, err)
+		defer release()
+		require.Len(t, rwMnts, 1)
+		require.False(t, isReadOnly(rwMnts[0]))
+
+		roMntable, err := mutRef.Mount(ctx, true, nil)
+		require.NoError(t, err)
+		roMnts, release, err := roMntable.Mount()
+		require.NoError(t, err)
+		defer release()
+		require.Len(t, roMnts, 1)
+		require.True(t, isReadOnly(roMnts[0]))
+
+		immutRef, err := mutRef.Commit(ctx)
+		require.NoError(t, err)
+
+		roMntable, err = immutRef.Mount(ctx, true, nil)
+		require.NoError(t, err)
+		roMnts, release, err = roMntable.Mount()
+		require.NoError(t, err)
+		defer release()
+		require.Len(t, roMnts, 1)
+		require.True(t, isReadOnly(roMnts[0]))
+
+		rwMntable, err = immutRef.Mount(ctx, false, nil)
+		require.NoError(t, err)
+		rwMnts, release, err = rwMntable.Mount()
+		require.NoError(t, err)
+		defer release()
+		require.Len(t, rwMnts, 1)
+		// once immutable, even when readonly=false, the mount is still readonly
+		require.True(t, isReadOnly(rwMnts[0]))
+
+		// repeat with a ref that has a parent
+		mutRef, err = cm.New(ctx, immutRef, nil)
+		require.NoError(t, err)
 	}
 }
 
@@ -1729,4 +2161,19 @@ func mapToSystemTarBlob(m map[string]string) ([]byte, ocispecs.Descriptor, error
 			"containerd.io/uncompressed": digest.FromBytes(tarout).String(),
 		},
 	}, nil
+}
+
+func isReadOnly(mnt mount.Mount) bool {
+	var hasUpperdir bool
+	for _, o := range mnt.Options {
+		if o == "ro" {
+			return true
+		} else if strings.HasPrefix(o, "upperdir=") {
+			hasUpperdir = true
+		}
+	}
+	if mnt.Type == "overlay" {
+		return !hasUpperdir
+	}
+	return false
 }

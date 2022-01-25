@@ -39,6 +39,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/upload/uploadprovider"
 	"github.com/moby/buildkit/solver/errdefs"
+	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/testutil"
 	"github.com/moby/buildkit/util/testutil/httpserver"
@@ -58,7 +59,7 @@ func init() {
 	}
 }
 
-var allTests = []integration.Test{
+var allTests = integration.TestFuncs(
 	testCmdShell,
 	testGlobalArg,
 	testDockerfileDirs,
@@ -117,9 +118,14 @@ var allTests = []integration.Test{
 	testBuildInfo,
 	testShmSize,
 	testUlimit,
-}
+	testCgroupParent,
+	testNamedImageContext,
+	testNamedLocalContext,
+	testNamedInputContext,
+	testNamedMultiplatformInputContext,
+)
 
-var fileOpTests = []integration.Test{
+var fileOpTests = integration.TestFuncs(
 	testEmptyDestDir,
 	testCopyChownCreateDest,
 	testCopyThroughSymlinkContext,
@@ -142,7 +148,7 @@ var fileOpTests = []integration.Test{
 	testWorkdirCopyIgnoreRelative,
 	testCopyFollowAllSymlinks,
 	testDockerfileAddChownExpand,
-}
+)
 
 // Tests that depend on the `security.*` entitlements
 var securityTests = []integration.Test{}
@@ -158,6 +164,7 @@ var securityOpts []integration.TestOpt
 
 type frontend interface {
 	Solve(context.Context, *client.Client, client.SolveOpt, chan *client.SolveStatus) (*client.SolveResponse, error)
+	SolveGateway(context.Context, gateway.Client, gateway.SolveRequest) (*gateway.Result, error)
 	DFCmdArgs(string, string) (string, string)
 	RequiresBuildctl(t *testing.T)
 }
@@ -1810,7 +1817,6 @@ COPY --from=0 /foo /foo
 	dt, err := ioutil.ReadFile(filepath.Join(destDir, "foo"))
 	require.NoError(t, err)
 	require.Equal(t, "foo-contents", string(dt))
-
 }
 
 func testCmdShell(t *testing.T, sb integration.Sandbox) {
@@ -3986,7 +3992,7 @@ func testOnBuildCleared(t *testing.T, sb integration.Sandbox) {
 	f := getFrontend(t, sb)
 
 	registry, err := sb.NewRegistry()
-	if errors.Is(err, integration.ErrorRequirements) {
+	if errors.Is(err, integration.ErrRequirements) {
 		t.Skip(err.Error())
 	}
 	require.NoError(t, err)
@@ -4094,7 +4100,7 @@ func testCacheMultiPlatformImportExport(t *testing.T, sb integration.Sandbox) {
 	f := getFrontend(t, sb)
 
 	registry, err := sb.NewRegistry()
-	if errors.Is(err, integration.ErrorRequirements) {
+	if errors.Is(err, integration.ErrRequirements) {
 		t.Skip(err.Error())
 	}
 	require.NoError(t, err)
@@ -4220,7 +4226,7 @@ func testCacheImportExport(t *testing.T, sb integration.Sandbox) {
 	f := getFrontend(t, sb)
 
 	registry, err := sb.NewRegistry()
-	if errors.Is(err, integration.ErrorRequirements) {
+	if errors.Is(err, integration.ErrRequirements) {
 		t.Skip(err.Error())
 	}
 	require.NoError(t, err)
@@ -4397,7 +4403,7 @@ func testImportExportReproducibleIDs(t *testing.T, sb integration.Sandbox) {
 	f := getFrontend(t, sb)
 
 	registry, err := sb.NewRegistry()
-	if errors.Is(err, integration.ErrorRequirements) {
+	if errors.Is(err, integration.ErrRequirements) {
 		t.Skip(err.Error())
 	}
 	require.NoError(t, err)
@@ -5356,6 +5362,426 @@ COPY --from=base /ulimit /
 	require.Equal(t, `1062`, strings.TrimSpace(string(dt)))
 }
 
+func testCgroupParent(t *testing.T, sb integration.Sandbox) {
+	if sb.Rootless() {
+		t.SkipNow()
+	}
+
+	f := getFrontend(t, sb)
+	dockerfile := []byte(`
+FROM alpine AS base
+RUN cat /proc/self/cgroup > /out
+FROM scratch
+COPY --from=base /out /
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		FrontendAttrs: map[string]string{
+			"cgroup-parent": "foocgroup",
+		},
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out"))
+	require.NoError(t, err)
+	require.Contains(t, strings.TrimSpace(string(dt)), `/foocgroup/buildkit/`)
+}
+
+func testNamedImageContext(t *testing.T, sb integration.Sandbox) {
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	dockerfile := []byte(`
+FROM busybox AS base
+RUN cat /etc/alpine-release > /out
+FROM scratch
+COPY --from=base /out /
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	f := getFrontend(t, sb)
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		FrontendAttrs: map[string]string{
+			"context:busybox": "docker-image://alpine",
+		},
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out"))
+	require.NoError(t, err)
+	require.True(t, len(dt) > 0)
+}
+
+func testNamedLocalContext(t *testing.T, sb integration.Sandbox) {
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	dockerfile := []byte(`
+FROM busybox AS base
+RUN cat /etc/alpine-release > /out
+FROM scratch
+COPY --from=base /o* /
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	outf := []byte(`dummy-result`)
+
+	dir2, err := tmpdir(
+		fstest.CreateFile("out", outf, 0600),
+		fstest.CreateFile("out2", outf, 0600),
+		fstest.CreateFile(".dockerignore", []byte("out2\n"), 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir2)
+
+	f := getFrontend(t, sb)
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		FrontendAttrs: map[string]string{
+			"context:base": "local:basedir",
+		},
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+			"basedir":                          dir2,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out"))
+	require.NoError(t, err)
+	require.True(t, len(dt) > 0)
+
+	_, err = ioutil.ReadFile(filepath.Join(destDir, "out2"))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, os.ErrNotExist))
+}
+
+func testNamedInputContext(t *testing.T, sb integration.Sandbox) {
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	dockerfile := []byte(`
+FROM alpine
+ENV FOO=bar
+RUN echo first > /out
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	dockerfile2 := []byte(`
+FROM base AS build
+RUN echo "foo is $FOO" > /foo
+FROM scratch
+COPY --from=build /foo /out /
+`)
+
+	dir2, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile2, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	f := getFrontend(t, sb)
+
+	b := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		res, err := f.SolveGateway(ctx, c, gateway.SolveRequest{})
+		if err != nil {
+			return nil, err
+		}
+		ref, err := res.SingleRef()
+		if err != nil {
+			return nil, err
+		}
+		st, err := ref.ToState()
+		if err != nil {
+			return nil, err
+		}
+
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		dt, ok := res.Metadata["containerimage.config"]
+		if !ok {
+			return nil, errors.Errorf("no containerimage.config in metadata")
+		}
+
+		dt, err = json.Marshal(map[string][]byte{
+			"containerimage.config": dt,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		res, err = f.SolveGateway(ctx, c, gateway.SolveRequest{
+			FrontendOpt: map[string]string{
+				"dockerfilekey":       builder.DefaultLocalNameDockerfile + "2",
+				"context:base":        "input:base",
+				"input-metadata:base": string(dt),
+			},
+			FrontendInputs: map[string]*pb.Definition{
+				"base": def.ToPB(),
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
+
+	product := "buildkit_test"
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = c.Build(ctx, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile:       dir,
+			builder.DefaultLocalNameContext:          dir,
+			builder.DefaultLocalNameDockerfile + "2": dir2,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, product, b, nil)
+	require.NoError(t, err)
+
+	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out"))
+	require.NoError(t, err)
+	require.Equal(t, "first\n", string(dt))
+
+	dt, err = ioutil.ReadFile(filepath.Join(destDir, "foo"))
+	require.NoError(t, err)
+	require.Equal(t, "foo is bar\n", string(dt))
+}
+
+func testNamedMultiplatformInputContext(t *testing.T, sb integration.Sandbox) {
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	dockerfile := []byte(`
+FROM --platform=$BUILDPLATFORM alpine
+ARG TARGETARCH
+ENV FOO=bar-$TARGETARCH
+RUN echo "foo $TARGETARCH" > /out
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	dockerfile2 := []byte(`
+FROM base AS build
+RUN echo "foo is $FOO" > /foo
+FROM scratch
+COPY --from=build /foo /out /
+`)
+
+	dir2, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile2, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	f := getFrontend(t, sb)
+
+	b := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		res, err := f.SolveGateway(ctx, c, gateway.SolveRequest{
+			FrontendOpt: map[string]string{
+				"platform": "linux/amd64,linux/arm64",
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if len(res.Refs) != 2 {
+			return nil, errors.Errorf("expected 2 refs, got %d", len(res.Refs))
+		}
+
+		inputs := map[string]*pb.Definition{}
+		st, err := res.Refs["linux/amd64"].ToState()
+		if err != nil {
+			return nil, err
+		}
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		inputs["base::linux/amd64"] = def.ToPB()
+
+		st, err = res.Refs["linux/arm64"].ToState()
+		if err != nil {
+			return nil, err
+		}
+		def, err = st.Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		inputs["base::linux/arm64"] = def.ToPB()
+
+		frontendOpt := map[string]string{
+			"dockerfilekey":             builder.DefaultLocalNameDockerfile + "2",
+			"context:base::linux/amd64": "input:base::linux/amd64",
+			"context:base::linux/arm64": "input:base::linux/arm64",
+			"platform":                  "linux/amd64,linux/arm64",
+		}
+
+		dt, ok := res.Metadata["containerimage.config/linux/amd64"]
+		if !ok {
+			return nil, errors.Errorf("no containerimage.config in metadata")
+		}
+		dt, err = json.Marshal(map[string][]byte{
+			"containerimage.config": dt,
+		})
+		if err != nil {
+			return nil, err
+		}
+		frontendOpt["input-metadata:base::linux/amd64"] = string(dt)
+
+		dt, ok = res.Metadata["containerimage.config/linux/arm64"]
+		if !ok {
+			return nil, errors.Errorf("no containerimage.config in metadata")
+		}
+		dt, err = json.Marshal(map[string][]byte{
+			"containerimage.config": dt,
+		})
+		if err != nil {
+			return nil, err
+		}
+		frontendOpt["input-metadata:base::linux/arm64"] = string(dt)
+
+		res, err = f.SolveGateway(ctx, c, gateway.SolveRequest{
+			FrontendOpt:    frontendOpt,
+			FrontendInputs: inputs,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
+
+	product := "buildkit_test"
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = c.Build(ctx, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile:       dir,
+			builder.DefaultLocalNameContext:          dir,
+			builder.DefaultLocalNameDockerfile + "2": dir2,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, product, b, nil)
+	require.NoError(t, err)
+
+	dt, err := ioutil.ReadFile(filepath.Join(destDir, "linux_amd64/out"))
+	require.NoError(t, err)
+	require.Equal(t, "foo amd64\n", string(dt))
+
+	dt, err = ioutil.ReadFile(filepath.Join(destDir, "linux_amd64/foo"))
+	require.NoError(t, err)
+	require.Equal(t, "foo is bar-amd64\n", string(dt))
+
+	dt, err = ioutil.ReadFile(filepath.Join(destDir, "linux_arm64/out"))
+	require.NoError(t, err)
+	require.Equal(t, "foo arm64\n", string(dt))
+
+	dt, err = ioutil.ReadFile(filepath.Join(destDir, "linux_arm64/foo"))
+	require.NoError(t, err)
+	require.Equal(t, "foo is bar-arm64\n", string(dt))
+}
+
 func tmpdir(appliers ...fstest.Applier) (string, error) {
 	tmpdir, err := ioutil.TempDir("", "buildkit-dockerfile")
 	if err != nil {
@@ -5492,6 +5918,11 @@ func (f *builtinFrontend) Solve(ctx context.Context, c *client.Client, opt clien
 	return c.Solve(ctx, nil, opt, statusChan)
 }
 
+func (f *builtinFrontend) SolveGateway(ctx context.Context, c gateway.Client, req gateway.SolveRequest) (*gateway.Result, error) {
+	req.Frontend = "dockerfile.v0"
+	return c.Solve(ctx, req)
+}
+
 func (f *builtinFrontend) DFCmdArgs(ctx, dockerfile string) (string, string) {
 	return dfCmdArgs(ctx, dockerfile, "--frontend dockerfile.v0")
 }
@@ -5504,6 +5935,13 @@ var _ frontend = &clientFrontend{}
 
 func (f *clientFrontend) Solve(ctx context.Context, c *client.Client, opt client.SolveOpt, statusChan chan *client.SolveStatus) (*client.SolveResponse, error) {
 	return c.Build(ctx, opt, "", builder.Build, statusChan)
+}
+
+func (f *clientFrontend) SolveGateway(ctx context.Context, c gateway.Client, req gateway.SolveRequest) (*gateway.Result, error) {
+	if req.Frontend == "" && req.Definition == nil {
+		req.Frontend = "dockerfile.v0"
+	}
+	return c.Solve(ctx, req)
 }
 
 func (f *clientFrontend) DFCmdArgs(ctx, dockerfile string) (string, string) {
@@ -5526,6 +5964,15 @@ func (f *gatewayFrontend) Solve(ctx context.Context, c *client.Client, opt clien
 	}
 	opt.FrontendAttrs["source"] = f.gw
 	return c.Solve(ctx, nil, opt, statusChan)
+}
+
+func (f *gatewayFrontend) SolveGateway(ctx context.Context, c gateway.Client, req gateway.SolveRequest) (*gateway.Result, error) {
+	req.Frontend = "gateway.v0"
+	if req.FrontendOpt == nil {
+		req.FrontendOpt = make(map[string]string)
+	}
+	req.FrontendOpt["source"] = f.gw
+	return c.Solve(ctx, req)
 }
 
 func (f *gatewayFrontend) DFCmdArgs(ctx, dockerfile string) (string, string) {

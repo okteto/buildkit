@@ -1,3 +1,4 @@
+//go:build ignore
 // +build ignore
 
 package main
@@ -83,7 +84,8 @@ func (w *hexStringWriter) Write(d []byte) (int, error) {
 	}
 }
 
-var tmpl = template.Must(template.New("pause").Parse(`// +build !{{.Arch}}
+var tmpl = template.Must(template.New("pause").Parse(`//go:build !{{.Arch}}
+// +build !{{.Arch}}
 
 package {{.Package}}
 

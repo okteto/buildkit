@@ -68,6 +68,8 @@ type edge struct {
 	index         *edgeIndex
 
 	secondaryExporters []expDep
+
+	failedOnce sync.Once
 }
 
 // dep holds state for a dependant edge
@@ -363,7 +365,6 @@ func (e *edge) unpark(incoming []pipe.Sender, updates, allPipes []pipe.Receiver,
 			e.createInputRequests(desiredState, f, true)
 		}
 	}
-
 }
 
 func (e *edge) makeExportable(k *CacheKey, records []*CacheRecord) ExportableCacheKey {
@@ -375,7 +376,9 @@ func (e *edge) makeExportable(k *CacheKey, records []*CacheRecord) ExportableCac
 
 func (e *edge) markFailed(f *pipeFactory, err error) {
 	e.err = err
-	e.postpone(f)
+	e.failedOnce.Do(func() {
+		e.postpone(f)
+	})
 }
 
 // processUpdate is called by unpark for every updated pipe request

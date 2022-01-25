@@ -15,12 +15,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var runSecurityTests = []integration.Test{
+var runSecurityTests = integration.TestFuncs(
 	testRunSecurityInsecure,
 	testRunSecuritySandbox,
 	testRunSecurityDefault,
 	testInsecureDevicesWhitelist,
-}
+)
 
 func init() {
 	securityOpts = []integration.TestOpt{
@@ -31,7 +31,6 @@ func init() {
 	}
 
 	securityTests = append(securityTests, runSecurityTests...)
-
 }
 
 func testInsecureDevicesWhitelist(t *testing.T, sb integration.Sandbox) {
