@@ -12,7 +12,7 @@ ARG CNI_VERSION=v0.9.1
 ARG SHADOW_VERSION=4.8.1
 ARG STARGZ_SNAPSHOTTER_VERSION=v0.5.0
 
-ARG ALPINE_VERSION=3.14
+ARG ALPINE_VERSION=3.15
 
 # git stage is used for checking out remote repository sources
 FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS git
@@ -293,5 +293,3 @@ ENTRYPOINT ["rootlesskit", "buildkitd"]
 
 
 FROM buildkit-${BUILDKIT_TARGET}
-
-
