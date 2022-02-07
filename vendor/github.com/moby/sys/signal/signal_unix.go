@@ -1,6 +1,7 @@
+//go:build !windows
 // +build !windows
 
-package signal // import "github.com/docker/docker/pkg/signal"
+package signal
 
 import (
 	"syscall"
@@ -16,6 +17,4 @@ const (
 	SIGWINCH = syscall.SIGWINCH
 	// SIGPIPE is a signal sent to a process when a pipe is written to before the other end is open for reading
 	SIGPIPE = syscall.SIGPIPE
-	// DefaultStopSignal is the syscall signal used to stop a container in unix systems.
-	DefaultStopSignal = "SIGTERM"
 )

@@ -8,7 +8,7 @@ require (
 	github.com/Microsoft/hcsshim v0.8.23
 	github.com/agext/levenshtein v1.2.3
 	github.com/containerd/console v1.0.2
-	github.com/containerd/containerd v1.5.8
+	github.com/containerd/containerd v1.5.9
 	github.com/containerd/continuity v0.1.0
 	github.com/containerd/fuse-overlayfs-snapshotter v1.0.2
 	github.com/containerd/go-cni v1.0.2
@@ -16,7 +16,7 @@ require (
 	github.com/containerd/stargz-snapshotter v0.6.4
 	github.com/containerd/typeurl v1.0.2
 	github.com/coreos/go-systemd/v22 v22.3.2
-	github.com/docker/cli v20.10.7+incompatible
+	github.com/docker/cli v20.10.12+incompatible
 	github.com/docker/distribution v2.7.1+incompatible
 	// docker: the actual version is replaced in replace()
 	github.com/docker/docker v20.10.7+incompatible // master (v21.xx-dev)
@@ -36,10 +36,11 @@ require (
 	github.com/mitchellh/hashstructure v1.0.0
 	github.com/moby/locker v1.0.1
 	github.com/moby/sys/mount v0.2.0 // indirect
+	github.com/moby/sys/signal v0.6.0 // indirect
 	github.com/moby/term v0.0.0-20201110203204-bea5bbe245bf // indirect
 	github.com/morikuni/aec v1.0.0
 	github.com/opencontainers/go-digest v1.0.0
-	github.com/opencontainers/image-spec v1.0.1
+	github.com/opencontainers/image-spec v1.0.2
 	github.com/opencontainers/runc v1.0.2
 	github.com/opencontainers/runtime-spec v1.0.3-0.20210326190908-1c3f411f0417
 	github.com/opencontainers/selinux v1.8.2
@@ -70,14 +71,14 @@ require (
 	golang.org/x/net v0.0.0-20210226172049-e18ecbb05110
 	golang.org/x/oauth2 v0.0.0-20211005180243-6b3c2da341f1
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210603081109-ebe580a85c40
+	golang.org/x/sys v0.0.0-20211025201205-69cdffdb9359
 	golang.org/x/time v0.0.0-20200630173020-3af7569d3a1e
 	google.golang.org/genproto v0.0.0-20201110150050-8816d57aaa9a
 	google.golang.org/grpc v1.38.0
 	grpc.go4.org v0.0.0-20170609214715-11d0a25b4919
 )
 
-replace github.com/docker/docker => github.com/tonistiigi/docker v0.10.1-0.20210928031959-5fec36db36f9
+replace github.com/docker/docker => github.com/docker/docker v20.10.3-0.20211208011758-87521affb077+incompatible
 
 replace go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc => github.com/tonistiigi/opentelemetry-go-contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.0.0-20210714055410-d010b05b4939
 
