@@ -1,3 +1,4 @@
+//go:build seccomp
 // +build seccomp
 
 package seccomp // import "github.com/docker/docker/profiles/seccomp"
@@ -753,9 +754,13 @@ func DefaultProfile() *Seccomp {
 		},
 	}
 
+	errnoRet := uint(unix.EPERM)
 	return &Seccomp{
-		DefaultAction: specs.ActErrno,
-		ArchMap:       arches(),
-		Syscalls:      syscalls,
+		LinuxSeccomp: specs.LinuxSeccomp{
+			DefaultAction:   specs.ActErrno,
+			DefaultErrnoRet: &errnoRet,
+		},
+		ArchMap:  arches(),
+		Syscalls: syscalls,
 	}
 }

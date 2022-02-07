@@ -1,14 +1,14 @@
-package signal // import "github.com/docker/docker/pkg/signal"
+package signal
 
 import (
 	"syscall"
 )
 
-// SignalMap is a map of FreeBSD signals.
+// SignalMap is a map of Darwin signals.
 var SignalMap = map[string]syscall.Signal{
 	"ABRT":   syscall.SIGABRT,
 	"ALRM":   syscall.SIGALRM,
-	"BUF":    syscall.SIGBUS,
+	"BUS":    syscall.SIGBUS,
 	"CHLD":   syscall.SIGCHLD,
 	"CONT":   syscall.SIGCONT,
 	"EMT":    syscall.SIGEMT,
@@ -20,7 +20,6 @@ var SignalMap = map[string]syscall.Signal{
 	"IO":     syscall.SIGIO,
 	"IOT":    syscall.SIGIOT,
 	"KILL":   syscall.SIGKILL,
-	"LWP":    syscall.SIGLWP,
 	"PIPE":   syscall.SIGPIPE,
 	"PROF":   syscall.SIGPROF,
 	"QUIT":   syscall.SIGQUIT,
@@ -28,7 +27,6 @@ var SignalMap = map[string]syscall.Signal{
 	"STOP":   syscall.SIGSTOP,
 	"SYS":    syscall.SIGSYS,
 	"TERM":   syscall.SIGTERM,
-	"THR":    syscall.SIGTHR,
 	"TRAP":   syscall.SIGTRAP,
 	"TSTP":   syscall.SIGTSTP,
 	"TTIN":   syscall.SIGTTIN,

@@ -1,6 +1,6 @@
 // Package signal provides helper functions for dealing with signals across
 // various operating systems.
-package signal // import "github.com/docker/docker/pkg/signal"
+package signal
 
 import (
 	"fmt"
@@ -39,13 +39,13 @@ func ParseSignal(rawSignal string) (syscall.Signal, error) {
 	s, err := strconv.Atoi(rawSignal)
 	if err == nil {
 		if s == 0 {
-			return -1, fmt.Errorf("Invalid signal: %s", rawSignal)
+			return -1, fmt.Errorf("invalid signal: %s", rawSignal)
 		}
 		return syscall.Signal(s), nil
 	}
 	signal, ok := SignalMap[strings.TrimPrefix(strings.ToUpper(rawSignal), "SIG")]
 	if !ok {
-		return -1, fmt.Errorf("Invalid signal: %s", rawSignal)
+		return -1, fmt.Errorf("invalid signal: %s", rawSignal)
 	}
 	return signal, nil
 }
