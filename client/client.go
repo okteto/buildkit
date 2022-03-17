@@ -4,9 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"io/ioutil"
 	"net"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/containerd/containerd/defaults"
@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type Client struct {
@@ -102,7 +103,7 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 		gopts = append(gopts, grpc.WithContextDialer(dialFn))
 	}
 	if needWithInsecure {
-		gopts = append(gopts, grpc.WithInsecure())
+		gopts = append(gopts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 	if address == "" {
 		address = appdefaults.Address
@@ -211,7 +212,7 @@ func WithCredentials(serverName, ca, cert, key string) ClientOpt {
 }
 
 func loadCredentials(opts *withCredentials) (grpc.DialOption, error) {
-	ca, err := ioutil.ReadFile(opts.CACert)
+	ca, err := os.ReadFile(opts.CACert)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not read ca certificate")
 	}

@@ -92,6 +92,7 @@ BuildKit is used by the following projects:
 -   [Okteto Cloud](https://okteto.com/)
 -   [Earthly earthfiles](https://github.com/vladaionescu/earthly)
 -   [Gitpod](https://github.com/gitpod-io/gitpod)
+-   [Dagger](https://dagger.io)
 
 ## Quick start
 
@@ -234,8 +235,10 @@ Keys supported by image output:
 * `dangling-name-prefix=[value]`: name image with `prefix@<digest>` , used for anonymous images
 * `name-canonical=true`: add additional canonical name `name@<digest>`
 * `compression=[uncompressed,gzip,estargz,zstd]`: choose compression type for layers newly created and cached, gzip is default value. estargz should be used with `oci-mediatypes=true`.
+* `compression-level=[value]`: compression level for gzip, estargz (0-9) and zstd (0-22)
 * `force-compression=true`: forcefully apply `compression` option to all layers (including already existing layers).
-* `buildinfo=[all,imageconfig,metadata,none]`: choose [build dependency](docs/build-repro.md#build-dependencies) version to export (default `all`).
+* `buildinfo=true`: inline build info in [image config](docs/build-repro.md#image-config) (default `true`).
+* `buildinfo-attrs=true`: inline build info attributes in [image config](docs/build-repro.md#image-config) (default `false`).
 
 If credentials are required, `buildctl` will attempt to read Docker configuration file `$DOCKER_CONFIG/config.json`.
 `$DOCKER_CONFIG` defaults to `~/.docker`.
@@ -357,6 +360,9 @@ buildctl build ... \
 * `mode=max`: export all the layers of all intermediate steps.
 * `ref=docker.io/user/image:tag`: reference
 * `oci-mediatypes=true|false`: whether to use OCI mediatypes in exported manifests. Since BuildKit `v0.8` defaults to true.
+* `compression=[uncompressed,gzip,estargz,zstd]`: choose compression type for layers newly created and cached, gzip is default value. estargz and zstd should be used with `oci-mediatypes=true`.
+* `compression-level=[value]`: compression level for gzip, estargz (0-9) and zstd (0-22)
+* `force-compression=true`: forcibly apply `compression` option to all layers.
 
 `--import-cache` options:
 * `type=registry`
@@ -377,6 +383,9 @@ The directory layout conforms to OCI Image Spec v1.0.
 * `mode=max`: export all the layers of all intermediate steps.
 * `dest=path/to/output-dir`: destination directory for cache exporter
 * `oci-mediatypes=true|false`: whether to use OCI mediatypes in exported manifests. Since BuildKit `v0.8` defaults to true.
+* `compression=[uncompressed,gzip,estargz,zstd]`: choose compression type for layers newly created and cached, gzip is default value. estargz and zstd should be used with `oci-mediatypes=true`.
+* `compression-level=[value]`: compression level for gzip, estargz (0-9) and zstd (0-22)
+* `force-compression=true`: forcibly apply `compression` option to all layers.
 
 `--import-cache` options:
 * `type=local`
@@ -432,8 +441,43 @@ The directory of the specified file must already exist and be writable.
 buildctl build ... --metadata-file metadata.json
 ```
 
+```shell
+jq '.' metadata.json
 ```
-{"containerimage.digest": "sha256:ea0cfb27fd41ea0405d3095880c1efa45710f5bcdddb7d7d5a7317ad4825ae14",...}
+```json
+{
+  "containerimage.buildinfo": {
+    "frontend": "dockerfile.v0",
+    "attrs": {
+      "context": "https://github.com/crazy-max/buildkit-buildsources-test.git#master",
+      "filename": "Dockerfile",
+      "source": "docker/dockerfile:master"
+    },
+    "sources": [
+      {
+        "type": "docker-image",
+        "ref": "docker.io/docker/buildx-bin:0.6.1@sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0",
+        "pin": "sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0"
+      },
+      {
+        "type": "docker-image",
+        "ref": "docker.io/library/alpine:3.13",
+        "pin": "sha256:026f721af4cf2843e07bba648e158fb35ecc876d822130633cc49f707f0fc88c"
+      }
+    ]
+  },
+  "containerimage.config.digest": "sha256:2937f66a9722f7f4a2df583de2f8cb97fc9196059a410e7f00072fc918930e66",
+  "containerimage.descriptor": {
+    "annotations": {
+      "config.digest": "sha256:2937f66a9722f7f4a2df583de2f8cb97fc9196059a410e7f00072fc918930e66",
+      "org.opencontainers.image.created": "2022-02-08T21:28:03Z"
+    },
+    "digest": "sha256:19ffeab6f8bc9293ac2c3fdf94ebe28396254c993aea0b5a542cfb02e0883fa3",
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "size": 506
+  },
+  "containerimage.digest": "sha256:19ffeab6f8bc9293ac2c3fdf94ebe28396254c993aea0b5a542cfb02e0883fa3"
+}
 ```
 
 ## Systemd socket activation

@@ -18,9 +18,12 @@ import (
 	sessionauth "github.com/moby/buildkit/session/auth"
 	log "github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/flightcontrol"
+	"github.com/moby/buildkit/version"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
+
+const defaultExpiration = 60
 
 type authHandlerNS struct {
 	counter int64 // needs to be 64bit aligned for 32bit systems
@@ -350,10 +353,16 @@ func (ah *authHandler) fetchToken(ctx context.Context, sm *session.Manager, g se
 		if err != nil {
 			return nil, err
 		}
+		if resp.ExpiresIn == 0 {
+			resp.ExpiresIn = defaultExpiration
+		}
 		issuedAt, expires = time.Unix(resp.IssuedAt, 0), int(resp.ExpiresIn)
 		token = resp.Token
 		return nil, nil
 	}
+
+	hdr := http.Header{}
+	hdr.Set("User-Agent", version.UserAgent())
 
 	// fetch token for the resource scope
 	if to.Secret != "" {
@@ -370,9 +379,12 @@ func (ah *authHandler) fetchToken(ctx context.Context, sm *session.Manager, g se
 				// As of September 2017, GCR is known to return 404.
 				// As of February 2018, JFrog Artifactory is known to return 401.
 				if (errStatus.StatusCode == 405 && to.Username != "") || errStatus.StatusCode == 404 || errStatus.StatusCode == 401 {
-					resp, err := auth.FetchTokenWithOAuth(ctx, ah.client, nil, "buildkit-client", to)
+					resp, err := auth.FetchTokenWithOAuth(ctx, ah.client, hdr, "buildkit-client", to)
 					if err != nil {
 						return nil, err
+					}
+					if resp.ExpiresIn == 0 {
+						resp.ExpiresIn = defaultExpiration
 					}
 					issuedAt, expires = resp.IssuedAt, resp.ExpiresIn
 					token = resp.AccessToken
@@ -385,14 +397,20 @@ func (ah *authHandler) fetchToken(ctx context.Context, sm *session.Manager, g se
 			}
 			return nil, err
 		}
+		if resp.ExpiresIn == 0 {
+			resp.ExpiresIn = defaultExpiration
+		}
 		issuedAt, expires = resp.IssuedAt, resp.ExpiresIn
 		token = resp.Token
 		return nil, nil
 	}
 	// do request anonymously
-	resp, err := auth.FetchToken(ctx, ah.client, nil, to)
+	resp, err := auth.FetchToken(ctx, ah.client, hdr, to)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to fetch anonymous token")
+	}
+	if resp.ExpiresIn == 0 {
+		resp.ExpiresIn = defaultExpiration
 	}
 	issuedAt, expires = resp.IssuedAt, resp.ExpiresIn
 
@@ -401,11 +419,6 @@ func (ah *authHandler) fetchToken(ctx context.Context, sm *session.Manager, g se
 }
 
 func invalidAuthorization(c auth.Challenge, responses []*http.Response) error {
-	lastResponse := responses[len(responses)-1]
-	if lastResponse.StatusCode == http.StatusUnauthorized {
-		return errors.Wrapf(docker.ErrInvalidAuthorization, "authorization status: %v", lastResponse.StatusCode)
-	}
-
 	errStr := c.Parameters["error"]
 	if errStr == "" {
 		return nil

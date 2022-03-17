@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +18,7 @@ import (
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/util/testutil/integration"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -54,7 +54,7 @@ func testBuildLocalExporter(t *testing.T, sb integration.Sandbox) {
 	rdr, err := marshal(sb.Context(), out)
 	require.NoError(t, err)
 
-	tmpdir, err := ioutil.TempDir("", "buildkit-buildctl")
+	tmpdir, err := os.MkdirTemp("", "buildkit-buildctl")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpdir)
 
@@ -64,7 +64,7 @@ func testBuildLocalExporter(t *testing.T, sb integration.Sandbox) {
 
 	require.NoError(t, err)
 
-	dt, err := ioutil.ReadFile(filepath.Join(tmpdir, "foo"))
+	dt, err := os.ReadFile(filepath.Join(tmpdir, "foo"))
 	require.NoError(t, err)
 	require.Equal(t, string(dt), "bar")
 }
@@ -120,7 +120,7 @@ func testBuildMetadataFile(t *testing.T, sb integration.Sandbox) {
 	rdr, err := marshal(sb.Context(), st.Root())
 	require.NoError(t, err)
 
-	tmpDir, err := ioutil.TempDir("", "buildkit-buildctl")
+	tmpDir, err := os.MkdirTemp("", "buildkit-buildctl")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
@@ -139,17 +139,28 @@ func testBuildMetadataFile(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	require.FileExists(t, metadataFile)
-	metadataBytes, err := ioutil.ReadFile(metadataFile)
+	metadataBytes, err := os.ReadFile(metadataFile)
 	require.NoError(t, err)
 
-	var metadata map[string]string
+	var metadata map[string]interface{}
 	err = json.Unmarshal(metadataBytes, &metadata)
 	require.NoError(t, err)
 
+	require.Contains(t, metadata, "image.name")
 	require.Equal(t, imageName, metadata["image.name"])
 
+	require.Contains(t, metadata, exptypes.ExporterImageDigestKey)
 	digest := metadata[exptypes.ExporterImageDigestKey]
 	require.NotEmpty(t, digest)
+
+	require.Contains(t, metadata, exptypes.ExporterImageDescriptorKey)
+	var desc *ocispecs.Descriptor
+	dtdesc, err := json.Marshal(metadata[exptypes.ExporterImageDescriptorKey])
+	require.NoError(t, err)
+	err = json.Unmarshal(dtdesc, &desc)
+	require.NoError(t, err)
+	require.NotEmpty(t, desc.MediaType)
+	require.NotEmpty(t, desc.Digest.String())
 
 	cdAddress := sb.ContainerdAddress()
 	if cdAddress == "" {
@@ -181,7 +192,7 @@ func marshal(ctx context.Context, st llb.State) (io.Reader, error) {
 }
 
 func tmpdir(appliers ...fstest.Applier) (string, error) {
-	tmpdir, err := ioutil.TempDir("", "buildkit-buildctl")
+	tmpdir, err := os.MkdirTemp("", "buildkit-buildctl")
 	if err != nil {
 		return "", err
 	}

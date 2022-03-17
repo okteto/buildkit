@@ -19,12 +19,13 @@ import (
 	"github.com/docker/go-connections/nat"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/llb/imagemetaresolver"
-	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
+	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/apicaps"
+	binfotypes "github.com/moby/buildkit/util/buildinfo/types"
 	"github.com/moby/buildkit/util/suggest"
 	"github.com/moby/buildkit/util/system"
 	"github.com/moby/sys/signal"
@@ -69,22 +70,35 @@ type ConvertOpt struct {
 	SourceMap         *llb.SourceMap
 	Hostname          string
 	Warn              func(short, url string, detail [][]byte, location *parser.Range)
-	ContextByName     func(context.Context, string) (*llb.State, *Image, error)
+	ContextByName     func(context.Context, string) (*llb.State, *Image, *binfotypes.BuildInfo, error)
 }
 
-func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State, *Image, error) {
+func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State, *Image, *binfotypes.BuildInfo, error) {
+	buildInfo := &binfotypes.BuildInfo{}
 	contextByName := opt.ContextByName
-	opt.ContextByName = func(ctx context.Context, name string) (*llb.State, *Image, error) {
+	opt.ContextByName = func(ctx context.Context, name string) (*llb.State, *Image, *binfotypes.BuildInfo, error) {
 		if !strings.EqualFold(name, "scratch") && !strings.EqualFold(name, "context") {
 			if contextByName != nil {
-				return contextByName(ctx, name)
+				st, img, bi, err := contextByName(ctx, name)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				if bi != nil && bi.Deps != nil {
+					for k := range bi.Deps {
+						if buildInfo.Deps == nil {
+							buildInfo.Deps = make(map[string]binfotypes.BuildInfo)
+						}
+						buildInfo.Deps[k] = bi.Deps[k]
+					}
+				}
+				return st, img, bi, nil
 			}
 		}
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	if len(dt) == 0 {
-		return nil, nil, errors.Errorf("the Dockerfile cannot be empty")
+		return nil, nil, nil, errors.Errorf("the Dockerfile cannot be empty")
 	}
 
 	if opt.ContextLocalName == "" {
@@ -100,7 +114,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 
 	dockerfile, err := parser.Parse(bytes.NewReader(dt))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	for _, w := range dockerfile.Warnings {
@@ -111,7 +125,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 
 	stages, metaArgs, err := instructions.Parse(dockerfile.AST)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	shlex := shell.NewLex(dockerfile.EscapeToken)
@@ -136,10 +150,10 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 	for i, st := range stages {
 		name, err := shlex.ProcessWordWithMap(st.BaseName, metaArgsToMap(optMetaArgs))
 		if err != nil {
-			return nil, nil, parser.WithLocation(err, st.Location)
+			return nil, nil, nil, parser.WithLocation(err, st.Location)
 		}
 		if name == "" {
-			return nil, nil, parser.WithLocation(errors.Errorf("base name (%s) should not be blank", st.BaseName), st.Location)
+			return nil, nil, nil, parser.WithLocation(errors.Errorf("base name (%s) should not be blank", st.BaseName), st.Location)
 		}
 		st.BaseName = name
 
@@ -151,15 +165,18 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 		}
 
 		if st.Name != "" {
-			s, img, err := opt.ContextByName(ctx, st.Name)
+			s, img, bi, err := opt.ContextByName(ctx, st.Name)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			if s != nil {
 				ds.noinit = true
 				ds.state = *s
 				if img != nil {
 					ds.image = *img
+				}
+				if bi != nil {
+					ds.buildInfo = *bi
 				}
 				allDispatchStates.addState(ds)
 				continue
@@ -175,12 +192,12 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 		if v := st.Platform; v != "" {
 			v, err := shlex.ProcessWordWithMap(v, metaArgsToMap(optMetaArgs))
 			if err != nil {
-				return nil, nil, parser.WithLocation(errors.Wrapf(err, "failed to process arguments for platform %s", v), st.Location)
+				return nil, nil, nil, parser.WithLocation(errors.Wrapf(err, "failed to process arguments for platform %s", v), st.Location)
 			}
 
 			p, err := platforms.Parse(v)
 			if err != nil {
-				return nil, nil, parser.WithLocation(errors.Wrapf(err, "failed to parse platform %s", v), st.Location)
+				return nil, nil, nil, parser.WithLocation(errors.Wrapf(err, "failed to parse platform %s", v), st.Location)
 			}
 			ds.platform = &p
 		}
@@ -222,7 +239,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 		var ok bool
 		target, ok = allDispatchStates.findStateByName(opt.Target)
 		if !ok {
-			return nil, nil, errors.Errorf("target stage %s could not be found", opt.Target)
+			return nil, nil, nil, errors.Errorf("target stage %s could not be found", opt.Target)
 		}
 	}
 
@@ -232,7 +249,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 		for i, cmd := range d.stage.Commands {
 			newCmd, err := toCommand(cmd, allDispatchStates)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			d.commands[i] = newCmd
 			for _, src := range newCmd.sources {
@@ -247,7 +264,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 	}
 
 	if has, state := hasCircularDependency(allDispatchStates.states); has {
-		return nil, nil, errors.Errorf("circular dependency detected on stage: %s", state.stageName)
+		return nil, nil, nil, errors.Errorf("circular dependency detected on stage: %s", state.stageName)
 	}
 
 	if len(allDispatchStates.states) == 1 {
@@ -290,7 +307,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 					d.stage.BaseName = reference.TagNameOnly(ref).String()
 
 					var isScratch bool
-					st, img, err := opt.ContextByName(ctx, d.stage.BaseName)
+					st, img, bi, err := opt.ContextByName(ctx, d.stage.BaseName)
 					if err != nil {
 						return err
 					}
@@ -299,6 +316,9 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 							d.image = *img
 						} else {
 							d.image = emptyImage(platformOpt.targetPlatform)
+						}
+						if bi != nil {
+							d.buildInfo = *bi
 						}
 						d.state = *st
 						d.platform = platform
@@ -346,14 +366,14 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 							}
 						}
 						if !isScratch {
-							// image not scratch set original image name as ref
-							// and actual reference as alias in BuildInfo
-							d.buildInfo = &exptypes.BuildInfo{
-								Type:  exptypes.BuildInfoTypeDockerImage,
+							// if image not scratch set original image name as ref
+							// and actual reference as alias in binfotypes.Source
+							d.buildInfo.Sources = append(d.buildInfo.Sources, binfotypes.Source{
+								Type:  binfotypes.SourceTypeDockerImage,
 								Ref:   origName,
 								Alias: ref.String(),
 								Pin:   dgst.String(),
-							}
+							})
 						}
 						d.image = img
 					}
@@ -364,7 +384,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 							dfCmd(d.stage.SourceCode),
 							llb.Platform(*platform),
 							opt.ImageResolveMode,
-							llb.WithCustomName(prefixCommand(d, "FROM "+d.stage.BaseName, opt.PrefixPlatform, platform)),
+							llb.WithCustomName(prefixCommand(d, "FROM "+d.stage.BaseName, opt.PrefixPlatform, platform, nil)),
 							location(opt.SourceMap, d.stage.Location),
 						)
 					}
@@ -376,21 +396,28 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 	}
 
 	if err := eg.Wait(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	buildContext := &mutableOutput{}
 	ctxPaths := map[string]struct{}{}
-	var buildInfos []exptypes.BuildInfo
 
 	for _, d := range allDispatchStates.states {
 		if !isReachable(target, d) {
 			continue
 		}
 
-		// collect build dependencies
-		if d.buildInfo != nil {
-			buildInfos = append(buildInfos, *d.buildInfo)
+		// collect build sources and dependencies
+		if len(d.buildInfo.Sources) > 0 {
+			buildInfo.Sources = append(buildInfo.Sources, d.buildInfo.Sources...)
+		}
+		if d.buildInfo.Deps != nil {
+			for name, bi := range d.buildInfo.Deps {
+				if buildInfo.Deps == nil {
+					buildInfo.Deps = make(map[string]binfotypes.BuildInfo)
+				}
+				buildInfo.Deps[name] = bi
+			}
 		}
 
 		if d.base != nil {
@@ -418,12 +445,12 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 		}
 		if d.image.Config.WorkingDir != "" {
 			if err = dispatchWorkdir(d, &instructions.WorkdirCommand{Path: d.image.Config.WorkingDir}, false, nil); err != nil {
-				return nil, nil, parser.WithLocation(err, d.stage.Location)
+				return nil, nil, nil, parser.WithLocation(err, d.stage.Location)
 			}
 		}
 		if d.image.Config.User != "" {
 			if err = dispatchUser(d, &instructions.UserCommand{User: d.image.Config.User}, false); err != nil {
-				return nil, nil, parser.WithLocation(err, d.stage.Location)
+				return nil, nil, nil, parser.WithLocation(err, d.stage.Location)
 			}
 		}
 		d.state = d.state.Network(opt.ForceNetMode)
@@ -452,13 +479,13 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 		}
 
 		if err = dispatchOnBuildTriggers(d, d.image.Config.OnBuild, opt); err != nil {
-			return nil, nil, parser.WithLocation(err, d.stage.Location)
+			return nil, nil, nil, parser.WithLocation(err, d.stage.Location)
 		}
 		d.image.Config.OnBuild = nil
 
 		for _, cmd := range d.commands {
 			if err := dispatch(d, cmd, opt); err != nil {
-				return nil, nil, parser.WithLocation(err, cmd.Location())
+				return nil, nil, nil, parser.WithLocation(err, cmd.Location())
 			}
 		}
 
@@ -467,16 +494,11 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 		}
 	}
 
-	// set target with gathered build dependencies
-	target.image.BuildInfo = []byte{}
-	if len(buildInfos) > 0 {
-		sort.Slice(buildInfos, func(i, j int) bool {
-			return buildInfos[i].Ref < buildInfos[j].Ref
+	// sort build sources
+	if len(buildInfo.Sources) > 0 {
+		sort.Slice(buildInfo.Sources, func(i, j int) bool {
+			return buildInfo.Sources[i].Ref < buildInfo.Sources[j].Ref
 		})
-		target.image.BuildInfo, err = json.Marshal(buildInfos)
-		if err != nil {
-			return nil, nil, err
-		}
 	}
 
 	if len(opt.Labels) != 0 && target.image.Config.Labels == nil {
@@ -516,7 +538,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 		target.image.Variant = platformOpt.targetPlatform.Variant
 	}
 
-	return &st, &target.image, nil
+	return &st, &target.image, buildInfo, nil
 }
 
 func metaArgsToMap(metaArgs []instructions.KeyValuePairOptional) map[string]string {
@@ -594,6 +616,21 @@ func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
 			return err
 		}
 	}
+	if ex, ok := cmd.Command.(instructions.SupportsSingleWordExpansionRaw); ok {
+		err := ex.ExpandRaw(func(word string) (string, error) {
+			env, err := d.state.Env(context.TODO())
+			if err != nil {
+				return "", err
+			}
+
+			lex := shell.NewLex('\\')
+			lex.SkipProcessQuotes = true
+			return lex.ProcessWord(word, env)
+		})
+		if err != nil {
+			return err
+		}
+	}
 
 	var err error
 	switch c := cmd.Command.(type) {
@@ -606,7 +643,17 @@ func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
 	case *instructions.WorkdirCommand:
 		err = dispatchWorkdir(d, c, true, &opt)
 	case *instructions.AddCommand:
-		err = dispatchCopy(d, c.SourcesAndDest, opt.buildContext, true, c, c.Chown, c.Chmod, c.Location(), opt)
+		err = dispatchCopy(d, copyConfig{
+			params:       c.SourcesAndDest,
+			source:       opt.buildContext,
+			isAddCommand: true,
+			cmdToPrint:   c,
+			chown:        c.Chown,
+			chmod:        c.Chmod,
+			link:         c.Link,
+			location:     c.Location(),
+			opt:          opt,
+		})
 		if err == nil {
 			for _, src := range c.SourcePaths {
 				if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
@@ -641,7 +688,17 @@ func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
 		if len(cmd.sources) != 0 {
 			l = cmd.sources[0].state
 		}
-		err = dispatchCopy(d, c.SourcesAndDest, l, false, c, c.Chown, c.Chmod, c.Location(), opt)
+		err = dispatchCopy(d, copyConfig{
+			params:       c.SourcesAndDest,
+			source:       l,
+			isAddCommand: false,
+			cmdToPrint:   c,
+			chown:        c.Chown,
+			chmod:        c.Chmod,
+			link:         c.Link,
+			location:     c.Location(),
+			opt:          opt,
+		})
 		if err == nil && len(cmd.sources) == 0 {
 			for _, src := range c.SourcePaths {
 				d.ctxPaths[path.Join("/", filepath.ToSlash(src))] = struct{}{}
@@ -670,7 +727,7 @@ type dispatchState struct {
 	cmdIndex       int
 	cmdTotal       int
 	prefixPlatform bool
-	buildInfo      *exptypes.BuildInfo
+	buildInfo      binfotypes.BuildInfo
 }
 
 type dispatchStates struct {
@@ -858,7 +915,7 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 	if err != nil {
 		return err
 	}
-	opt = append(opt, llb.WithCustomName(prefixCommand(d, uppercaseCmd(processCmdEnv(&shlex, customname, env)), d.prefixPlatform, pl)))
+	opt = append(opt, llb.WithCustomName(prefixCommand(d, uppercaseCmd(processCmdEnv(&shlex, customname, env)), d.prefixPlatform, pl, env)))
 	for _, h := range dopt.extraHosts {
 		opt = append(opt, llb.AddExtraHost(h.Host, h.IP))
 	}
@@ -902,7 +959,7 @@ func dispatchWorkdir(d *dispatchState, c *instructions.WorkdirCommand, commit bo
 				return err
 			}
 			d.state = d.state.File(llb.Mkdir(wd, 0755, mkdirOpt...),
-				llb.WithCustomName(prefixCommand(d, uppercaseCmd(processCmdEnv(opt.shlex, c.String(), env)), d.prefixPlatform, &platform)),
+				llb.WithCustomName(prefixCommand(d, uppercaseCmd(processCmdEnv(opt.shlex, c.String(), env)), d.prefixPlatform, &platform, env)),
 				location(opt.sourceMap, c.Location()),
 			)
 			withLayer = true
@@ -912,25 +969,25 @@ func dispatchWorkdir(d *dispatchState, c *instructions.WorkdirCommand, commit bo
 	return nil
 }
 
-func dispatchCopyFileOp(d *dispatchState, c instructions.SourcesAndDest, sourceState llb.State, isAddCommand bool, cmdToPrint fmt.Stringer, chown string, chmod string, loc []parser.Range, opt dispatchOpt) error {
-	pp, err := pathRelativeToWorkingDir(d.state, c.DestPath)
+func dispatchCopyFileOp(d *dispatchState, cfg copyConfig) error {
+	pp, err := pathRelativeToWorkingDir(d.state, cfg.params.DestPath)
 	if err != nil {
 		return err
 	}
 	dest := path.Join("/", pp)
-	if c.DestPath == "." || c.DestPath == "" || c.DestPath[len(c.DestPath)-1] == filepath.Separator {
+	if cfg.params.DestPath == "." || cfg.params.DestPath == "" || cfg.params.DestPath[len(cfg.params.DestPath)-1] == filepath.Separator {
 		dest += string(filepath.Separator)
 	}
 
 	var copyOpt []llb.CopyOption
 
-	if chown != "" {
-		copyOpt = append(copyOpt, llb.WithUser(chown))
+	if cfg.chown != "" {
+		copyOpt = append(copyOpt, llb.WithUser(cfg.chown))
 	}
 
 	var mode *os.FileMode
-	if chmod != "" {
-		p, err := strconv.ParseUint(chmod, 8, 32)
+	if cfg.chmod != "" {
+		p, err := strconv.ParseUint(cfg.chmod, 8, 32)
 		if err == nil {
 			perm := os.FileMode(p)
 			mode = &perm
@@ -938,7 +995,7 @@ func dispatchCopyFileOp(d *dispatchState, c instructions.SourcesAndDest, sourceS
 	}
 
 	commitMessage := bytes.NewBufferString("")
-	if isAddCommand {
+	if cfg.isAddCommand {
 		commitMessage.WriteString("ADD")
 	} else {
 		commitMessage.WriteString("COPY")
@@ -946,10 +1003,10 @@ func dispatchCopyFileOp(d *dispatchState, c instructions.SourcesAndDest, sourceS
 
 	var a *llb.FileAction
 
-	for _, src := range c.SourcePaths {
+	for _, src := range cfg.params.SourcePaths {
 		commitMessage.WriteString(" " + src)
 		if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
-			if !isAddCommand {
+			if !cfg.isAddCommand {
 				return errors.New("source can't be a URL for COPY")
 			}
 
@@ -966,7 +1023,7 @@ func dispatchCopyFileOp(d *dispatchState, c instructions.SourcesAndDest, sourceS
 				}
 			}
 
-			st := llb.HTTP(src, llb.Filename(f), dfCmd(c))
+			st := llb.HTTP(src, llb.Filename(f), dfCmd(cfg.params))
 
 			opts := append([]llb.CopyOption{&llb.CopyInfo{
 				Mode:           mode,
@@ -983,21 +1040,21 @@ func dispatchCopyFileOp(d *dispatchState, c instructions.SourcesAndDest, sourceS
 				Mode:                mode,
 				FollowSymlinks:      true,
 				CopyDirContentsOnly: true,
-				AttemptUnpack:       isAddCommand,
+				AttemptUnpack:       cfg.isAddCommand,
 				CreateDestPath:      true,
 				AllowWildcard:       true,
 				AllowEmptyWildcard:  true,
 			}}, copyOpt...)
 
 			if a == nil {
-				a = llb.Copy(sourceState, filepath.Join("/", src), dest, opts...)
+				a = llb.Copy(cfg.source, filepath.Join("/", src), dest, opts...)
 			} else {
-				a = a.Copy(sourceState, filepath.Join("/", src), dest, opts...)
+				a = a.Copy(cfg.source, filepath.Join("/", src), dest, opts...)
 			}
 		}
 	}
 
-	for _, src := range c.SourceContents {
+	for _, src := range cfg.params.SourceContents {
 		commitMessage.WriteString(" <<" + src.Path)
 
 		data := src.Data
@@ -1019,9 +1076,9 @@ func dispatchCopyFileOp(d *dispatchState, c instructions.SourcesAndDest, sourceS
 		}
 	}
 
-	commitMessage.WriteString(" " + c.DestPath)
+	commitMessage.WriteString(" " + cfg.params.DestPath)
 
-	platform := opt.targetPlatform
+	platform := cfg.opt.targetPlatform
 	if d.platform != nil {
 		platform = *d.platform
 	}
@@ -1031,50 +1088,81 @@ func dispatchCopyFileOp(d *dispatchState, c instructions.SourcesAndDest, sourceS
 		return err
 	}
 
+	name := uppercaseCmd(processCmdEnv(cfg.opt.shlex, cfg.cmdToPrint.String(), env))
 	fileOpt := []llb.ConstraintsOpt{
-		llb.WithCustomName(prefixCommand(d, uppercaseCmd(processCmdEnv(opt.shlex, cmdToPrint.String(), env)), d.prefixPlatform, &platform)),
-		location(opt.sourceMap, loc),
+		llb.WithCustomName(prefixCommand(d, name, d.prefixPlatform, &platform, env)),
+		location(cfg.opt.sourceMap, cfg.location),
 	}
 	if d.ignoreCache {
 		fileOpt = append(fileOpt, llb.IgnoreCache)
 	}
 
-	d.state = d.state.File(a, fileOpt...)
+	if cfg.opt.llbCaps.Supports(pb.CapMergeOp) == nil && cfg.link && cfg.chmod == "" {
+		pgID := identity.NewID()
+		d.cmdIndex-- // prefixCommand increases it
+		pgName := prefixCommand(d, name, d.prefixPlatform, &platform, env)
+
+		var copyOpts []llb.ConstraintsOpt
+		copy(copyOpts, fileOpt)
+		copyOpts = append(copyOpts, llb.ProgressGroup(pgID, pgName, true))
+
+		var mergeOpts []llb.ConstraintsOpt
+		copy(mergeOpts, fileOpt)
+		d.cmdIndex--
+		mergeOpts = append(mergeOpts, llb.ProgressGroup(pgID, pgName, false), llb.WithCustomName(prefixCommand(d, "LINK "+name, d.prefixPlatform, &platform, env)))
+
+		d.state = d.state.WithOutput(llb.Merge([]llb.State{d.state, llb.Scratch().File(a, copyOpts...)}, mergeOpts...).Output())
+	} else {
+		d.state = d.state.File(a, fileOpt...)
+	}
+
 	return commitToHistory(&d.image, commitMessage.String(), true, &d.state)
 }
 
-func dispatchCopy(d *dispatchState, c instructions.SourcesAndDest, sourceState llb.State, isAddCommand bool, cmdToPrint fmt.Stringer, chown string, chmod string, loc []parser.Range, opt dispatchOpt) error {
-	if useFileOp(opt.buildArgValues, opt.llbCaps) {
-		return dispatchCopyFileOp(d, c, sourceState, isAddCommand, cmdToPrint, chown, chmod, loc, opt)
+type copyConfig struct {
+	params       instructions.SourcesAndDest
+	source       llb.State
+	isAddCommand bool
+	cmdToPrint   fmt.Stringer
+	chown        string
+	chmod        string
+	link         bool
+	location     []parser.Range
+	opt          dispatchOpt
+}
+
+func dispatchCopy(d *dispatchState, cfg copyConfig) error {
+	if useFileOp(cfg.opt.buildArgValues, cfg.opt.llbCaps) {
+		return dispatchCopyFileOp(d, cfg)
 	}
 
-	if len(c.SourceContents) > 0 {
+	if len(cfg.params.SourceContents) > 0 {
 		return errors.New("inline content copy is not supported")
 	}
 
-	if chmod != "" {
-		if opt.llbCaps != nil && opt.llbCaps.Supports(pb.CapFileBase) != nil {
-			return errors.Wrap(opt.llbCaps.Supports(pb.CapFileBase), "chmod is not supported")
+	if cfg.chmod != "" {
+		if cfg.opt.llbCaps != nil && cfg.opt.llbCaps.Supports(pb.CapFileBase) != nil {
+			return errors.Wrap(cfg.opt.llbCaps.Supports(pb.CapFileBase), "chmod is not supported")
 		}
 		return errors.New("chmod is not supported")
 	}
 
-	img := llb.Image(opt.copyImage, llb.MarkImageInternal, llb.Platform(opt.buildPlatforms[0]), WithInternalName("helper image for file operations"))
-	pp, err := pathRelativeToWorkingDir(d.state, c.DestPath)
+	img := llb.Image(cfg.opt.copyImage, llb.MarkImageInternal, llb.Platform(cfg.opt.buildPlatforms[0]), WithInternalName("helper image for file operations"))
+	pp, err := pathRelativeToWorkingDir(d.state, cfg.params.DestPath)
 	if err != nil {
 		return err
 	}
 	dest := path.Join(".", pp)
-	if c.DestPath == "." || c.DestPath == "" || c.DestPath[len(c.DestPath)-1] == filepath.Separator {
+	if cfg.params.DestPath == "." || cfg.params.DestPath == "" || cfg.params.DestPath[len(cfg.params.DestPath)-1] == filepath.Separator {
 		dest += string(filepath.Separator)
 	}
 	args := []string{"copy"}
-	unpack := isAddCommand
+	unpack := cfg.isAddCommand
 
-	mounts := make([]llb.RunOption, 0, len(c.SourcePaths))
-	if chown != "" {
-		args = append(args, fmt.Sprintf("--chown=%s", chown))
-		_, _, err := parseUser(chown)
+	mounts := make([]llb.RunOption, 0, len(cfg.params.SourcePaths))
+	if cfg.chown != "" {
+		args = append(args, fmt.Sprintf("--chown=%s", cfg.chown))
+		_, _, err := parseUser(cfg.chown)
 		if err != nil {
 			mounts = append(mounts, llb.AddMount("/etc/passwd", d.state, llb.SourcePath("/etc/passwd"), llb.Readonly))
 			mounts = append(mounts, llb.AddMount("/etc/group", d.state, llb.SourcePath("/etc/group"), llb.Readonly))
@@ -1082,16 +1170,16 @@ func dispatchCopy(d *dispatchState, c instructions.SourcesAndDest, sourceState l
 	}
 
 	commitMessage := bytes.NewBufferString("")
-	if isAddCommand {
+	if cfg.isAddCommand {
 		commitMessage.WriteString("ADD")
 	} else {
 		commitMessage.WriteString("COPY")
 	}
 
-	for i, src := range c.SourcePaths {
+	for i, src := range cfg.params.SourcePaths {
 		commitMessage.WriteString(" " + src)
 		if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
-			if !isAddCommand {
+			if !cfg.isAddCommand {
 				return errors.New("source can't be a URL for COPY")
 			}
 
@@ -1110,7 +1198,7 @@ func dispatchCopy(d *dispatchState, c instructions.SourcesAndDest, sourceState l
 			}
 			target := path.Join(fmt.Sprintf("/src-%d", i), f)
 			args = append(args, target)
-			mounts = append(mounts, llb.AddMount(path.Dir(target), llb.HTTP(src, llb.Filename(f), dfCmd(c)), llb.Readonly))
+			mounts = append(mounts, llb.AddMount(path.Dir(target), llb.HTTP(src, llb.Filename(f), dfCmd(cfg.params)), llb.Readonly))
 		} else {
 			d, f := splitWildcards(src)
 			targetCmd := fmt.Sprintf("/src-%d", i)
@@ -1121,18 +1209,18 @@ func dispatchCopy(d *dispatchState, c instructions.SourcesAndDest, sourceState l
 			}
 			targetCmd = path.Join(targetCmd, f)
 			args = append(args, targetCmd)
-			mounts = append(mounts, llb.AddMount(targetMount, sourceState, llb.SourcePath(d), llb.Readonly))
+			mounts = append(mounts, llb.AddMount(targetMount, cfg.source, llb.SourcePath(d), llb.Readonly))
 		}
 	}
 
-	commitMessage.WriteString(" " + c.DestPath)
+	commitMessage.WriteString(" " + cfg.params.DestPath)
 
 	args = append(args, dest)
 	if unpack {
 		args = append(args[:1], append([]string{"--unpack"}, args[1:]...)...)
 	}
 
-	platform := opt.targetPlatform
+	platform := cfg.opt.targetPlatform
 	if d.platform != nil {
 		platform = *d.platform
 	}
@@ -1146,16 +1234,16 @@ func dispatchCopy(d *dispatchState, c instructions.SourcesAndDest, sourceState l
 		llb.Args(args),
 		llb.Dir("/dest"),
 		llb.ReadonlyRootFS(),
-		dfCmd(cmdToPrint),
-		llb.WithCustomName(prefixCommand(d, uppercaseCmd(processCmdEnv(opt.shlex, cmdToPrint.String(), env)), d.prefixPlatform, &platform)),
-		location(opt.sourceMap, loc),
+		dfCmd(cfg.cmdToPrint),
+		llb.WithCustomName(prefixCommand(d, uppercaseCmd(processCmdEnv(cfg.opt.shlex, cfg.cmdToPrint.String(), env)), d.prefixPlatform, &platform, env)),
+		location(cfg.opt.sourceMap, cfg.location),
 	}
 	if d.ignoreCache {
 		runOpt = append(runOpt, llb.IgnoreCache)
 	}
 
-	if opt.llbCaps != nil {
-		if err := opt.llbCaps.Supports(pb.CapExecMetaNetwork); err == nil {
+	if cfg.opt.llbCaps != nil {
+		if err := cfg.opt.llbCaps.Supports(pb.CapExecMetaNetwork); err == nil {
 			runOpt = append(runOpt, llb.Network(llb.NetModeNone))
 		}
 	}
@@ -1600,13 +1688,13 @@ func processCmdEnv(shlex *shell.Lex, cmd string, env []string) string {
 	return w
 }
 
-func prefixCommand(ds *dispatchState, str string, prefixPlatform bool, platform *ocispecs.Platform) string {
+func prefixCommand(ds *dispatchState, str string, prefixPlatform bool, platform *ocispecs.Platform, env []string) string {
 	if ds.cmdTotal == 0 {
 		return str
 	}
 	out := "["
 	if prefixPlatform && platform != nil {
-		out += platforms.Format(*platform) + " "
+		out += platforms.Format(*platform) + formatTargetPlatform(*platform, platformFromEnv(env)) + " "
 	}
 	if ds.stageName != "" {
 		out += ds.stageName + " "
@@ -1614,6 +1702,62 @@ func prefixCommand(ds *dispatchState, str string, prefixPlatform bool, platform 
 	ds.cmdIndex++
 	out += fmt.Sprintf("%*d/%d] ", int(1+math.Log10(float64(ds.cmdTotal))), ds.cmdIndex, ds.cmdTotal)
 	return out + str
+}
+
+// formatTargetPlatform formats a secondary platform string for cross compilation cases
+func formatTargetPlatform(base ocispecs.Platform, target *ocispecs.Platform) string {
+	if target == nil {
+		return ""
+	}
+	if target.OS == "" {
+		target.OS = base.OS
+	}
+	if target.Architecture == "" {
+		target.Architecture = base.Architecture
+	}
+	p := platforms.Normalize(*target)
+
+	if p.OS == base.OS && p.Architecture != base.Architecture {
+		archVariant := p.Architecture
+		if p.Variant != "" {
+			archVariant += "/" + p.Variant
+		}
+		return "->" + archVariant
+	}
+	if p.OS != base.OS {
+		return "->" + platforms.Format(p)
+	}
+	return ""
+}
+
+// platformFromEnv returns defined platforms based on TARGET* environment variables
+func platformFromEnv(env []string) *ocispecs.Platform {
+	var p ocispecs.Platform
+	var set bool
+	for _, v := range env {
+		parts := strings.SplitN(v, "=", 2)
+		switch parts[0] {
+		case "TARGETPLATFORM":
+			p, err := platforms.Parse(parts[1])
+			if err != nil {
+				continue
+			}
+			return &p
+		case "TARGETOS":
+			p.OS = parts[1]
+			set = true
+		case "TARGETARCH":
+			p.Architecture = parts[1]
+			set = true
+		case "TARGETVARIANT":
+			p.Variant = parts[1]
+			set = true
+		}
+	}
+	if !set {
+		return nil
+	}
+	return &p
 }
 
 func useFileOp(args map[string]string, caps *apicaps.CapSet) bool {

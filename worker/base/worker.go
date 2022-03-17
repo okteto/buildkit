@@ -3,7 +3,6 @@ package base
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
@@ -44,7 +43,6 @@ import (
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/progress/controller"
-	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -75,6 +73,7 @@ type WorkerOpt struct {
 	GarbageCollect  func(context.Context) (gc.Stats, error)
 	ParallelismSem  *semaphore.Weighted
 	MetadataStore   *metadata.Store
+	MountPoolRoot   string
 }
 
 // Worker is a local worker instance with dedicated snapshotter, cache, and so on.
@@ -103,6 +102,7 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 		ContentStore:    opt.ContentStore,
 		Differ:          opt.Differ,
 		MetadataStore:   opt.MetadataStore,
+		MountPoolRoot:   opt.MountPoolRoot,
 	})
 	if err != nil {
 		return nil, err
@@ -198,14 +198,16 @@ func (w *Worker) Labels() map[string]string {
 
 func (w *Worker) Platforms(noCache bool) []ocispecs.Platform {
 	if noCache {
-		pm := make(map[string]struct{}, len(w.WorkerOpt.Platforms))
-		for _, p := range w.WorkerOpt.Platforms {
-			pm[platforms.Format(p)] = struct{}{}
-		}
 		for _, p := range archutil.SupportedPlatforms(noCache) {
-			if _, ok := pm[p]; !ok {
-				pp, _ := platforms.Parse(p)
-				w.WorkerOpt.Platforms = append(w.WorkerOpt.Platforms, pp)
+			exists := false
+			for _, pp := range w.WorkerOpt.Platforms {
+				if platforms.Only(pp).Match(p) {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				w.WorkerOpt.Platforms = append(w.WorkerOpt.Platforms, p)
 			}
 		}
 	}
@@ -227,7 +229,8 @@ func (w *Worker) LoadRef(ctx context.Context, id string, hidden bool) (cache.Imm
 		return nil, nil
 	}
 
-	ref, err := w.CacheMgr.Get(ctx, id, opts...)
+	pg := solver.ProgressControllerFromContext(ctx)
+	ref, err := w.CacheMgr.Get(ctx, id, pg, opts...)
 	var needsRemoteProviders cache.NeedsRemoteProviderError
 	if errors.As(err, &needsRemoteProviders) {
 		if optGetter := solver.CacheOptGetterOf(ctx); optGetter != nil {
@@ -236,7 +239,7 @@ func (w *Worker) LoadRef(ctx context.Context, id string, hidden bool) (cache.Imm
 				keys = append(keys, cache.DescHandlerKey(dgst))
 			}
 			descHandlers := cache.DescHandlers(make(map[digest.Digest]*cache.DescHandler))
-			for k, v := range optGetter(keys...) {
+			for k, v := range optGetter(true, keys...) {
 				if key, ok := k.(cache.DescHandlerKey); ok {
 					if handler, ok := v.(*cache.DescHandler); ok {
 						descHandlers[digest.Digest(key)] = handler
@@ -244,7 +247,7 @@ func (w *Worker) LoadRef(ctx context.Context, id string, hidden bool) (cache.Imm
 				}
 			}
 			opts = append(opts, descHandlers)
-			ref, err = w.CacheMgr.Get(ctx, id, opts...)
+			ref, err = w.CacheMgr.Get(ctx, id, pg, opts...)
 		}
 	}
 	if err != nil {
@@ -379,15 +382,31 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cac
 		}
 	}
 
+	pg := solver.ProgressControllerFromContext(ctx)
+	if pg == nil {
+		pg = &controller.Controller{
+			WriterFactory: progress.FromContext(ctx),
+		}
+	}
+
 	descHandler := &cache.DescHandler{
 		Provider: func(session.Group) content.Provider { return remote.Provider },
-		Progress: &controller.Controller{
-			WriterFactory: progress.FromContext(ctx),
-		},
+		Progress: pg,
+	}
+	snapshotLabels := func([]ocispecs.Descriptor, int) map[string]string { return nil }
+	if cd, ok := remote.Provider.(interface {
+		SnapshotLabels([]ocispecs.Descriptor, int) map[string]string
+	}); ok {
+		snapshotLabels = cd.SnapshotLabels
 	}
 	descHandlers := cache.DescHandlers(make(map[digest.Digest]*cache.DescHandler))
-	for _, desc := range remote.Descriptors {
-		descHandlers[desc.Digest] = descHandler
+	for i, desc := range remote.Descriptors {
+		descHandlers[desc.Digest] = &cache.DescHandler{
+			Provider:       descHandler.Provider,
+			Progress:       descHandler.Progress,
+			Annotations:    desc.Annotations,
+			SnapshotLabels: snapshotLabels(remote.Descriptors, i),
+		}
 	}
 
 	var current cache.ImmutableRef
@@ -405,10 +424,17 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cac
 		if v, ok := desc.Annotations["buildkit/description"]; ok {
 			descr = v
 		}
-		ref, err := w.CacheMgr.GetByBlob(ctx, desc, current,
+		opts := []cache.RefOption{
 			cache.WithDescription(descr),
 			cache.WithCreationTime(tm),
-			descHandlers)
+			descHandlers,
+		}
+		if dh, ok := descHandlers[desc.Digest]; ok {
+			if ref, ok := dh.Annotations["containerd.io/distribution.source.ref"]; ok {
+				opts = append(opts, cache.WithImageRef(ref)) // can set by registry cache importer
+			}
+		}
+		ref, err := w.CacheMgr.GetByBlob(ctx, desc, current, opts...)
 		if current != nil {
 			current.Release(context.TODO())
 		}
@@ -420,30 +446,15 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cac
 	return current, nil
 }
 
-// Labels returns default labels
-// utility function. could be moved to the constructor logic?
-func Labels(executor, snapshotter string) map[string]string {
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = "unknown"
-	}
-	labels := map[string]string{
-		worker.LabelExecutor:    executor,
-		worker.LabelSnapshotter: snapshotter,
-		worker.LabelHostname:    hostname,
-	}
-	return labels
-}
-
 // ID reads the worker id from the `workerid` file.
 // If not exist, it creates a random one,
 func ID(root string) (string, error) {
 	f := filepath.Join(root, "workerid")
-	b, err := ioutil.ReadFile(f)
+	b, err := os.ReadFile(f)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			id := identity.NewID()
-			err := ioutil.WriteFile(f, []byte(id), 0400)
+			err := os.WriteFile(f, []byte(id), 0400)
 			return id, err
 		}
 		return "", err

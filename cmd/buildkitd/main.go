@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/user"
@@ -15,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/pkg/seed"
 	"github.com/containerd/containerd/pkg/userns"
 	"github.com/containerd/containerd/platforms"
@@ -76,9 +74,6 @@ func init() {
 	if reexec.Init() {
 		os.Exit(0)
 	}
-
-	// overwrites containerd/log.G
-	log.G = bklog.GetLogger
 }
 
 var propagators = propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
@@ -375,7 +370,7 @@ func defaultConf() (config.Config, error) {
 		if !errors.As(err, &pe) {
 			return config.Config{}, err
 		}
-		return cfg, nil
+		logrus.Warnf("failed to load default config: %v", err)
 	}
 	setDefaultConfig(&cfg)
 
@@ -407,10 +402,10 @@ func setDefaultConfig(cfg *config.Config) {
 	}
 
 	if cfg.Workers.OCI.Platforms == nil {
-		cfg.Workers.OCI.Platforms = archutil.SupportedPlatforms(false)
+		cfg.Workers.OCI.Platforms = formatPlatforms(archutil.SupportedPlatforms(false))
 	}
 	if cfg.Workers.Containerd.Platforms == nil {
-		cfg.Workers.Containerd.Platforms = archutil.SupportedPlatforms(false)
+		cfg.Workers.Containerd.Platforms = formatPlatforms(archutil.SupportedPlatforms(false))
 	}
 
 	cfg.Workers.OCI.NetworkConfig = setDefaultNetworkConfig(cfg.Workers.OCI.NetworkConfig)
@@ -441,15 +436,7 @@ func applyMainFlags(c *cli.Context, cfg *config.Config) error {
 	}
 
 	if c.IsSet("addr") || len(cfg.GRPC.Address) == 0 {
-		addrs := c.StringSlice("addr")
-		if len(addrs) > 1 {
-			addrs = addrs[1:] // https://github.com/urfave/cli/issues/160
-		}
-
-		cfg.GRPC.Address = make([]string, 0, len(addrs))
-		for _, v := range addrs {
-			cfg.GRPC.Address = append(cfg.GRPC.Address, v)
-		}
+		cfg.GRPC.Address = c.StringSlice("addr")
 	}
 
 	if c.IsSet("allow-insecure-entitlement") {
@@ -606,7 +593,7 @@ func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
 	}
 	if caFile != "" {
 		certPool := x509.NewCertPool()
-		ca, err := ioutil.ReadFile(caFile)
+		ca, err := os.ReadFile(caFile)
 		if err != nil {
 			return nil, errors.Wrap(err, "could not read ca certificate")
 		}
@@ -700,8 +687,8 @@ func newWorkerController(c *cli.Context, wiOpt workerInitializerOpt) (*worker.Co
 			return nil, err
 		}
 		for _, w := range ws {
-			p := formatPlatforms(w.Platforms(false))
-			logrus.Infof("found worker %q, labels=%v, platforms=%v", w.ID(), w.Labels(), p)
+			p := w.Platforms(false)
+			logrus.Infof("found worker %q, labels=%v, platforms=%v", w.ID(), w.Labels(), formatPlatforms(p))
 			archutil.WarnIfUnsupported(p)
 			if err = wc.Add(w); err != nil {
 				return nil, err

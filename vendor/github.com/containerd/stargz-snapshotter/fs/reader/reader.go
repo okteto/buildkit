@@ -33,7 +33,6 @@ import (
 	"os"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/containerd/stargz-snapshotter/cache"
@@ -42,7 +41,6 @@ import (
 	"github.com/containerd/stargz-snapshotter/metadata"
 	"github.com/hashicorp/go-multierror"
 	digest "github.com/opencontainers/go-digest"
-	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
@@ -60,7 +58,8 @@ type Reader interface {
 type VerifiableReader struct {
 	r *reader
 
-	lastVerifyErr           atomic.Value
+	lastVerifyErr           error
+	lastVerifyErrMu         sync.Mutex
 	prohibitVerifyFailure   bool
 	prohibitVerifyFailureMu sync.RWMutex
 
@@ -68,6 +67,19 @@ type VerifiableReader struct {
 	closedMu sync.Mutex
 
 	verifier func(uint32, string) (digest.Verifier, error)
+}
+
+func (vr *VerifiableReader) storeLastVerifyErr(err error) {
+	vr.lastVerifyErrMu.Lock()
+	vr.lastVerifyErr = err
+	vr.lastVerifyErrMu.Unlock()
+}
+
+func (vr *VerifiableReader) loadLastVerifyErr() error {
+	vr.lastVerifyErrMu.Lock()
+	err := vr.lastVerifyErr
+	vr.lastVerifyErrMu.Unlock()
+	return err
 }
 
 func (vr *VerifiableReader) SkipVerify() Reader {
@@ -80,10 +92,10 @@ func (vr *VerifiableReader) VerifyTOC(tocDigest digest.Digest) (Reader, error) {
 	}
 	vr.prohibitVerifyFailureMu.Lock()
 	vr.prohibitVerifyFailure = true
-	lastVerifyErr := vr.lastVerifyErr.Load()
+	lastVerifyErr := vr.loadLastVerifyErr()
 	vr.prohibitVerifyFailureMu.Unlock()
 	if err := lastVerifyErr; err != nil {
-		return nil, errors.Wrapf(err.(error), "content error occures during caching contents")
+		return nil, fmt.Errorf("content error occurs during caching contents: %w", err)
 	}
 	if actual := vr.r.r.TOCDigest(); actual != tocDigest {
 		return nil, fmt.Errorf("invalid TOC JSON %q; want %q", actual, tocDigest)
@@ -200,7 +212,7 @@ func (vr *VerifiableReader) cacheWithReader(ctx context.Context, currentDepth in
 				defer sem.Release(1)
 				defer func() {
 					if retErr != nil {
-						vr.lastVerifyErr.Store(retErr)
+						vr.storeLastVerifyErr(retErr)
 					}
 				}()
 
@@ -225,9 +237,9 @@ func (vr *VerifiableReader) cacheWithReader(ctx context.Context, currentDepth in
 					vr.prohibitVerifyFailureMu.RLock()
 					if vr.prohibitVerifyFailure {
 						vr.prohibitVerifyFailureMu.RUnlock()
-						return errors.Wrapf(err, "verifier not found %q(off:%d,size:%d)", name, chunkOffset, chunkSize)
+						return fmt.Errorf("verifier not found %q(off:%d,size:%d): %w", name, chunkOffset, chunkSize, err)
 					}
-					vr.lastVerifyErr.Store(err)
+					vr.storeLastVerifyErr(err)
 					vr.prohibitVerifyFailureMu.RUnlock()
 				}
 				tee := ioutil.Discard
@@ -236,9 +248,7 @@ func (vr *VerifiableReader) cacheWithReader(ctx context.Context, currentDepth in
 				}
 				if _, err := io.CopyN(w, io.TeeReader(br, tee), chunkSize); err != nil {
 					w.Abort()
-					return errors.Wrapf(err,
-						"failed to cache file payload of %q (offset:%d,size:%d)",
-						name, chunkOffset, chunkSize)
+					return fmt.Errorf("failed to cache file payload of %q (offset:%d,size:%d): %w", name, chunkOffset, chunkSize, err)
 				}
 				if v != nil && !v.Verified() {
 					err := fmt.Errorf("invalid chunk %q (offset:%d,size:%d)", name, chunkOffset, chunkSize)
@@ -248,7 +258,7 @@ func (vr *VerifiableReader) cacheWithReader(ctx context.Context, currentDepth in
 						w.Abort()
 						return err
 					}
-					vr.lastVerifyErr.Store(err)
+					vr.storeLastVerifyErr(err)
 					vr.prohibitVerifyFailureMu.RUnlock()
 				}
 
@@ -338,7 +348,7 @@ func (gr *reader) OpenFile(id uint32) (io.ReaderAt, error) {
 	var fr metadata.File
 	fr, err := gr.r.OpenFile(id)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open file %d", id)
+		return nil, fmt.Errorf("failed to open file %d: %w", id, err)
 	}
 	return &file{
 		id: id,
@@ -416,7 +426,7 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 			ip := p[nr : int64(nr)+chunkSize]
 			n, err := sf.fr.ReadAt(ip, chunkOffset)
 			if err != nil && err != io.EOF {
-				return 0, errors.Wrap(err, "failed to read data")
+				return 0, fmt.Errorf("failed to read data: %w", err)
 			}
 
 			commonmetrics.IncOperationCount(commonmetrics.OnDemandRemoteRegistryFetchCount, sf.gr.layerSha) // increment the number of on demand file fetches from remote registry
@@ -425,7 +435,7 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 
 			// Verify this chunk
 			if err := sf.verify(sf.id, ip, chunkDigestStr); err != nil {
-				return 0, errors.Wrap(err, "invalid chunk")
+				return 0, fmt.Errorf("invalid chunk: %w", err)
 			}
 
 			// Cache this chunk
@@ -448,7 +458,7 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 		ip := b.Bytes()[:chunkSize]
 		if _, err := sf.fr.ReadAt(ip, chunkOffset); err != nil && err != io.EOF {
 			sf.gr.putBuffer(b)
-			return 0, errors.Wrap(err, "failed to read data")
+			return 0, fmt.Errorf("failed to read data: %w", err)
 		}
 
 		// We can end up doing on demand registry fetch when aligning the chunk
@@ -459,7 +469,7 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 		// Verify this chunk
 		if err := sf.verify(sf.id, ip, chunkDigestStr); err != nil {
 			sf.gr.putBuffer(b)
-			return 0, errors.Wrap(err, "invalid chunk")
+			return 0, fmt.Errorf("invalid chunk: %w", err)
 		}
 
 		// Cache this chunk
@@ -490,10 +500,10 @@ func (sf *file) verify(id uint32, p []byte, chunkDigestStr string) error {
 	}
 	v, err := sf.gr.verifier(id, chunkDigestStr)
 	if err != nil {
-		return errors.Wrapf(err, "invalid chunk")
+		return fmt.Errorf("invalid chunk: %w", err)
 	}
 	if _, err := v.Write(p); err != nil {
-		return errors.Wrap(err, "invalid chunk: failed to write to verifier")
+		return fmt.Errorf("invalid chunk: failed to write to verifier: %w", err)
 	}
 	if !v.Verified() {
 		return fmt.Errorf("invalid chunk: not verified")
@@ -543,7 +553,7 @@ func WithReader(sr *io.SectionReader) CacheOption {
 func digestVerifier(id uint32, chunkDigestStr string) (digest.Verifier, error) {
 	chunkDigest, err := digest.Parse(chunkDigestStr)
 	if err != nil {
-		return nil, errors.Wrap(err, "invalid chunk: no digset is recorded")
+		return nil, fmt.Errorf("invalid chunk: no digset is recorded: %w", err)
 	}
 	return chunkDigest.Verifier(), nil
 }

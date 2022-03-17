@@ -13,6 +13,7 @@ import (
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/platforms"
 	"github.com/moby/buildkit/cache"
+	cacheconfig "github.com/moby/buildkit/cache/config"
 	"github.com/moby/buildkit/exporter"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/session"
@@ -20,6 +21,7 @@ import (
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/buildinfo"
+	binfotypes "github.com/moby/buildkit/util/buildinfo/types"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/system"
@@ -48,7 +50,7 @@ type ImageWriter struct {
 	opt WriterOpt
 }
 
-func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool, compressionType compression.Type, buildInfoMode buildinfo.ExportMode, forceCompression bool, sessionID string) (*ocispecs.Descriptor, error) {
+func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool, refCfg cacheconfig.RefConfig, buildInfo bool, buildInfoAttrs bool, sessionID string) (*ocispecs.Descriptor, error) {
 	platformsBytes, ok := inp.Metadata[exptypes.ExporterPlatformsKey]
 
 	if len(inp.Refs) > 0 && !ok {
@@ -56,17 +58,21 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 	}
 
 	if len(inp.Refs) == 0 {
-		remotes, err := ic.exportLayers(ctx, compressionType, forceCompression, session.NewGroup(sessionID), inp.Ref)
+		remotes, err := ic.exportLayers(ctx, refCfg, session.NewGroup(sessionID), inp.Ref)
 		if err != nil {
 			return nil, err
 		}
 
-		var buildInfo []byte
-		if buildInfoMode&buildinfo.ExportImageConfig > 0 {
-			buildInfo = inp.Metadata[exptypes.ExporterBuildInfo]
+		var dtbi []byte
+		if buildInfo {
+			if dtbi, err = buildinfo.Format(inp.Metadata[exptypes.ExporterBuildInfo], buildinfo.FormatOpts{
+				RemoveAttrs: !buildInfoAttrs,
+			}); err != nil {
+				return nil, err
+			}
 		}
 
-		mfstDesc, configDesc, err := ic.commitDistributionManifest(ctx, inp.Ref, inp.Metadata[exptypes.ExporterImageConfigKey], &remotes[0], oci, inp.Metadata[exptypes.ExporterInlineCache], buildInfo)
+		mfstDesc, configDesc, err := ic.commitDistributionManifest(ctx, inp.Ref, inp.Metadata[exptypes.ExporterImageConfigKey], &remotes[0], oci, inp.Metadata[exptypes.ExporterInlineCache], dtbi)
 		if err != nil {
 			return nil, err
 		}
@@ -94,7 +100,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 		refs = append(refs, r)
 	}
 
-	remotes, err := ic.exportLayers(ctx, compressionType, forceCompression, session.NewGroup(sessionID), refs...)
+	remotes, err := ic.exportLayers(ctx, refCfg, session.NewGroup(sessionID), refs...)
 	if err != nil {
 		return nil, err
 	}
@@ -128,12 +134,16 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 		config := inp.Metadata[fmt.Sprintf("%s/%s", exptypes.ExporterImageConfigKey, p.ID)]
 		inlineCache := inp.Metadata[fmt.Sprintf("%s/%s", exptypes.ExporterInlineCache, p.ID)]
 
-		var buildInfo []byte
-		if buildInfoMode&buildinfo.ExportImageConfig > 0 {
-			buildInfo = inp.Metadata[fmt.Sprintf("%s/%s", exptypes.ExporterBuildInfo, p.ID)]
+		var dtbi []byte
+		if buildInfo {
+			if dtbi, err = buildinfo.Format(inp.Metadata[fmt.Sprintf("%s/%s", exptypes.ExporterBuildInfo, p.ID)], buildinfo.FormatOpts{
+				RemoveAttrs: !buildInfoAttrs,
+			}); err != nil {
+				return nil, err
+			}
 		}
 
-		desc, _, err := ic.commitDistributionManifest(ctx, r, config, &remotes[remotesMap[p.ID]], oci, inlineCache, buildInfo)
+		desc, _, err := ic.commitDistributionManifest(ctx, r, config, &remotes[remotesMap[p.ID]], oci, inlineCache, dtbi)
 		if err != nil {
 			return nil, err
 		}
@@ -165,20 +175,20 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 	return &idxDesc, nil
 }
 
-func (ic *ImageWriter) exportLayers(ctx context.Context, compressionType compression.Type, forceCompression bool, s session.Group, refs ...cache.ImmutableRef) ([]solver.Remote, error) {
-	span, ctx := tracing.StartSpan(ctx, "export layers", trace.WithAttributes(
-		attribute.String("exportLayers.compressionType", compressionType.String()),
-		attribute.Bool("exportLayers.forceCompression", forceCompression),
-	))
+func (ic *ImageWriter) exportLayers(ctx context.Context, refCfg cacheconfig.RefConfig, s session.Group, refs ...cache.ImmutableRef) ([]solver.Remote, error) {
+	attr := []attribute.KeyValue{
+		attribute.String("exportLayers.compressionType", refCfg.Compression.Type.String()),
+		attribute.Bool("exportLayers.forceCompression", refCfg.Compression.Force),
+	}
+	if refCfg.Compression.Level != nil {
+		attr = append(attr, attribute.Int("exportLayers.compressionLevel", *refCfg.Compression.Level))
+	}
+	span, ctx := tracing.StartSpan(ctx, "export layers", trace.WithAttributes(attr...))
 
 	eg, ctx := errgroup.WithContext(ctx)
 	layersDone := oneOffProgress(ctx, "exporting layers")
 
 	out := make([]solver.Remote, len(refs))
-	compressionopt := solver.CompressionOpt{
-		Type:  compressionType,
-		Force: forceCompression,
-	}
 
 	for i, ref := range refs {
 		func(i int, ref cache.ImmutableRef) {
@@ -186,7 +196,7 @@ func (ic *ImageWriter) exportLayers(ctx context.Context, compressionType compres
 				return
 			}
 			eg.Go(func() error {
-				remotes, err := ref.GetRemotes(ctx, true, compressionopt, false, s)
+				remotes, err := ref.GetRemotes(ctx, true, refCfg, false, s)
 				if err != nil {
 					return err
 				}
@@ -278,6 +288,7 @@ func (ic *ImageWriter) commitDistributionManifest(ctx context.Context, ref cache
 		} else {
 			desc.Annotations = nil
 		}
+
 		mfst.Layers = append(mfst.Layers, desc)
 		labels[fmt.Sprintf("containerd.io/gc.ref.content.%d", i+1)] = desc.Digest.String()
 	}
@@ -414,9 +425,9 @@ func patchImageConfig(dt []byte, descs []ocispecs.Descriptor, history []ocispecs
 		if err != nil {
 			return nil, err
 		}
-		m[buildinfo.ImageConfigField] = dt
-	} else if _, ok := m[buildinfo.ImageConfigField]; ok {
-		delete(m, buildinfo.ImageConfigField)
+		m[binfotypes.ImageConfigField] = dt
+	} else if _, ok := m[binfotypes.ImageConfigField]; ok {
+		delete(m, binfotypes.ImageConfigField)
 	}
 
 	dt, err = json.Marshal(m)
@@ -465,15 +476,10 @@ func normalizeLayersAndHistory(ctx context.Context, remote *solver.Remote, histo
 	var layerIndex int
 	for i, h := range history {
 		if !h.EmptyLayer {
-			if remote.Descriptors[layerIndex].Digest == exptypes.EmptyGZLayer {
-				h.EmptyLayer = true
-				remote.Descriptors = append(remote.Descriptors[:layerIndex], remote.Descriptors[layerIndex+1:]...)
-			} else {
-				if h.Created == nil {
-					h.Created = refMeta[layerIndex].createdAt
-				}
-				layerIndex++
+			if h.Created == nil {
+				h.Created = refMeta[layerIndex].createdAt
 			}
+			layerIndex++
 		}
 		history[i] = h
 	}

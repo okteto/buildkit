@@ -5,9 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
+	"strings"
+	"testing"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -58,7 +59,7 @@ func (c dockerd) New(ctx context.Context, cfg *BackendConfig) (b Backend, cl fun
 	var proxyGroup errgroup.Group
 	deferF.append(proxyGroup.Wait)
 
-	workDir, err := ioutil.TempDir("", "integration")
+	workDir, err := os.MkdirTemp("", "integration")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -98,7 +99,7 @@ func (c dockerd) New(ctx context.Context, cfg *BackendConfig) (b Backend, cl fun
 	// Create a file descriptor to be used as a Unix domain socket.
 	// Remove it immediately (the name will still be valid for the socket) so that
 	// we don't leave files all over the users tmp tree.
-	f, err := ioutil.TempFile("", "buildkit-integration")
+	f, err := os.CreateTemp("", "buildkit-integration")
 	if err != nil {
 		return
 	}
@@ -142,7 +143,23 @@ func (c dockerd) New(ctx context.Context, cfg *BackendConfig) (b Backend, cl fun
 	})
 
 	return backend{
-		address:  "unix://" + listener.Addr().String(),
-		rootless: false,
+		address:   "unix://" + listener.Addr().String(),
+		rootless:  false,
+		isDockerd: true,
 	}, cl, nil
+}
+
+func SkipIfDockerd(t *testing.T, sb Sandbox, reason ...string) {
+	t.Helper()
+	sbx, ok := sb.(*sandbox)
+	if !ok {
+		t.Fatalf("invalid sandbox type %T", sb)
+	}
+	b, ok := sbx.Backend.(backend)
+	if !ok {
+		t.Fatalf("invalid backend type %T", b)
+	}
+	if b.isDockerd {
+		t.Skipf("dockerd worker can not currently run this test due to missing features (%s)", strings.Join(reason, ", "))
+	}
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -273,7 +272,7 @@ func (gs *gitSourceHandler) mountKnownHosts(ctx context.Context) (string, func()
 	if gs.src.KnownSSHHosts == "" {
 		return "", nil, errors.Errorf("no configured known hosts forwarded from the client")
 	}
-	knownHosts, err := ioutil.TempFile("", "")
+	knownHosts, err := os.CreateTemp("", "")
 	if err != nil {
 		return "", nil, err
 	}
@@ -382,7 +381,7 @@ func (gs *gitSourceHandler) Snapshot(ctx context.Context, g session.Group) (out 
 		return nil, errors.Wrapf(err, "failed to search metadata for %s", snapshotKey)
 	}
 	if len(sis) > 0 {
-		return gs.cache.Get(ctx, sis[0].ID())
+		return gs.cache.Get(ctx, sis[0].ID(), nil)
 	}
 
 	gs.locker.Lock(gs.src.Remote)
@@ -501,8 +500,17 @@ func (gs *gitSourceHandler) Snapshot(ctx context.Context, g session.Group) (out 
 		if err != nil {
 			return nil, err
 		}
+
+		gitCatFileBuf, err := gitWithinDir(ctx, gitDir, "", sock, knownHosts, gs.auth, "cat-file", "-t", ref)
+		if err != nil {
+			return nil, err
+		}
+		isAnnotatedTag := strings.TrimSpace(gitCatFileBuf.String()) == "tag"
+
 		pullref := ref
-		if isCommitSHA(ref) {
+		if isAnnotatedTag {
+			pullref += ":refs/tags/" + pullref
+		} else if isCommitSHA(ref) {
 			pullref = "refs/buildkit/" + identity.NewID()
 			_, err = gitWithinDir(ctx, gitDir, "", sock, knownHosts, gs.auth, "update-ref", pullref, ref)
 			if err != nil {
@@ -534,7 +542,7 @@ func (gs *gitSourceHandler) Snapshot(ctx context.Context, g session.Group) (out 
 	} else {
 		cd := checkoutDir
 		if subdir != "." {
-			cd, err = ioutil.TempDir(cd, "checkout")
+			cd, err = os.MkdirTemp(cd, "checkout")
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to create temporary checkout dir")
 			}
@@ -631,11 +639,16 @@ func getGitSSHCommand(knownHosts string) string {
 	return gitSSHCommand
 }
 
-func git(ctx context.Context, dir, sshAuthSock, knownHosts string, args ...string) (*bytes.Buffer, error) {
+func git(ctx context.Context, dir, sshAuthSock, knownHosts string, args ...string) (_ *bytes.Buffer, err error) {
 	for {
-		stdout, stderr := logs.NewLogStreams(ctx, false)
+		stdout, stderr, flush := logs.NewLogStreams(ctx, false)
 		defer stdout.Close()
 		defer stderr.Close()
+		defer func() {
+			if err != nil {
+				flush()
+			}
+		}()
 		cmd := exec.Command("git", args...)
 		cmd.Dir = dir // some commands like submodule require this
 		buf := bytes.NewBuffer(nil)

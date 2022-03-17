@@ -1,6 +1,3 @@
-//go:build dfheredoc
-// +build dfheredoc
-
 package parser
 
 import (
@@ -72,6 +69,11 @@ content 1
 FILE1
 content 2
 FILE2
+
+COPY <<EOF /quotes
+"foo"
+'bar'
+EOF
 
 COPY <<X <<Y /dest
 Y
@@ -208,6 +210,14 @@ $EOF
 			{
 				Name:    "FILE2",
 				Content: "content 2\n",
+				Expand:  true,
+			},
+		},
+		{
+			// COPY <<EOF /quotes
+			{
+				Name:    "EOF",
+				Content: "\"foo\"\n'bar'\n",
 				Expand:  true,
 			},
 		},

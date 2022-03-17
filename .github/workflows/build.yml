@@ -69,6 +69,7 @@ jobs:
           - ./frontend/dockerfile
         worker:
           - containerd
+          - containerd-rootless
           - containerd-1.5
           - containerd-1.4
           - containerd-snapshotter-stargz
@@ -139,7 +140,7 @@ jobs:
         name: Set up Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.16
+          go-version: 1.17
       -
         name: Cache Go modules
         uses: actions/cache@v2

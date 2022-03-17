@@ -1,6 +1,3 @@
-//go:build dfheredoc
-// +build dfheredoc
-
 package instructions
 
 import (
@@ -142,6 +139,21 @@ EOF`,
 					{
 						Path:   "EOF",
 						Data:   "this is inline\n",
+						Expand: true,
+					},
+				},
+			},
+		},
+		{
+			dockerfile: `COPY <<EOF /quotes
+"quotes"
+EOF`,
+			sourcesAndDest: SourcesAndDest{
+				DestPath: "/quotes",
+				SourceContents: []SourceContent{
+					{
+						Path:   "EOF",
+						Data:   "\"quotes\"\n",
 						Expand: true,
 					},
 				},

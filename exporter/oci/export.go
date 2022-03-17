@@ -2,6 +2,8 @@ package oci
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
@@ -10,13 +12,12 @@ import (
 	"github.com/containerd/containerd/leases"
 	"github.com/docker/distribution/reference"
 	"github.com/moby/buildkit/cache"
+	cacheconfig "github.com/moby/buildkit/cache/config"
 	"github.com/moby/buildkit/exporter"
 	"github.com/moby/buildkit/exporter/containerimage"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/filesync"
-	"github.com/moby/buildkit/solver"
-	"github.com/moby/buildkit/util/buildinfo"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/grpcerrors"
@@ -37,7 +38,13 @@ const (
 	VariantDocker       = "docker"
 	ociTypes            = "oci-mediatypes"
 	keyForceCompression = "force-compression"
+	keyCompressionLevel = "compression-level"
 	keyBuildInfo        = "buildinfo"
+	keyBuildInfoAttrs   = "buildinfo-attrs"
+	// preferNondistLayersKey is an exporter option which can be used to mark a layer as non-distributable if the layer reference was
+	// already found to use a non-distributable media type.
+	// When this option is not set, the exporter will change the media type of the layer to a distributable one.
+	preferNondistLayersKey = "prefer-nondist-layers"
 )
 
 type Opt struct {
@@ -61,7 +68,7 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 	i := &imageExporterInstance{
 		imageExporter:    e,
 		layerCompression: compression.Default,
-		buildInfoMode:    buildinfo.ExportDefault,
+		buildInfo:        true,
 	}
 	var esgz bool
 	for k, v := range opt {
@@ -89,9 +96,16 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 			}
 			b, err := strconv.ParseBool(v)
 			if err != nil {
-				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
+				return nil, errors.Wrapf(err, "non-bool value %v specified for %s", v, k)
 			}
 			i.forceCompression = b
+		case keyCompressionLevel:
+			ii, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return nil, errors.Wrapf(err, "non-int value %s specified for %s", v, k)
+			}
+			v := int(ii)
+			i.compressionLevel = &v
 		case ociTypes:
 			ot = new(bool)
 			if v == "" {
@@ -105,13 +119,30 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 			*ot = b
 		case keyBuildInfo:
 			if v == "" {
+				i.buildInfo = true
 				continue
 			}
-			bimode, err := buildinfo.ParseExportMode(v)
+			b, err := strconv.ParseBool(v)
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
 			}
-			i.buildInfoMode = bimode
+			i.buildInfo = b
+		case keyBuildInfoAttrs:
+			if v == "" {
+				i.buildInfoAttrs = false
+				continue
+			}
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
+			}
+			i.buildInfoAttrs = b
+		case preferNondistLayersKey:
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
+			}
+			i.preferNonDist = b
 		default:
 			if i.meta == nil {
 				i.meta = make(map[string][]byte)
@@ -138,7 +169,10 @@ type imageExporterInstance struct {
 	ociTypes         bool
 	layerCompression compression.Type
 	forceCompression bool
-	buildInfoMode    buildinfo.ExportMode
+	compressionLevel *int
+	buildInfo        bool
+	buildInfoAttrs   bool
+	preferNonDist    bool
 }
 
 func (e *imageExporterInstance) Name() string {
@@ -147,10 +181,22 @@ func (e *imageExporterInstance) Name() string {
 
 func (e *imageExporterInstance) Config() exporter.Config {
 	return exporter.Config{
-		Compression: solver.CompressionOpt{
-			Type:  e.layerCompression,
-			Force: e.forceCompression,
-		},
+		Compression: e.compression(),
+	}
+}
+
+func (e *imageExporterInstance) compression() compression.Config {
+	c := compression.New(e.layerCompression).SetForce(e.forceCompression)
+	if e.compressionLevel != nil {
+		c = c.SetLevel(*e.compressionLevel)
+	}
+	return c
+}
+
+func (e *imageExporterInstance) refCfg() cacheconfig.RefConfig {
+	return cacheconfig.RefConfig{
+		Compression:            e.compression(),
+		PreferNonDistributable: e.preferNonDist,
 	}
 }
 
@@ -172,7 +218,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 	}
 	defer done(context.TODO())
 
-	desc, err := e.opt.ImageWriter.Commit(ctx, src, e.ociTypes, e.layerCompression, e.buildInfoMode, e.forceCompression, sessionID)
+	desc, err := e.opt.ImageWriter.Commit(ctx, src, e.ociTypes, e.refCfg(), e.buildInfo, e.buildInfoAttrs, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -180,26 +226,24 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 		e.opt.ImageWriter.ContentStore().Delete(context.TODO(), desc.Digest)
 	}()
 
-	if e.buildInfoMode&buildinfo.ExportMetadata == 0 {
-		for k := range src.Metadata {
-			if !strings.HasPrefix(k, exptypes.ExporterBuildInfo) {
-				continue
-			}
-			delete(src.Metadata, k)
-		}
-	}
-
 	if desc.Annotations == nil {
 		desc.Annotations = map[string]string{}
 	}
 	desc.Annotations[ocispecs.AnnotationCreated] = time.Now().UTC().Format(time.RFC3339)
 
 	resp := make(map[string]string)
+
 	resp[exptypes.ExporterImageDigestKey] = desc.Digest.String()
 	if v, ok := desc.Annotations[exptypes.ExporterConfigDigestKey]; ok {
 		resp[exptypes.ExporterImageConfigDigestKey] = v
 		delete(desc.Annotations, exptypes.ExporterConfigDigestKey)
 	}
+
+	dtdesc, err := json.Marshal(desc)
+	if err != nil {
+		return nil, err
+	}
+	resp[exptypes.ExporterImageDescriptorKey] = base64.StdEncoding.EncodeToString(dtdesc)
 
 	if n, ok := src.Metadata["image.name"]; e.name == "*" && ok {
 		e.name = string(n)
@@ -237,12 +281,8 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 	}
 
 	mprovider := contentutil.NewMultiProvider(e.opt.ImageWriter.ContentStore())
-	compressionopt := solver.CompressionOpt{
-		Type:  e.layerCompression,
-		Force: e.forceCompression,
-	}
 	if src.Ref != nil {
-		remotes, err := src.Ref.GetRemotes(ctx, false, compressionopt, false, session.NewGroup(sessionID))
+		remotes, err := src.Ref.GetRemotes(ctx, false, e.refCfg(), false, session.NewGroup(sessionID))
 		if err != nil {
 			return nil, err
 		}
@@ -260,7 +300,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 	}
 	if len(src.Refs) > 0 {
 		for _, r := range src.Refs {
-			remotes, err := r.GetRemotes(ctx, false, compressionopt, false, session.NewGroup(sessionID))
+			remotes, err := r.GetRemotes(ctx, false, e.refCfg(), false, session.NewGroup(sessionID))
 			if err != nil {
 				return nil, err
 			}

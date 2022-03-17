@@ -25,10 +25,9 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/containerd/stargz-snapshotter/util/lrucache"
+	"github.com/containerd/stargz-snapshotter/util/cacheutil"
 	"github.com/containerd/stargz-snapshotter/util/namedmutex"
 	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -51,11 +50,11 @@ type DirectoryCacheConfig struct {
 
 	// DataCache is an on-memory cache of the data.
 	// OnEvicted will be overridden and replaced for internal use.
-	DataCache *lrucache.Cache
+	DataCache *cacheutil.LRUCache
 
 	// FdCache is a cache for opened file descriptors.
 	// OnEvicted will be overridden and replaced for internal use.
-	FdCache *lrucache.Cache
+	FdCache *cacheutil.LRUCache
 
 	// BufPool will be used for pooling bytes.Buffer.
 	BufPool *sync.Pool
@@ -130,7 +129,7 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 		if maxEntry == 0 {
 			maxEntry = defaultMaxLRUCacheEntry
 		}
-		dataCache = lrucache.New(maxEntry)
+		dataCache = cacheutil.NewLRUCache(maxEntry)
 		dataCache.OnEvicted = func(key string, value interface{}) {
 			value.(*bytes.Buffer).Reset()
 			bufPool.Put(value)
@@ -142,7 +141,7 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 		if maxEntry == 0 {
 			maxEntry = defaultMaxCacheFds
 		}
-		fdCache = lrucache.New(maxEntry)
+		fdCache = cacheutil.NewLRUCache(maxEntry)
 		fdCache.OnEvicted = func(key string, value interface{}) {
 			value.(*os.File).Close()
 		}
@@ -169,8 +168,8 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 
 // directoryCache is a cache implementation which backend is a directory.
 type directoryCache struct {
-	cache        *lrucache.Cache
-	fileCache    *lrucache.Cache
+	cache        *cacheutil.LRUCache
+	fileCache    *cacheutil.LRUCache
 	wipDirectory string
 	directory    string
 	wipLock      *namedmutex.NamedMutex
@@ -223,7 +222,7 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	//       or simply report the cache miss?
 	file, err := os.Open(dc.cachePath(key))
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open blob file for %q", key)
+		return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
 	}
 
 	// If "direct" option is specified, do not cache the file on memory.
@@ -280,7 +279,7 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 					allErr = multierror.Append(allErr, err)
 				}
 				return multierror.Append(allErr,
-					errors.Wrapf(err, "failed to create cache directory %q", c))
+					fmt.Errorf("failed to create cache directory %q: %w", c, err))
 			}
 			return os.Rename(wip.Name(), c)
 		},
