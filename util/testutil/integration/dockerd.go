@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -95,7 +96,7 @@ func (c dockerd) New(ctx context.Context, cfg *BackendConfig) (b Backend, cl fun
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "dockerd startcmd error: %s", formatLogs(cfg.Logs))
 	}
-	if err := waitUnix(daemonSocket, 5*time.Second); err != nil {
+	if err := waitUnix(daemonSocket, 15*time.Second); err != nil {
 		dockerdStop()
 		return nil, nil, errors.Wrapf(err, "dockerd did not start up: %s", formatLogs(cfg.Logs))
 	}
@@ -144,7 +145,11 @@ func (c dockerd) New(ctx context.Context, cfg *BackendConfig) (b Backend, cl fun
 			}
 			conn, err := dockerAPI.DialHijack(ctx, "/grpc", "h2c", nil)
 			if err != nil {
-				return errors.Wrapf(err, "dockerd grpc conn error: %s", formatLogs(cfg.Logs))
+				if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed) {
+					logrus.Warn("dockerd conn already closed: ", err)
+					return nil
+				}
+				return errors.Wrap(err, "dockerd grpc conn error")
 			}
 
 			proxyGroup.Go(func() error {
@@ -202,4 +207,8 @@ func SkipIfDockerd(t *testing.T, sb Sandbox, reason ...string) {
 	if b.isDockerd {
 		t.Skipf("dockerd worker can not currently run this test due to missing features (%s)", strings.Join(reason, ", "))
 	}
+}
+
+func IsTestDockerd() bool {
+	return os.Getenv("TEST_DOCKERD") == "1"
 }
