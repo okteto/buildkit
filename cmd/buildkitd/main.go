@@ -247,9 +247,11 @@ func main() {
 		var stream grpc.StreamServerInterceptor
 
 		if cfg.AuthorizationEndpoint == "" {
+			logrus.Fatal("no authorization endpoint was provided, this is required for this fork of buildkitd")
 			unary = grpc_middleware.ChainUnaryServer(unaryInterceptor(ctx, tp), grpcerrors.UnaryServerInterceptor)
 			stream = grpc_middleware.ChainStreamServer(streamTracer, grpcerrors.StreamServerInterceptor)
 		} else {
+			logrus.Info("buildkitd is running with auth required")
 			svc := auth.NewService(cfg.AuthorizationEndpoint)
 			unaryAuthorizer := grpc_auth.UnaryServerInterceptor(svc.EnsureValidToken)
 			streamAuthorizer := grpc_auth.StreamServerInterceptor(svc.EnsureValidToken)
@@ -503,6 +505,10 @@ func applyMainFlags(c *cli.Context, cfg *config.Config, md *toml.MetaData) error
 			return err
 		}
 		cfg.GRPC.GID = gid
+	}
+
+	if authEndpoint := c.String("authorization-endpoint"); authEndpoint != "" {
+		cfg.AuthorizationEndpoint = authEndpoint
 	}
 
 	if tlscert := c.String("tlscert"); tlscert != "" {
