@@ -71,7 +71,7 @@ func (s *Service) valid(authorization []string) bool {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		logrus.Errorf("bad token: %s | %d", authorization[0], resp.StatusCode)
+		logrus.Errorf("authentication request failed due to a bad token: %d", resp.StatusCode)
 		return false
 	}
 
