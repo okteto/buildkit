@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
@@ -52,21 +53,25 @@ func (s *Service) valid(authorization []string) bool {
 
 	req, err := http.NewRequest("POST", s.endpoint, nil)
 	if err != nil {
-		logrus.Error("couldn't create request: %s", err)
+		logrus.Errorf("couldn't create request: %s", err)
 		return false
 	}
 
-	req.Header.Add("Authorization", authorization[0])
+	// TODO: the OKTETO CLI should not be sending a bearer token, but just the plain token
+	a := strings.TrimPrefix(authorization[0], "Bearer")
+	a = "Bearer " + a
+
+	req.Header.Add("Authorization", a)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		logrus.Error("authentication request failed: %s", err)
+		logrus.Errorf("authentication request failed: %s", err)
 		return false
 	}
 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		logrus.Error("%s is a bad token: %s | %d", authorization[0], resp.StatusCode)
+		logrus.Errorf("bad token: %s | %d", authorization[0], resp.StatusCode)
 		return false
 	}
 
