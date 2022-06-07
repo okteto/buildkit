@@ -18,9 +18,10 @@ import (
 	sessionauth "github.com/moby/buildkit/session/auth"
 	log "github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/flightcontrol"
-	"github.com/moby/buildkit/vendor/github.com/prometheus/client_golang/prometheus"
 	"github.com/moby/buildkit/version"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sirupsen/logrus"
 )
 
