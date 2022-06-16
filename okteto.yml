@@ -1,21 +1,19 @@
 name: buildkit
 
-# The build section defines how to build the images of your development environment
-# More info: https://www.okteto.com/docs/reference/manifest/#build
-# build:
-#   my-service:
-#     context: .
+build:
+  # buildx build --tag=moby/buildkit:local --output=type=docker,buildinfo-attrs=true .
+  buildkit-root:
+    context: .
+    dockerfile: Dockerfile
+    image: gcr.io/development-300207/buildkit:agustin-local
+  # buildx build --target=rootless --tag=moby/buildkit:local-rootless --output=type=docker,buildinfo-attrs=true .
+  buildkit-rootless:
+    context: .
+    dockerfile: Dockerfile
+    image: gcr.io/development-300207/buildkit:agustin-local-rootless
+    target: rootless
 
 
-# The deploy section defines how to deploy your development environment
-# More info: https://www.okteto.com/docs/reference/manifest/#deploy
-
-# The dependencies section defines other git repositories to be deployed as part of your development environment
-# More info: https://www.okteto.com/docs/reference/manifest/#dependencies
-# dependencies:
-#   - https://github.com/okteto/sample
-# The dev section defines how to activate a development container
-# More info: https://www.okteto.com/docs/reference/manifest/#dev
 dev:
   buildkit:
     selector:
