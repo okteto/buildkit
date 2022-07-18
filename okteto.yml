@@ -1,4 +1,6 @@
 name: buildkit
+context: ${OKTETO_DEV_CLUSTER}
+namespace: okteto
 
 # The build section defines how to build the images of your development environment
 # More info: https://www.okteto.com/docs/reference/manifest/#build
