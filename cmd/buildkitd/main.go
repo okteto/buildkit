@@ -69,6 +69,7 @@ import (
 	tracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 func init() {
@@ -256,6 +257,20 @@ func main() {
 		}
 
 		opts := []grpc.ServerOption{grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream)}
+
+		opts = append(opts, grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}))
+
+		opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle:     30 * time.Minute,
+			MaxConnectionAge:      5 * time.Hour,
+			MaxConnectionAgeGrace: 5 * time.Minute,
+			Time:                  5 * time.Minute,
+			Timeout:               time.Minute,
+		}))
+
 		server := grpc.NewServer(opts...)
 
 		// relative path does not work with nightlyone/lockfile

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/defaults"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
@@ -27,6 +28,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 type Client struct {
@@ -144,6 +146,12 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 	} else if len(stream) > 1 {
 		gopts = append(gopts, grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(stream...)))
 	}
+
+	gopts = append(gopts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		Time:                10 * time.Second,
+		Timeout:             time.Minute,
+		PermitWithoutStream: true,
+	}))
 
 	conn, err := grpc.DialContext(ctx, address, gopts...)
 	if err != nil {
