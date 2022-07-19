@@ -4,9 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io/ioutil"
+	"math"
 	"net"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +39,11 @@ type Client struct {
 	conn          *grpc.ClientConn
 	sessionDialer func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error)
 }
+
+const (
+	defaultClientKeepaliveTime    = time.Duration(math.MaxInt64)
+	defaultClientKeepaliveTimeout = 20 * time.Second
+)
 
 type ClientOpt interface{}
 
@@ -147,10 +156,39 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 		gopts = append(gopts, grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(stream...)))
 	}
 
+	var kaTimeDuration time.Duration
+	if timeEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_TIME_MS"); timeEnv != "" {
+		timeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", timeEnv))
+		if err != nil {
+			kaTimeDuration = defaultClientKeepaliveTime
+		}
+
+		kaTimeDuration = timeDuration
+	} else {
+		kaTimeDuration = defaultClientKeepaliveTime
+	}
+
+	var kaTimeoutDuration time.Duration
+	if timeoutEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_TIMEOUT_MS"); timeoutEnv != "" {
+		timeoutDuration, err := time.ParseDuration(fmt.Sprintf("%sms", timeoutEnv))
+		if err != nil {
+			kaTimeoutDuration = defaultClientKeepaliveTimeout
+		}
+
+		kaTimeoutDuration = timeoutDuration
+	} else {
+		kaTimeDuration = defaultClientKeepaliveTimeout
+	}
+
+	var kaPermitWithoutStreamDuration bool
+	if permitWithoutStreamEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_PERMIT_WITHOUT_STREAM"); permitWithoutStreamEnv != "" {
+		kaPermitWithoutStreamDuration, _ = strconv.ParseBool(permitWithoutStreamEnv)
+	}
+
 	gopts = append(gopts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
-		Time:                10 * time.Second,
-		Timeout:             time.Minute,
-		PermitWithoutStream: true,
+		Time:                kaTimeDuration,
+		Timeout:             kaTimeoutDuration,
+		PermitWithoutStream: kaPermitWithoutStreamDuration,
 	}))
 
 	conn, err := grpc.DialContext(ctx, address, gopts...)
