@@ -4,13 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"io/ioutil"
 	"math"
 	"net"
 	"net/url"
-	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -32,7 +29,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
 )
 
 type Client struct {
@@ -158,32 +154,7 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 		gopts = append(gopts, grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(stream...)))
 	}
 
-	kaTimeDuration := defaultClientKeepaliveTime
-	if timeEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_TIME_MS"); timeEnv != "" {
-		timeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", timeEnv))
-		if err == nil {
-			kaTimeDuration = timeDuration
-		}
-	}
-
-	kaTimeoutDuration := defaultClientKeepaliveTimeout
-	if timeoutEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_TIMEOUT_MS"); timeoutEnv != "" {
-		timeoutDuration, err := time.ParseDuration(fmt.Sprintf("%sms", timeoutEnv))
-		if err == nil {
-			kaTimeoutDuration = timeoutDuration
-		}
-	}
-
-	var kaPermitWithoutStreamDuration bool
-	if permitWithoutStreamEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_PERMIT_WITHOUT_STREAM"); permitWithoutStreamEnv != "" {
-		kaPermitWithoutStreamDuration, _ = strconv.ParseBool(permitWithoutStreamEnv)
-	}
-
-	gopts = append(gopts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
-		Time:                kaTimeDuration,
-		Timeout:             kaTimeoutDuration,
-		PermitWithoutStream: kaPermitWithoutStreamDuration,
-	}))
+	gopts = append(gopts, grpc.WithKeepaliveParams(okteto.loadKeepaliveClientParams()))
 
 	conn, err := grpc.DialContext(ctx, address, gopts...)
 	if err != nil {

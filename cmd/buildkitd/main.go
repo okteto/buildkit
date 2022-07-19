@@ -70,7 +70,6 @@ import (
 	tracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/keepalive"
 )
 
 func init() {
@@ -270,71 +269,9 @@ func main() {
 
 		opts := []grpc.ServerOption{grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream)}
 
-		kaspMintimeDuration := defaultKeepalivePolicyMinTime
-		if kaspMintimeEnv := os.Getenv("OKTETO_KEEPALIVE_SERVER_POLICY_MINTIME_MS"); kaspMintimeEnv != "" {
-			mintimeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaspMintimeEnv))
-			if err == nil {
-				kaspMintimeDuration = mintimeDuration
-			}
-		}
+		opts = append(opts, grpc.KeepaliveEnforcementPolicy(okteto.loadKeepaliveEnforcementPolicy()))
 
-		var kaspPermitWithoutStreamDuration bool
-		if permitWithoutStreamEnv := os.Getenv("OKTETO_KEEPALIVE_SERVER_POLICY_PERMIT_WITHOUT_STREAM"); permitWithoutStreamEnv != "" {
-			kaspPermitWithoutStreamDuration, _ = strconv.ParseBool(permitWithoutStreamEnv)
-		}
-
-		opts = append(opts, grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             kaspMintimeDuration,
-			PermitWithoutStream: kaspPermitWithoutStreamDuration,
-		}))
-
-		kaMaxConnIdleDuration := defaultMaxConnectionIdle
-		if kaMaxConnEnv := os.Getenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_IDLE_MS"); kaMaxConnEnv != "" {
-			maxConnIdleDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaMaxConnEnv))
-			if err == nil {
-				kaMaxConnIdleDuration = maxConnIdleDuration
-			}
-		}
-
-		kaMaxConnAgeDuration := defaultMaxConnectionAge
-		if kaMaxConnAge := os.Getenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_MS"); kaMaxConnAge != "" {
-			maxConnAgeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaMaxConnAge))
-			if err == nil {
-				kaMaxConnAgeDuration = maxConnAgeDuration
-			}
-		}
-
-		kaMaxConnAgeGraceDuration := defaultMaxConnectionAgeGrace
-		if kaMaxConnAgeGrace := os.Getenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_GRACE_MS"); kaMaxConnAgeGrace != "" {
-			maxConnAgeGraceDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaMaxConnAgeGrace))
-			if err == nil {
-				kaMaxConnAgeGraceDuration = maxConnAgeGraceDuration
-			}
-		}
-
-		kaTimeDuration := defaultServerKeepaliveTime
-		if kaTime := os.Getenv("OKTETO_KEEPALIVE_SERVER_TIME_MS"); kaTime != "" {
-			timeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaTime))
-			if err == nil {
-				kaTimeDuration = timeDuration
-			}
-		}
-
-		kaTimeoutDuration := defaultServerKeepaliveTimeout
-		if kaTimeout := os.Getenv("OKTETO_KEEPALIVE_SERVER_TIMEOUT_MS"); kaTimeout != "" {
-			timeoutDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaTimeout))
-			if err == nil {
-				kaTimeoutDuration = timeoutDuration
-			}
-		}
-
-		opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionIdle:     kaMaxConnIdleDuration,
-			MaxConnectionAge:      kaMaxConnAgeDuration,
-			MaxConnectionAgeGrace: kaMaxConnAgeGraceDuration,
-			Time:                  kaTimeDuration,
-			Timeout:               kaTimeoutDuration,
-		}))
+		opts = append(opts, grpc.KeepaliveParams(okteto.loadKeepaliveServerParams()))
 
 		server := grpc.NewServer(opts...)
 
