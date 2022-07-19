@@ -41,6 +41,7 @@ type Client struct {
 }
 
 const (
+	// default values from https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
 	defaultClientKeepaliveTime    = time.Duration(math.MaxInt64)
 	defaultClientKeepaliveTimeout = 20 * time.Second
 )
