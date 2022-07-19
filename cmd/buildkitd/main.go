@@ -272,13 +272,13 @@ func main() {
 
 		kaspMintimeDuration := defaultKeepalivePolicyMinTime
 		if kaspMintimeEnv := os.Getenv("OKTETO_KEEPALIVE_SERVER_POLICY_MINTIME_MS"); kaspMintimeEnv != "" {
-			kaspMintimeDuration, _ = time.ParseDuration(fmt.Sprintf("%sms", kaspMintimeEnv))
-			if err != nil {
-				kaspMintimeDuration = defaultKeepalivePolicyMinTime
+			mintimeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaspMintimeEnv))
+			if err == nil {
+				kaspMintimeDuration = mintimeDuration
 			}
 		}
 
-		kaspPermitWithoutStreamDuration := false
+		var kaspPermitWithoutStreamDuration bool
 		if permitWithoutStreamEnv := os.Getenv("OKTETO_KEEPALIVE_SERVER_POLICY_PERMIT_WITHOUT_STREAM"); permitWithoutStreamEnv != "" {
 			kaspPermitWithoutStreamDuration, _ = strconv.ParseBool(permitWithoutStreamEnv)
 		}
@@ -290,41 +290,41 @@ func main() {
 
 		kaMaxConnIdleDuration := defaultMaxConnectionIdle
 		if kaMaxConnEnv := os.Getenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_IDLE_MS"); kaMaxConnEnv != "" {
-			kaMaxConnIdleDuration, err = time.ParseDuration(fmt.Sprintf("%sms", kaMaxConnEnv))
-			if err != nil {
-				kaMaxConnIdleDuration = defaultMaxConnectionIdle
+			maxConnIdleDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaMaxConnEnv))
+			if err == nil {
+				kaMaxConnIdleDuration = maxConnIdleDuration
 			}
 		}
 
 		kaMaxConnAgeDuration := defaultMaxConnectionAge
 		if kaMaxConnAge := os.Getenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_MS"); kaMaxConnAge != "" {
-			kaMaxConnAgeDuration, err = time.ParseDuration(fmt.Sprintf("%sms", kaMaxConnAge))
-			if err != nil {
-				kaMaxConnAgeDuration = defaultMaxConnectionAge
+			maxConnAgeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaMaxConnAge))
+			if err == nil {
+				kaMaxConnAgeDuration = maxConnAgeDuration
 			}
 		}
 
 		kaMaxConnAgeGraceDuration := defaultMaxConnectionAgeGrace
 		if kaMaxConnAgeGrace := os.Getenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_GRACE_MS"); kaMaxConnAgeGrace != "" {
-			kaMaxConnAgeGraceDuration, err = time.ParseDuration(fmt.Sprintf("%sms", kaMaxConnAgeGrace))
-			if err != nil {
-				kaMaxConnAgeGraceDuration = defaultMaxConnectionAgeGrace
+			maxConnAgeGraceDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaMaxConnAgeGrace))
+			if err == nil {
+				kaMaxConnAgeGraceDuration = maxConnAgeGraceDuration
 			}
 		}
 
 		kaTimeDuration := defaultServerKeepaliveTime
 		if kaTime := os.Getenv("OKTETO_KEEPALIVE_SERVER_TIME_MS"); kaTime != "" {
-			kaTimeDuration, err = time.ParseDuration(fmt.Sprintf("%sms", kaTime))
-			if err != nil {
-				kaTimeDuration = defaultServerKeepaliveTime
+			timeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaTime))
+			if err == nil {
+				kaTimeDuration = timeDuration
 			}
 		}
 
 		kaTimeoutDuration := defaultServerKeepaliveTimeout
 		if kaTimeout := os.Getenv("OKTETO_KEEPALIVE_SERVER_TIMEOUT_MS"); kaTimeout != "" {
-			kaTimeoutDuration, err = time.ParseDuration(fmt.Sprintf("%sms", kaTimeout))
-			if err != nil {
-				kaTimeoutDuration = defaultServerKeepaliveTimeout
+			timeoutDuration, err := time.ParseDuration(fmt.Sprintf("%sms", kaTimeout))
+			if err == nil {
+				kaTimeoutDuration = timeoutDuration
 			}
 		}
 

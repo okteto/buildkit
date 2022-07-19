@@ -161,21 +161,17 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 	kaTimeDuration := defaultClientKeepaliveTime
 	if timeEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_TIME_MS"); timeEnv != "" {
 		timeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", timeEnv))
-		if err != nil {
-			kaTimeDuration = defaultClientKeepaliveTime
+		if err == nil {
+			kaTimeDuration = timeDuration
 		}
-
-		kaTimeDuration = timeDuration
 	}
 
 	kaTimeoutDuration := defaultClientKeepaliveTimeout
 	if timeoutEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_TIMEOUT_MS"); timeoutEnv != "" {
 		timeoutDuration, err := time.ParseDuration(fmt.Sprintf("%sms", timeoutEnv))
-		if err != nil {
-			kaTimeoutDuration = defaultClientKeepaliveTimeout
+		if err == nil {
+			kaTimeoutDuration = timeoutDuration
 		}
-
-		kaTimeoutDuration = timeoutDuration
 	}
 
 	var kaPermitWithoutStreamDuration bool
