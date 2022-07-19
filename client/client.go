@@ -5,11 +5,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"io/ioutil"
-	"math"
 	"net"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/containerd/containerd/defaults"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
@@ -35,13 +33,6 @@ type Client struct {
 	conn          *grpc.ClientConn
 	sessionDialer func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error)
 }
-
-const (
-	// default values from https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
-	infinity                      = time.Duration(math.MaxInt64)
-	defaultClientKeepaliveTime    = infinity
-	defaultClientKeepaliveTimeout = 20 * time.Second
-)
 
 type ClientOpt interface{}
 

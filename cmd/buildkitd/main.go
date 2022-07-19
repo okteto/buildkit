@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io/ioutil"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -109,17 +108,6 @@ func registerWorkerInitializer(wi workerInitializer, flags ...cli.Flag) {
 		})
 	appFlags = append(appFlags, flags...)
 }
-
-const (
-	// default values from https://pkg.go.dev/google.golang.org/grpc/keepalive#ServerParameters
-	infinity                      = time.Duration(math.MaxInt64)
-	defaultKeepalivePolicyMinTime = 5 * time.Minute
-	defaultMaxConnectionIdle      = infinity
-	defaultMaxConnectionAge       = infinity
-	defaultMaxConnectionAgeGrace  = infinity
-	defaultServerKeepaliveTime    = 2 * time.Hour
-	defaultServerKeepaliveTimeout = 20 * time.Second
-)
 
 func main() {
 	cli.VersionPrinter = func(c *cli.Context) {
