@@ -42,7 +42,8 @@ type Client struct {
 
 const (
 	// default values from https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
-	defaultClientKeepaliveTime    = time.Duration(math.MaxInt64)
+	infinity                      = time.Duration(math.MaxInt64)
+	defaultClientKeepaliveTime    = infinity
 	defaultClientKeepaliveTimeout = 20 * time.Second
 )
 
@@ -157,7 +158,7 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 		gopts = append(gopts, grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(stream...)))
 	}
 
-	var kaTimeDuration time.Duration
+	kaTimeDuration := defaultClientKeepaliveTime
 	if timeEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_TIME_MS"); timeEnv != "" {
 		timeDuration, err := time.ParseDuration(fmt.Sprintf("%sms", timeEnv))
 		if err != nil {
@@ -165,11 +166,9 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 		}
 
 		kaTimeDuration = timeDuration
-	} else {
-		kaTimeDuration = defaultClientKeepaliveTime
 	}
 
-	var kaTimeoutDuration time.Duration
+	kaTimeoutDuration := defaultClientKeepaliveTimeout
 	if timeoutEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_TIMEOUT_MS"); timeoutEnv != "" {
 		timeoutDuration, err := time.ParseDuration(fmt.Sprintf("%sms", timeoutEnv))
 		if err != nil {
@@ -177,8 +176,6 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 		}
 
 		kaTimeoutDuration = timeoutDuration
-	} else {
-		kaTimeDuration = defaultClientKeepaliveTimeout
 	}
 
 	var kaPermitWithoutStreamDuration bool
