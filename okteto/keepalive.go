@@ -15,7 +15,7 @@ var (
 	kep *keepalive.EnforcementPolicy
 )
 
-func loadKeepaliveClientParams() keepalive.ClientParameters {
+func LoadKeepaliveClientParams() keepalive.ClientParameters {
 	if kcp == nil {
 		kcp = &keepalive.ClientParameters{}
 		if timeEnv := os.Getenv("OKTETO_KEEPALIVE_CLIENT_TIME_MS"); timeEnv != "" {
@@ -41,7 +41,7 @@ func loadKeepaliveClientParams() keepalive.ClientParameters {
 
 }
 
-func loadKeepaliveServerParams() keepalive.ServerParameters {
+func LoadKeepaliveServerParams() keepalive.ServerParameters {
 	if ksp == nil {
 		ksp = &keepalive.ServerParameters{}
 		if maxConnEnv := os.Getenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_IDLE_MS"); maxConnEnv != "" {
@@ -84,7 +84,7 @@ func loadKeepaliveServerParams() keepalive.ServerParameters {
 
 }
 
-func loadKeepaliveEnforcementPolicy() keepalive.EnforcementPolicy {
+func LoadKeepaliveEnforcementPolicy() keepalive.EnforcementPolicy {
 	if kep == nil {
 		kep = &keepalive.EnforcementPolicy{}
 		if mintimeEnv := os.Getenv("OKTETO_KEEPALIVE_SERVER_POLICY_MINTIME_MS"); mintimeEnv != "" {
