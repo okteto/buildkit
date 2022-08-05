@@ -1,6 +1,7 @@
 package okteto
 
 import (
+	"os"
 	"strconv"
 	"testing"
 
@@ -13,6 +14,19 @@ const (
 	secondaryIntEnvValue = "3"
 	initialBoolEnvValue  = true
 )
+
+func unsetKeepaliveEnvs() {
+	os.Unsetenv("OKTETO_KEEPALIVE_CLIENT_TIME_MS")
+	os.Unsetenv("OKTETO_KEEPALIVE_CLIENT_TIMEOUT_MS")
+	os.Unsetenv("OKTETO_KEEPALIVE_CLIENT_PERMIT_WITHOUT_STREAM")
+	os.Unsetenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_IDLE_MS")
+	os.Unsetenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_MS")
+	os.Unsetenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_GRACE_MS")
+	os.Unsetenv("OKTETO_KEEPALIVE_SERVER_TIME_MS")
+	os.Unsetenv("OKTETO_KEEPALIVE_SERVER_TIMEOUT_MS")
+	os.Unsetenv("OKTETO_KEEPALIVE_SERVER_POLICY_MINTIME_MS")
+	os.Unsetenv("OKTETO_KEEPALIVE_SERVER_POLICY_PERMIT_WITHOUT_STREAM")
+}
 
 func initialKcp() keepalive.ClientParameters {
 	return keepalive.ClientParameters{
@@ -49,9 +63,9 @@ func setInitialKeepaliveClientEnvs(t *testing.T, initValues bool) {
 		bEnvValue = strconv.FormatBool(!initialBoolEnvValue)
 	}
 
-	t.Setenv("OKTETO_KEEPALIVE_CLIENT_TIME_MS", iEnvValue)
-	t.Setenv("OKTETO_KEEPALIVE_CLIENT_TIMEOUT_MS", iEnvValue)
-	t.Setenv("OKTETO_KEEPALIVE_CLIENT_PERMIT_WITHOUT_STREAM", bEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_CLIENT_TIME_MS", iEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_CLIENT_TIMEOUT_MS", iEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_CLIENT_PERMIT_WITHOUT_STREAM", bEnvValue)
 }
 
 func setInitialKeepaliveServerEnvs(t *testing.T, initValues bool) {
@@ -62,11 +76,11 @@ func setInitialKeepaliveServerEnvs(t *testing.T, initValues bool) {
 		iEnvValue = secondaryIntEnvValue
 	}
 
-	t.Setenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_IDLE_MS", iEnvValue)
-	t.Setenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_MS", iEnvValue)
-	t.Setenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_GRACE_MS", iEnvValue)
-	t.Setenv("OKTETO_KEEPALIVE_SERVER_TIME_MS", iEnvValue)
-	t.Setenv("OKTETO_KEEPALIVE_SERVER_TIMEOUT_MS", iEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_IDLE_MS", iEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_MS", iEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_SERVER_MAX_CONN_AGE_GRACE_MS", iEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_SERVER_TIME_MS", iEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_SERVER_TIMEOUT_MS", iEnvValue)
 }
 
 func setInitialKeepaliveEnforcementPolicyEnvs(t *testing.T, initValues bool) {
@@ -79,8 +93,8 @@ func setInitialKeepaliveEnforcementPolicyEnvs(t *testing.T, initValues bool) {
 		bEnvValue = strconv.FormatBool(!initialBoolEnvValue)
 	}
 
-	t.Setenv("OKTETO_KEEPALIVE_SERVER_POLICY_MINTIME_MS", iEnvValue)
-	t.Setenv("OKTETO_KEEPALIVE_SERVER_POLICY_PERMIT_WITHOUT_STREAM", bEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_SERVER_POLICY_MINTIME_MS", iEnvValue)
+	os.Setenv("OKTETO_KEEPALIVE_SERVER_POLICY_PERMIT_WITHOUT_STREAM", bEnvValue)
 }
 
 func TestLoadKeepaliveParamsDefault(t *testing.T) {
@@ -95,6 +109,8 @@ func TestLoadKeepaliveParamsDefault(t *testing.T) {
 }
 
 func TestLoadKeepaliveParamsFromEnvs(t *testing.T) {
+	t.Cleanup(unsetKeepaliveEnvs)
+
 	setInitialKeepaliveClientEnvs(t, true)
 	kcp := LoadKeepaliveClientParams()
 	assert.Equal(t, kcp, initialKcp())
@@ -109,6 +125,8 @@ func TestLoadKeepaliveParamsFromEnvs(t *testing.T) {
 }
 
 func TestLoadKeepaliveParamsSingleton(t *testing.T) {
+	t.Cleanup(unsetKeepaliveEnvs)
+
 	setInitialKeepaliveClientEnvs(t, true)
 	_ = LoadKeepaliveClientParams()
 	setInitialKeepaliveClientEnvs(t, false)
