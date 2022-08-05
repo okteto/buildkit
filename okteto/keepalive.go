@@ -48,7 +48,6 @@ func LoadKeepaliveClientParams() keepalive.ClientParameters {
 	}
 
 	return *kcp
-
 }
 
 func LoadKeepaliveServerParams() keepalive.ServerParameters {
@@ -101,7 +100,6 @@ func LoadKeepaliveServerParams() keepalive.ServerParameters {
 	}
 
 	return *ksp
-
 }
 
 func LoadKeepaliveEnforcementPolicy() keepalive.EnforcementPolicy {
@@ -127,5 +125,4 @@ func LoadKeepaliveEnforcementPolicy() keepalive.EnforcementPolicy {
 	}
 
 	return *kep
-
 }
