@@ -21,8 +21,8 @@ namespace: okteto
 dev:
   buildkit:
     selector:
-        app.kubernetes.io/component: buildkit
-        app.kubernetes.io/part-of: okteto
+      app.kubernetes.io/component: buildkit
+      app.kubernetes.io/part-of: okteto
     image: okteto/dev:latest
     command: bash
     securityContext:
