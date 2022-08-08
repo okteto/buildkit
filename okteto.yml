@@ -30,8 +30,8 @@ dev:
         add:
           - SYS_PTRACE
     volumes:
-    - /go/pkg/
-    - /root/.cache/go-build/
+      - /go/pkg/
+      - /root/.cache/go-build/
     workdir: /usr/src/app
     sync:
       - .:/usr/src/app
