@@ -15,7 +15,9 @@ const (
 	initialBoolEnvValue  = true
 )
 
-func unsetKeepaliveEnvs() {
+func reset() {
+	kcp, ksp, kep = nil, nil, nil
+
 	os.Unsetenv("OKTETO_KEEPALIVE_CLIENT_TIME_MS")
 	os.Unsetenv("OKTETO_KEEPALIVE_CLIENT_TIMEOUT_MS")
 	os.Unsetenv("OKTETO_KEEPALIVE_CLIENT_PERMIT_WITHOUT_STREAM")
@@ -98,6 +100,8 @@ func setInitialKeepaliveEnforcementPolicyEnvs(t *testing.T, initValues bool) {
 }
 
 func TestLoadKeepaliveParamsDefault(t *testing.T) {
+	t.Cleanup(reset)
+
 	kcp := LoadKeepaliveClientParams()
 	assert.Equal(t, kcp, keepalive.ClientParameters{})
 
@@ -109,7 +113,7 @@ func TestLoadKeepaliveParamsDefault(t *testing.T) {
 }
 
 func TestLoadKeepaliveParamsFromEnvs(t *testing.T) {
-	t.Cleanup(unsetKeepaliveEnvs)
+	t.Cleanup(reset)
 
 	setInitialKeepaliveClientEnvs(t, true)
 	kcp := LoadKeepaliveClientParams()
@@ -125,7 +129,7 @@ func TestLoadKeepaliveParamsFromEnvs(t *testing.T) {
 }
 
 func TestLoadKeepaliveParamsSingleton(t *testing.T) {
-	t.Cleanup(unsetKeepaliveEnvs)
+	t.Cleanup(reset)
 
 	setInitialKeepaliveClientEnvs(t, true)
 	_ = LoadKeepaliveClientParams()
