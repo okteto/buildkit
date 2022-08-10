@@ -40,6 +40,7 @@ import (
 	dockerfile "github.com/moby/buildkit/frontend/dockerfile/builder"
 	"github.com/moby/buildkit/frontend/gateway"
 	"github.com/moby/buildkit/frontend/gateway/forwarder"
+	"github.com/moby/buildkit/okteto"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver/bboltcachestorage"
 	"github.com/moby/buildkit/util/apicaps"
@@ -256,6 +257,11 @@ func main() {
 		}
 
 		opts := []grpc.ServerOption{grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream)}
+
+		opts = append(opts, grpc.KeepaliveEnforcementPolicy(okteto.LoadKeepaliveEnforcementPolicy()))
+
+		opts = append(opts, grpc.KeepaliveParams(okteto.LoadKeepaliveServerParams()))
+
 		server := grpc.NewServer(opts...)
 
 		// relative path does not work with nightlyone/lockfile

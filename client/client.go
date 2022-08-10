@@ -13,6 +13,7 @@ import (
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client/connhelper"
+	"github.com/moby/buildkit/okteto"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/grpchijack"
 	"github.com/moby/buildkit/util/appdefaults"
@@ -144,6 +145,8 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 	} else if len(stream) > 1 {
 		gopts = append(gopts, grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(stream...)))
 	}
+
+	gopts = append(gopts, grpc.WithKeepaliveParams(okteto.LoadKeepaliveClientParams()))
 
 	conn, err := grpc.DialContext(ctx, address, gopts...)
 	if err != nil {

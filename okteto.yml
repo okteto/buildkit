@@ -1,4 +1,6 @@
 name: buildkit
+context: ${OKTETO_DEV_CLUSTER}
+namespace: okteto
 
 # The build section defines how to build the images of your development environment
 # More info: https://www.okteto.com/docs/reference/manifest/#build
@@ -19,8 +21,8 @@ name: buildkit
 dev:
   buildkit:
     selector:
-        app.kubernetes.io/component: buildkit
-        app.kubernetes.io/part-of: okteto
+      app.kubernetes.io/component: buildkit
+      app.kubernetes.io/part-of: okteto
     image: okteto/dev:latest
     command: bash
     securityContext:
@@ -28,8 +30,8 @@ dev:
         add:
           - SYS_PTRACE
     volumes:
-    - /go/pkg/
-    - /root/.cache/go-build/
+      - /go/pkg/
+      - /root/.cache/go-build/
     workdir: /usr/src/app
     sync:
       - .:/usr/src/app
