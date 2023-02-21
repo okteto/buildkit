@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile-upstream:master
 
-ARG RUNC_VERSION=v1.0.2
-ARG CONTAINERD_VERSION=v1.6.2
+ARG RUNC_VERSION=v1.1.4
+ARG CONTAINERD_VERSION=v1.6.18
 # containerd v1.5 for integration tests
 ARG CONTAINERD_ALT_VERSION_15=v1.5.11
 # containerd v1.4 for integration tests
@@ -13,7 +13,9 @@ ARG ROOTLESSKIT_VERSION=v0.14.6
 ARG CNI_VERSION=v1.1.0
 ARG STARGZ_SNAPSHOTTER_VERSION=v0.11.3
 
-ARG ALPINE_VERSION=3.15
+ARG ALPINE_VERSION=3.17
+ARG TONISTIIGI_ALPINE_VERSION=3.15
+ARG GOLANG_VERSION=1.19.6-alpine
 
 # git stage is used for checking out remote repository sources
 FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS git
@@ -22,7 +24,7 @@ RUN apk add --no-cache git
 # xx is a helper for cross-compilation
 FROM --platform=$BUILDPLATFORM tonistiigi/xx@sha256:1e96844fadaa2f9aea021b2b05299bc02fe4c39a92d8e735b93e8e2b15610128 AS xx
 
-FROM --platform=$BUILDPLATFORM golang:1.17-alpine AS golatest
+FROM --platform=$BUILDPLATFORM golang:${GOLANG_VERSION} AS golatest
 
 # gobuild is base stage for compiling go/cgo
 FROM golatest AS gobuild-base
@@ -108,7 +110,13 @@ FROM scratch AS release
 COPY --link --from=releaser /out/ /
 
 # tonistiigi/alpine supports riscv64
-FROM tonistiigi/alpine:${ALPINE_VERSION} AS buildkit-export
+# FROM tonistiigi/alpine:${TONISTIIGI_ALPINE_VERSION} AS buildkit-export
+# RUN apk add --no-cache fuse3 git openssh pigz xz \
+#   && ln -s fusermount3 /usr/bin/fusermount
+# COPY --link examples/buildctl-daemonless/buildctl-daemonless.sh /usr/bin/
+# VOLUME /var/lib/buildkit
+
+FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS buildkit-export
 RUN apk add --no-cache fuse3 git openssh pigz xz \
   && ln -s fusermount3 /usr/bin/fusermount
 COPY --link examples/buildctl-daemonless/buildctl-daemonless.sh /usr/bin/
@@ -256,7 +264,7 @@ FROM integration-tests AS dev-env
 VOLUME /var/lib/buildkit
 
 # Rootless mode.
-FROM tonistiigi/alpine:${ALPINE_VERSION} AS rootless
+FROM tonistiigi/alpine:${TONISTIIGI_ALPINE_VERSION} AS rootless
 RUN apk add --no-cache fuse3 fuse-overlayfs git openssh pigz shadow-uidmap xz
 RUN adduser -D -u 1000 user \
   && mkdir -p /run/user/1000 /home/user/.local/tmp /home/user/.local/share/buildkit \
