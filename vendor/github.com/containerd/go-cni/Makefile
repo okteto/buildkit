@@ -31,10 +31,12 @@ help: ## this help
 test: ## run tests, except integration tests and tests that require root
 	$(Q)go test -v -race $(EXTRA_TESTFLAGS) -count=1 ./...
 
-integration: bin/integration.test ## run integration test
+integration: ## run integration test
 	$(Q)bin/integration.test -test.v -test.count=1 -test.root $(EXTRA_TESTFLAGS) -test.parallel $(TESTFLAGS_PARALLEL)
 
-bin/integration.test: ## build integration test binary into bin
+FORCE:
+
+bin/integration.test: FORCE ## build integration test binary into bin
 	$(Q)cd ./integration && go test -race -c . -o ../bin/integration.test
 
 clean: ## clean up binaries
