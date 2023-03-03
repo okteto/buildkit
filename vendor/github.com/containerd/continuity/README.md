@@ -1,20 +1,19 @@
 # continuity
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/containerd/continuity.svg)](https://pkg.go.dev/github.com/containerd/continuity)
-[![Build Status](https://github.com/containerd/continuity/workflows/Continuity/badge.svg)](https://github.com/containerd/continuity/actions?query=workflow%3AContinuity+branch%3Amain)
+[![GoDoc](https://godoc.org/github.com/containerd/continuity?status.svg)](https://godoc.org/github.com/containerd/continuity)
+[![Build Status](https://travis-ci.org/containerd/continuity.svg?branch=main)](https://travis-ci.org/containerd/continuity)
 
 A transport-agnostic, filesystem metadata manifest system
 
 This project is a staging area for experiments in providing transport agnostic
 metadata storage.
 
-See [opencontainers/runtime-spec#11](https://github.com/opencontainers/runtime-spec/issues/11)
-for more details.
+Please see https://github.com/opencontainers/specs/issues/11 for more details.
 
 ## Manifest Format
 
 A continuity manifest encodes filesystem metadata in Protocol Buffers.
-Refer to [proto/manifest.proto](proto/manifest.proto) for more details.
+Please refer to [proto/manifest.proto](proto/manifest.proto).
 
 ## Usage
 
@@ -66,7 +65,7 @@ $ ./bin/continuity verify . /tmp/a.pb
 
 ## Platforms
 
-continuity primarily targets Linux. Continuity may compile for and work on
+continuity primarily targets Linux.  continuity may compile for and work on
 other operating systems, but those platforms are not tested.
 
 ## Contribution Guide

@@ -1,7 +1,6 @@
 syntax = "proto3";
 
 package proto;
-option go_package = "github.com/containerd/continuity/proto;proto";
 
 // Manifest specifies the entries in a container bundle, keyed and sorted by
 // path.

@@ -18,6 +18,7 @@ package fstest
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 
 	"github.com/containerd/continuity"
@@ -56,7 +57,7 @@ func CheckDirectoryEqual(d1, d2 string) error {
 
 // CheckDirectoryEqualWithApplier compares directory against applier
 func CheckDirectoryEqualWithApplier(root string, a Applier) error {
-	applied, err := os.MkdirTemp("", "fstest")
+	applied, err := ioutil.TempDir("", "fstest")
 	if err != nil {
 		return err
 	}

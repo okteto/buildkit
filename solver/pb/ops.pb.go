@@ -154,7 +154,6 @@ type Op struct {
 	// inputs is a set of input edges.
 	Inputs []*Input `protobuf:"bytes,1,rep,name=inputs,proto3" json:"inputs,omitempty"`
 	// Types that are valid to be assigned to Op:
-	//
 	//	*Op_Exec
 	//	*Op_Source
 	//	*Op_File
@@ -1949,7 +1948,6 @@ type FileAction struct {
 	SecondaryInput InputIndex  `protobuf:"varint,2,opt,name=secondaryInput,proto3,customtype=InputIndex" json:"secondaryInput"`
 	Output         OutputIndex `protobuf:"varint,3,opt,name=output,proto3,customtype=OutputIndex" json:"output"`
 	// Types that are valid to be assigned to Action:
-	//
 	//	*FileAction_Copy
 	//	*FileAction_Mkfile
 	//	*FileAction_Mkdir
@@ -2467,7 +2465,6 @@ func (m *ChownOpt) GetGroup() *UserOpt {
 
 type UserOpt struct {
 	// Types that are valid to be assigned to User:
-	//
 	//	*UserOpt_ByName
 	//	*UserOpt_ByID
 	User isUserOpt_User `protobuf_oneof:"user"`
