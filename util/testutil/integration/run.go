@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -23,7 +22,6 @@ import (
 	"github.com/moby/buildkit/util/contentutil"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/semaphore"
 )
@@ -47,7 +45,9 @@ type Sandbox interface {
 
 	Context() context.Context
 	Cmd(...string) *exec.Cmd
+	Logs() map[string]*bytes.Buffer
 	PrintLogs(*testing.T)
+	ClearLogs()
 	NewRegistry() (string, error)
 	Value(string) interface{} // chosen matrix value
 	Name() string
@@ -62,6 +62,7 @@ type BackendConfig struct {
 type Worker interface {
 	New(context.Context, *BackendConfig) (Backend, func() error, error)
 	Name() string
+	Rootless() bool
 }
 
 type ConfigUpdater interface {
@@ -89,8 +90,14 @@ func (f testFunc) Run(t *testing.T, sb Sandbox) {
 
 func TestFuncs(funcs ...func(t *testing.T, sb Sandbox)) []Test {
 	var tests []Test
+	names := map[string]struct{}{}
 	for _, f := range funcs {
-		tests = append(tests, testFunc{name: getFunctionName(f), run: f})
+		name := getFunctionName(f)
+		if _, ok := names[name]; ok {
+			panic("duplicate test: " + name)
+		}
+		names[name] = struct{}{}
+		tests = append(tests, testFunc{name: name, run: f})
 	}
 	return tests
 }
@@ -151,27 +158,14 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 	mirror, cleanup, err := runMirror(t, tc.mirroredImages)
 	require.NoError(t, err)
 
-	var mu sync.Mutex
-	var count int
-	cleanOnComplete := func() func() {
-		count++
-		return func() {
-			mu.Lock()
-			count--
-			if count == 0 {
-				cleanup()
-			}
-			mu.Unlock()
-		}
-	}
-	defer cleanOnComplete()()
+	t.Cleanup(func() { _ = cleanup() })
 
 	matrix := prepareValueMatrix(tc)
 
 	list := List()
 	if os.Getenv("BUILDKIT_WORKER_RANDOM") == "1" && len(list) > 0 {
-		rand.Seed(time.Now().UnixNano())
-		list = []Worker{list[rand.Intn(len(list))]}
+		rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // using math/rand is fine in a test utility
+		list = []Worker{list[rng.Intn(len(list))]}
 	}
 
 	for _, br := range list {
@@ -181,9 +175,11 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 				name := fn + "/worker=" + br.Name() + mv.functionSuffix()
 				func(fn, testName string, br Worker, tc Test, mv matrixValue) {
 					ok := t.Run(testName, func(t *testing.T) {
+						if strings.Contains(fn, "NoRootless") && br.Rootless() {
+							// skip sandbox setup
+							t.Skip("rootless")
+						}
 						ctx := appcontext.Context()
-
-						defer cleanOnComplete()()
 						if !strings.HasSuffix(fn, "NoParallel") {
 							t.Parallel()
 						}
@@ -192,8 +188,8 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 
 						sb, closer, err := newSandbox(ctx, br, mirror, mv)
 						require.NoError(t, err)
+						t.Cleanup(func() { _ = closer() })
 						defer func() {
-							assert.NoError(t, closer())
 							if t.Failed() {
 								sb.PrintLogs(t)
 							}
@@ -210,7 +206,7 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 func getFunctionName(i interface{}) string {
 	fullname := runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
 	dot := strings.LastIndex(fullname, ".") + 1
-	return strings.Title(fullname[dot:])
+	return strings.Title(fullname[dot:]) //nolint:staticcheck // ignoring "SA1019: strings.Title is deprecated", as for our use we don't need full unicode support
 }
 
 var localImageCache map[string]map[string]struct{}
@@ -269,12 +265,18 @@ func OfficialImages(names ...string) map[string]string {
 	ns := runtime.GOARCH
 	if ns == "arm64" {
 		ns = "arm64v8"
-	} else if ns != "amd64" && ns != "armhf" {
+	} else if ns != "amd64" {
 		ns = "library"
 	}
 	m := map[string]string{}
 	for _, name := range names {
-		m["library/"+name] = "docker.io/" + ns + "/" + name
+		ref := "docker.io/" + ns + "/" + name
+		if pns, ok := pins[name]; ok {
+			if dgst, ok := pns[ns]; ok {
+				ref += "@" + dgst
+			}
+		}
+		m["library/"+name] = ref
 	}
 	return m
 }
@@ -318,6 +320,9 @@ func runMirror(t *testing.T, mirroredImages map[string]string) (host string, _ f
 
 	var lock *flock.Flock
 	if mirrorDir != "" {
+		if err := os.MkdirAll(mirrorDir, 0700); err != nil {
+			return "", nil, err
+		}
 		lock = flock.New(filepath.Join(mirrorDir, "lock"))
 		if err := lock.Lock(); err != nil {
 			return "", nil, err

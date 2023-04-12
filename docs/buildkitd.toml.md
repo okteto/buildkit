@@ -1,12 +1,5 @@
 # buildkitd.toml
 
-## NAME
-
-buildkitd.toml - configuration file for buildkitd
-
-
-## DESCRIPTION
-
 The TOML file used to configure the buildkitd daemon settings has a short
 list of global settings followed by a series of sections for specific areas
 of daemon configuration.
@@ -14,13 +7,11 @@ of daemon configuration.
 The file path is `/etc/buildkit/buildkitd.toml` for rootful mode,
 `~/.config/buildkit/buildkitd.toml` for rootless mode.
 
-## EXAMPLE
+The following is a complete `buildkitd.toml` configuration example, please
+note some configuration is only good for edge cases, please take care of it
+carefully.
 
-The following is a complete **buildkitd.toml** configuration example,
-please note some of the configuration is only good for edge cases, please
-take care of it carefully.
-
-```
+```toml
 debug = true
 # root is where all buildkit state is stored.
 root = "/var/lib/buildkit"
@@ -37,6 +28,13 @@ insecure-entitlements = [ "network.host", "security.insecure" ]
     cert = "/etc/buildkit/tls.crt"
     key = "/etc/buildkit/tls.key"
     ca = "/etc/buildkit/tlsca.crt"
+
+# config for build history API that stores information about completed build commands
+[history]
+  # maxAge is the maximum age of history entries to keep, in seconds.
+  maxAge = 172800
+  # maxEntries is the maximum number of history entries to keep.
+  maxEntries = 50
 
 [worker.oci]
   enabled = true
@@ -57,6 +55,9 @@ insecure-entitlements = [ "network.host", "security.insecure" ]
   apparmor-profile = ""
   # limit the number of parallel build steps that can run at the same time
   max-parallelism = 4
+  # maintain a pool of reusable CNI network namespaces to amortize the overhead
+  # of allocating and releasing the namespaces
+  cniPoolSize = 16
 
   [worker.oci.labels]
     "foo" = "bar"
@@ -77,6 +78,10 @@ insecure-entitlements = [ "network.host", "security.insecure" ]
   gc = true
   # gckeepstorage sets storage limit for default gc profile, in MB.
   gckeepstorage = 9000
+  # maintain a pool of reusable CNI network namespaces to amortize the overhead
+  # of allocating and releasing the namespaces
+  cniPoolSize = 16
+
   [worker.containerd.labels]
     "foo" = "bar"
 
@@ -90,14 +95,15 @@ insecure-entitlements = [ "network.host", "security.insecure" ]
 
 # registry configures a new Docker register used for cache import or output.
 [registry."docker.io"]
-  mirrors = ["yourmirror.local:5000"]
+  # mirror configuration to handle path in case a mirror registry requires a /project path rather than just a host:port
+  mirrors = ["yourmirror.local:5000", "core.harbor.domain/proxy.docker.io"]
   http = true
   insecure = true
   ca=["/etc/config/myca.pem"]
   [[registry."docker.io".keypair]]
     key="/etc/config/key.pem"
     cert="/etc/config/cert.pem"
-    
+
 # optionally mirror configuration can be done by defining it as a registry.
 [registry."yourmirror.local:5000"]
   http = true

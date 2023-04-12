@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/tracing"
@@ -21,13 +23,12 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	actionscache "github.com/tonistiigi/go-actions-cache"
 	"golang.org/x/sync/errgroup"
 )
 
 func init() {
-	actionscache.Log = logrus.Debugf
+	actionscache.Log = bklog.L.Debugf
 }
 
 const (
@@ -90,6 +91,10 @@ func NewExporter(c *Config) (remotecache.Exporter, error) {
 	return &exporter{CacheExporterTarget: cc, chains: cc, cache: cache, config: c}, nil
 }
 
+func (*exporter) Name() string {
+	return "exporting to GitHub Actions Cache"
+}
+
 func (ce *exporter) Config() remotecache.Config {
 	return remotecache.Config{
 		Compression: compression.New(compression.Default),
@@ -144,7 +149,7 @@ func (ce *exporter) Finalize(ctx context.Context) (map[string]string, error) {
 			return nil, err
 		}
 		if b == nil {
-			layerDone := oneOffProgress(ctx, fmt.Sprintf("writing layer %s", l.Blob))
+			layerDone := progress.OneOff(ctx, fmt.Sprintf("writing layer %s", l.Blob))
 			ra, err := dgstPair.Provider.ReaderAt(ctx, dgstPair.Descriptor)
 			if err != nil {
 				return nil, layerDone(err)
@@ -367,22 +372,13 @@ type readerAt struct {
 	desc ocispecs.Descriptor
 }
 
-func (r *readerAt) Size() int64 {
-	return r.desc.Size
+func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= r.desc.Size {
+		return 0, io.EOF
+	}
+	return r.ReaderAtCloser.ReadAt(p, off)
 }
 
-func oneOffProgress(ctx context.Context, id string) func(err error) error {
-	pw, _, _ := progress.NewFromContext(ctx)
-	now := time.Now()
-	st := progress.Status{
-		Started: &now,
-	}
-	pw.Write(id, st)
-	return func(err error) error {
-		now := time.Now()
-		st.Completed = &now
-		pw.Write(id, st)
-		pw.Close()
-		return err
-	}
+func (r *readerAt) Size() int64 {
+	return r.desc.Size
 }

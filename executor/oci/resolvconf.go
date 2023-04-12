@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 
 	"github.com/docker/docker/libnetwork/resolvconf"
-	"github.com/docker/docker/libnetwork/types"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/pkg/errors"
@@ -17,7 +16,7 @@ var notFirstRun bool
 var lastNotEmpty bool
 
 // overridden by tests
-var resolvconfGet = resolvconf.Get
+var resolvconfPath = resolvconf.Path
 
 type DNSConfig struct {
 	Nameservers   []string
@@ -40,7 +39,7 @@ func GetResolvConf(ctx context.Context, stateDir string, idmap *idtools.Identity
 				generate = true
 			}
 			if !generate {
-				fiMain, err := os.Stat(resolvconf.Path())
+				fiMain, err := os.Stat(resolvconfPath())
 				if err != nil {
 					if !errors.Is(err, os.ErrNotExist) {
 						return nil, err
@@ -61,33 +60,30 @@ func GetResolvConf(ctx context.Context, stateDir string, idmap *idtools.Identity
 			return "", nil
 		}
 
-		var dt []byte
-		f, err := resolvconfGet()
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				return "", err
-			}
-		} else {
-			dt = f.Content
+		dt, err := os.ReadFile(resolvconfPath())
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", err
 		}
 
+		var f *resolvconf.File
+		tmpPath := p + ".tmp"
 		if dns != nil {
 			var (
-				dnsNameservers   = resolvconf.GetNameservers(dt, types.IP)
-				dnsSearchDomains = resolvconf.GetSearchDomains(dt)
-				dnsOptions       = resolvconf.GetOptions(dt)
-			)
-			if len(dns.Nameservers) > 0 {
-				dnsNameservers = dns.Nameservers
-			}
-			if len(dns.SearchDomains) > 0 {
+				dnsNameservers   = dns.Nameservers
 				dnsSearchDomains = dns.SearchDomains
+				dnsOptions       = dns.Options
+			)
+			if len(dns.Nameservers) == 0 {
+				dnsNameservers = resolvconf.GetNameservers(dt, resolvconf.IP)
 			}
-			if len(dns.Options) > 0 {
-				dnsOptions = dns.Options
+			if len(dns.SearchDomains) == 0 {
+				dnsSearchDomains = resolvconf.GetSearchDomains(dt)
+			}
+			if len(dns.Options) == 0 {
+				dnsOptions = resolvconf.GetOptions(dt)
 			}
 
-			f, err = resolvconf.Build(p+".tmp", dnsNameservers, dnsSearchDomains, dnsOptions)
+			f, err = resolvconf.Build(tmpPath, dnsNameservers, dnsSearchDomains, dnsOptions)
 			if err != nil {
 				return "", err
 			}
@@ -99,7 +95,6 @@ func GetResolvConf(ctx context.Context, stateDir string, idmap *idtools.Identity
 			return "", err
 		}
 
-		tmpPath := p + ".tmp"
 		if err := os.WriteFile(tmpPath, f.Content, 0644); err != nil {
 			return "", err
 		}

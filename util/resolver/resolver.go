@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -15,6 +16,10 @@ import (
 	"github.com/moby/buildkit/util/resolver/config"
 	"github.com/moby/buildkit/util/tracing"
 	"github.com/pkg/errors"
+)
+
+const (
+	defaultPath = "/v2"
 )
 
 func fillInsecureOpts(host string, c config.RegistryConfig, h docker.RegistryHost) ([]docker.RegistryHost, error) {
@@ -126,14 +131,7 @@ func NewRegistryConfig(m map[string]config.RegistryConfig) docker.RegistryHosts 
 			var out []docker.RegistryHost
 
 			for _, mirror := range c.Mirrors {
-				h := docker.RegistryHost{
-					Scheme:       "https",
-					Client:       newDefaultClient(),
-					Host:         mirror,
-					Path:         "/v2",
-					Capabilities: docker.HostCapabilityPull | docker.HostCapabilityResolve,
-				}
-
+				h := newMirrorRegistryHost(mirror)
 				hosts, err := fillInsecureOpts(mirror, m[mirror], h)
 				if err != nil {
 					return nil, err
@@ -169,6 +167,20 @@ func NewRegistryConfig(m map[string]config.RegistryConfig) docker.RegistryHosts 
 	)
 }
 
+func newMirrorRegistryHost(mirror string) docker.RegistryHost {
+	mirrorHost, mirrorPath := extractMirrorHostAndPath(mirror)
+	path := path.Join(defaultPath, mirrorPath)
+	h := docker.RegistryHost{
+		Scheme:       "https",
+		Client:       newDefaultClient(),
+		Host:         mirrorHost,
+		Path:         path,
+		Capabilities: docker.HostCapabilityPull | docker.HostCapabilityResolve,
+	}
+
+	return h
+}
+
 func newDefaultClient() *http.Client {
 	return &http.Client{
 		Transport: tracing.NewTransport(newDefaultTransport()),
@@ -194,6 +206,7 @@ func newDefaultTransport() *http.Transport {
 		MaxIdleConnsPerHost:   4,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 5 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
 		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 	}
 }

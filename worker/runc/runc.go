@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/containerd/containerd/content/local"
 	"github.com/containerd/containerd/diff/apply"
@@ -20,8 +21,8 @@ import (
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/util/winlayers"
-	"github.com/moby/buildkit/worker"
 	"github.com/moby/buildkit/worker/base"
+	wlabel "github.com/moby/buildkit/worker/label"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sync/semaphore"
@@ -34,7 +35,7 @@ type SnapshotterFactory struct {
 }
 
 // NewWorkerOpt creates a WorkerOpt.
-func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, processMode oci.ProcessMode, labels map[string]string, idmap *idtools.IdentityMapping, nopt netproviders.Opt, dns *oci.DNSConfig, binary, apparmorProfile string, parallelismSem *semaphore.Weighted, traceSocket, defaultCgroupParent string) (base.WorkerOpt, error) {
+func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, processMode oci.ProcessMode, labels map[string]string, idmap *idtools.IdentityMapping, nopt netproviders.Opt, dns *oci.DNSConfig, binary, apparmorProfile string, selinux bool, parallelismSem *semaphore.Weighted, traceSocket, defaultCgroupParent string) (base.WorkerOpt, error) {
 	var opt base.WorkerOpt
 	name := "runc-" + snFactory.Name
 	root = filepath.Join(root, name)
@@ -65,6 +66,7 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		IdentityMapping:     idmap,
 		DNS:                 dns,
 		ApparmorProfile:     apparmorProfile,
+		SELinux:             selinux,
 		TracingSocket:       traceSocket,
 		DefaultCgroupParent: defaultCgroupParent,
 	}, np)
@@ -104,14 +106,15 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		hostname = "unknown"
 	}
 	xlabels := map[string]string{
-		worker.LabelExecutor:       "oci",
-		worker.LabelSnapshotter:    snFactory.Name,
-		worker.LabelHostname:       hostname,
-		worker.LabelNetwork:        npResolvedMode,
-		worker.LabelOCIProcessMode: processMode.String(),
+		wlabel.Executor:       "oci",
+		wlabel.Snapshotter:    snFactory.Name,
+		wlabel.Hostname:       hostname,
+		wlabel.Network:        npResolvedMode,
+		wlabel.OCIProcessMode: processMode.String(),
+		wlabel.SELinuxEnabled: strconv.FormatBool(selinux),
 	}
 	if apparmorProfile != "" {
-		xlabels[worker.LabelApparmorProfile] = apparmorProfile
+		xlabels[wlabel.ApparmorProfile] = apparmorProfile
 	}
 
 	for k, v := range labels {
@@ -137,21 +140,22 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 	}
 
 	opt = base.WorkerOpt{
-		ID:              id,
-		Labels:          xlabels,
-		MetadataStore:   md,
-		Executor:        exe,
-		Snapshotter:     snap,
-		ContentStore:    c,
-		Applier:         winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c)),
-		Differ:          winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c)),
-		ImageStore:      nil, // explicitly
-		Platforms:       []ocispecs.Platform{platforms.Normalize(platforms.DefaultSpec())},
-		IdentityMapping: idmap,
-		LeaseManager:    lm,
-		GarbageCollect:  mdb.GarbageCollect,
-		ParallelismSem:  parallelismSem,
-		MountPoolRoot:   filepath.Join(root, "cachemounts"),
+		ID:               id,
+		Labels:           xlabels,
+		MetadataStore:    md,
+		NetworkProviders: np,
+		Executor:         exe,
+		Snapshotter:      snap,
+		ContentStore:     c,
+		Applier:          winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c)),
+		Differ:           winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c)),
+		ImageStore:       nil, // explicitly
+		Platforms:        []ocispecs.Platform{platforms.Normalize(platforms.DefaultSpec())},
+		IdentityMapping:  idmap,
+		LeaseManager:     lm,
+		GarbageCollect:   mdb.GarbageCollect,
+		ParallelismSem:   parallelismSem,
+		MountPoolRoot:    filepath.Join(root, "cachemounts"),
 	}
 	return opt, nil
 }

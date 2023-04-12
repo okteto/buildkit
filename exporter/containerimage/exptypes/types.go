@@ -11,9 +11,16 @@ const (
 	ExporterImageConfigDigestKey = "containerimage.config.digest"
 	ExporterImageDescriptorKey   = "containerimage.descriptor"
 	ExporterInlineCache          = "containerimage.inlinecache"
-	ExporterBuildInfo            = "containerimage.buildinfo"
 	ExporterPlatformsKey         = "refs.platforms"
+	ExporterEpochKey             = "source.date.epoch"
 )
+
+// KnownRefMetadataKeys are the subset of exporter keys that can be suffixed by
+// a platform to become platform specific
+var KnownRefMetadataKeys = []string{
+	ExporterImageConfigKey,
+	ExporterInlineCache,
+}
 
 type Platforms struct {
 	Platforms []Platform

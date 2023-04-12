@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func RunCacheStorageTests(t *testing.T, st func() (solver.CacheKeyStorage, func())) {
+func RunCacheStorageTests(t *testing.T, st func() solver.CacheKeyStorage) {
 	for _, tc := range []func(*testing.T, solver.CacheKeyStorage){
 		testResults,
 		testLinks,
@@ -27,11 +27,9 @@ func RunCacheStorageTests(t *testing.T, st func() (solver.CacheKeyStorage, func(
 	}
 }
 
-func runStorageTest(t *testing.T, fn func(t *testing.T, st solver.CacheKeyStorage), st func() (solver.CacheKeyStorage, func())) {
+func runStorageTest(t *testing.T, fn func(t *testing.T, st solver.CacheKeyStorage), st func() solver.CacheKeyStorage) {
 	require.True(t, t.Run(getFunctionName(fn), func(t *testing.T) {
-		s, cleanup := st()
-		defer cleanup()
-		fn(t, s)
+		fn(t, st())
 	}))
 }
 
@@ -387,7 +385,7 @@ func testWalkIDsByResult(t *testing.T, st solver.CacheKeyStorage) {
 func getFunctionName(i interface{}) string {
 	fullname := runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
 	dot := strings.LastIndex(fullname, ".") + 1
-	return strings.Title(fullname[dot:])
+	return strings.Title(fullname[dot:]) //nolint:staticcheck // ignoring "SA1019: strings.Title is deprecated", as for our use we don't need full unicode support
 }
 
 func rootKey(dgst digest.Digest, output solver.Index) digest.Digest {

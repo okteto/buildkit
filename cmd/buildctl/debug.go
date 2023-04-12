@@ -12,5 +12,11 @@ var debugCommand = cli.Command{
 		debug.DumpLLBCommand,
 		debug.DumpMetadataCommand,
 		debug.WorkersCommand,
+		debug.InfoCommand,
+		debug.MonitorCommand,
+		debug.LogsCommand,
+		debug.CtlCommand,
+		debug.GetCommand,
+		debug.HistoriesCommand,
 	},
 }

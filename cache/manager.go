@@ -27,7 +27,6 @@ import (
 	imagespecidentity "github.com/opencontainers/image-spec/identity"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -222,10 +221,8 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 
 	id := identity.NewID()
 	snapshotID := chainID.String()
-	blobOnly := true
 	if link != nil {
 		snapshotID = link.getSnapshotID()
-		blobOnly = link.getBlobOnly()
 		go link.Release(context.TODO())
 	}
 
@@ -245,7 +242,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
 				ID: l.ID,
 			}); err != nil {
-				logrus.Errorf("failed to remove lease: %+v", err)
+				bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
 			}
 		}
 	}()
@@ -289,7 +286,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 	rec.queueChainID(chainID)
 	rec.queueBlobChainID(blobChainID)
 	rec.queueSnapshotID(snapshotID)
-	rec.queueBlobOnly(blobOnly)
+	rec.queueBlobOnly(true)
 	rec.queueMediaType(desc.MediaType)
 	rec.queueBlobSize(desc.Size)
 	rec.appendURLs(desc.URLs)
@@ -301,7 +298,14 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 
 	cm.records[id] = rec
 
-	return rec.ref(true, descHandlers, nil), nil
+	ref := rec.ref(true, descHandlers, nil)
+	if s := unlazySessionOf(opts...); s != nil {
+		if err := ref.unlazy(ctx, ref.descHandlers, ref.progress, s, true); err != nil {
+			return nil, err
+		}
+	}
+
+	return ref, nil
 }
 
 // init loads all snapshots from metadata state and tries to load the records
@@ -314,7 +318,7 @@ func (cm *cacheManager) init(ctx context.Context) error {
 
 	for _, si := range items {
 		if _, err := cm.getRecord(ctx, si.ID()); err != nil {
-			logrus.Debugf("could not load snapshot %s: %+v", si.ID(), err)
+			bklog.G(ctx).Debugf("could not load snapshot %s: %+v", si.ID(), err)
 			cm.MetadataStore.Clear(si.ID())
 			cm.LeaseManager.Delete(ctx, leases.Lease{ID: si.ID()})
 		}
@@ -458,6 +462,13 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 		cacheMetadata: md,
 	}
 
+	// TODO:(sipsma) this is kludge to deal with a bug in v0.10.{0,1} where
+	// merge and diff refs didn't have committed set to true:
+	// https://github.com/moby/buildkit/issues/2740
+	if kind := rec.kind(); kind == Merge || kind == Diff {
+		rec.mutable = false
+	}
+
 	// the record was deleted but we crashed before data on disk was removed
 	if md.getDeleted() {
 		if err := rec.remove(ctx, true); err != nil {
@@ -496,6 +507,11 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 }
 
 func (cm *cacheManager) parentsOf(ctx context.Context, md *cacheMetadata, opts ...RefOption) (ps parentRefs, rerr error) {
+	defer func() {
+		if rerr != nil {
+			ps.release(context.TODO())
+		}
+	}()
 	if parentID := md.getParent(); parentID != "" {
 		p, err := cm.get(ctx, parentID, nil, append(opts, NoUpdateLastUsed))
 		if err != nil {
@@ -580,7 +596,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
 				ID: l.ID,
 			}); err != nil {
-				logrus.Errorf("failed to remove lease: %+v", err)
+				bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
 			}
 		}
 	}()
@@ -794,7 +810,7 @@ func (cm *cacheManager) createMergeRef(ctx context.Context, parents parentRefs, 
 	}
 
 	rec.queueSnapshotID(snapshotID)
-
+	rec.queueCommitted(true)
 	if err := rec.commitMetadata(); err != nil {
 		return nil, err
 	}
@@ -969,6 +985,7 @@ func (cm *cacheManager) createDiffRef(ctx context.Context, parents parentRefs, d
 	}
 
 	rec.queueSnapshotID(snapshotID)
+	rec.queueCommitted(true)
 	if err := rec.commitMetadata(); err != nil {
 		return nil, err
 	}

@@ -32,6 +32,7 @@ type textMux struct {
 	last      map[string]lastStatus
 	notFirst  bool
 	nextIndex int
+	desc      string
 }
 
 func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
@@ -63,6 +64,9 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 		if p.notFirst {
 			fmt.Fprintln(p.w, "")
 		} else {
+			if p.desc != "" {
+				fmt.Fprintf(p.w, "#0 %s\n\n", p.desc)
+			}
 			p.notFirst = true
 		}
 
@@ -170,10 +174,10 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 		p.current = ""
 		v.count = 0
 
+		if v.logsPartial {
+			fmt.Fprintln(p.w, "")
+		}
 		if v.Error != "" {
-			if v.logsPartial {
-				fmt.Fprintln(p.w, "")
-			}
 			if strings.HasSuffix(v.Error, context.Canceled.Error()) {
 				fmt.Fprintf(p.w, "#%d CANCELED\n", v.index)
 			} else {
@@ -256,7 +260,7 @@ func (p *textMux) print(t *trace) {
 		}
 		// make any open vertex active
 		for dgst, v := range t.byDigest {
-			if v.isStarted() && !v.isCompleted() {
+			if v.isStarted() && !v.isCompleted() && v.ProgressGroup == nil && !v.hidden {
 				p.printVtx(t, dgst)
 				return
 			}
@@ -279,6 +283,10 @@ func (p *textMux) print(t *trace) {
 	for dgst := range rest {
 		v, ok := t.byDigest[dgst]
 		if !ok {
+			continue
+		}
+		if v.lastBlockTime == nil {
+			// shouldn't happen, but not worth crashing over
 			continue
 		}
 		tm := now.Sub(*v.lastBlockTime)

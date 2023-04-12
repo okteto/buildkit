@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 func InitContainerdWorker() {
@@ -45,7 +45,7 @@ func InitContainerdWorker() {
 	if s := os.Getenv("BUILDKIT_INTEGRATION_ROOTLESS_IDPAIR"); s != "" {
 		var uid, gid int
 		if _, err := fmt.Sscanf(s, "%d:%d", &uid, &gid); err != nil {
-			logrus.Fatalf("unexpected BUILDKIT_INTEGRATION_ROOTLESS_IDPAIR: %q", s)
+			bklog.L.Fatalf("unexpected BUILDKIT_INTEGRATION_ROOTLESS_IDPAIR: %q", s)
 		}
 		if rootlessSupported(uid) {
 			Register(&containerd{
@@ -78,6 +78,10 @@ type containerd struct {
 
 func (c *containerd) Name() string {
 	return c.name
+}
+
+func (c *containerd) Rootless() bool {
+	return c.uid != 0
 }
 
 func (c *containerd) New(ctx context.Context, cfg *BackendConfig) (b Backend, cl func() error, err error) {
@@ -164,11 +168,17 @@ disabled_plugins = ["cri"]
 	containerdArgs := []string{c.containerd, "--config", configFile}
 	rootlessKitState := filepath.Join(tmpdir, "rootlesskit-containerd")
 	if rootless {
-		containerdArgs = append([]string{"sudo", "-u", fmt.Sprintf("#%d", c.uid), "-i", "--", "exec",
-			"rootlesskit", "--copy-up=/run", "--state-dir", rootlessKitState}, containerdArgs...)
+		containerdArgs = append(append([]string{"sudo", "-u", fmt.Sprintf("#%d", c.uid), "-i",
+			fmt.Sprintf("CONTAINERD_ROOTLESS_ROOTLESSKIT_STATE_DIR=%s", rootlessKitState),
+			// Integration test requires the access to localhost of the host network namespace.
+			// TODO: remove these configurations
+			"CONTAINERD_ROOTLESS_ROOTLESSKIT_NET=host",
+			"CONTAINERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=none",
+			"CONTAINERD_ROOTLESS_ROOTLESSKIT_FLAGS=--mtu=0",
+		}, c.extraEnv...), "containerd-rootless.sh", "-c", configFile)
 	}
 
-	cmd := exec.Command(containerdArgs[0], containerdArgs[1:]...)
+	cmd := exec.Command(containerdArgs[0], containerdArgs[1:]...) //nolint:gosec // test utility
 	cmd.Env = append(os.Environ(), c.extraEnv...)
 
 	ctdStop, err := startCmd(cmd, cfg.Logs)

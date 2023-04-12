@@ -4,8 +4,8 @@ import (
 	"strings"
 
 	"github.com/docker/docker/pkg/idtools"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 func parseIdentityMapping(str string) (*idtools.IdentityMapping, error) {
@@ -20,11 +20,11 @@ func parseIdentityMapping(str string) (*idtools.IdentityMapping, error) {
 
 	username := idparts[0]
 
-	logrus.Debugf("user namespaces: ID ranges will be mapped to subuid ranges of: %s", username)
+	bklog.L.Debugf("user namespaces: ID ranges will be mapped to subuid ranges of: %s", username)
 
-	mappings, err := idtools.NewIdentityMapping(username)
+	mappings, err := idtools.LoadIdentityMapping(username)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create ID mappings")
 	}
-	return mappings, nil
+	return &mappings, nil
 }

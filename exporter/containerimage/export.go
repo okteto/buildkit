@@ -14,8 +14,10 @@ import (
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/rootfs"
+	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	"github.com/moby/buildkit/cache"
 	cacheconfig "github.com/moby/buildkit/cache/config"
 	"github.com/moby/buildkit/exporter"
@@ -25,32 +27,27 @@ import (
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/push"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 const (
-	keyImageName        = "name"
-	keyPush             = "push"
-	keyPushByDigest     = "push-by-digest"
-	keyInsecure         = "registry.insecure"
-	keyUnpack           = "unpack"
-	keyDanglingPrefix   = "dangling-name-prefix"
-	keyNameCanonical    = "name-canonical"
-	keyLayerCompression = "compression"
-	keyForceCompression = "force-compression"
-	keyCompressionLevel = "compression-level"
-	keyBuildInfo        = "buildinfo"
-	keyBuildInfoAttrs   = "buildinfo-attrs"
-	ociTypes            = "oci-mediatypes"
-	// preferNondistLayersKey is an exporter option which can be used to mark a layer as non-distributable if the layer reference was
-	// already found to use a non-distributable media type.
-	// When this option is not set, the exporter will change the media type of the layer to a distributable one.
-	preferNondistLayersKey = "prefer-nondist-layers"
+	keyPush           = "push"
+	keyPushByDigest   = "push-by-digest"
+	keyInsecure       = "registry.insecure"
+	keyUnpack         = "unpack"
+	keyDanglingPrefix = "dangling-name-prefix"
+	keyNameCanonical  = "name-canonical"
+	keyStore          = "store"
+
+	// keyUnsafeInternalStoreAllowIncomplete should only be used for tests. This option allows exporting image to the image store
+	// as well as lacking some blobs in the content store. Some integration tests for lazyref behaviour depends on this option.
+	// Ignored when store=false.
+	keyUnsafeInternalStoreAllowIncomplete = "unsafe-internal-store-allow-incomplete"
 )
 
 type Opt struct {
@@ -76,16 +73,23 @@ func New(opt Opt) (exporter.Exporter, error) {
 
 func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exporter.ExporterInstance, error) {
 	i := &imageExporterInstance{
-		imageExporter:    e,
-		layerCompression: compression.Default,
-		buildInfo:        true,
+		imageExporter: e,
+		opts: ImageCommitOpts{
+			RefCfg: cacheconfig.RefConfig{
+				Compression: compression.New(compression.Default),
+			},
+			ForceInlineAttestations: true,
+		},
+		store: true,
 	}
 
-	var esgz bool
+	opt, err := i.opts.Load(ctx, opt)
+	if err != nil {
+		return nil, err
+	}
+
 	for k, v := range opt {
 		switch k {
-		case keyImageName:
-			i.targetName = v
 		case keyPush:
 			if v == "" {
 				i.push = true
@@ -126,16 +130,26 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
 			}
 			i.unpack = b
-		case ociTypes:
+		case keyStore:
 			if v == "" {
-				i.ociTypes = true
+				i.store = true
 				continue
 			}
 			b, err := strconv.ParseBool(v)
 			if err != nil {
 				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
 			}
-			i.ociTypes = b
+			i.store = b
+		case keyUnsafeInternalStoreAllowIncomplete:
+			if v == "" {
+				i.storeAllowIncomplete = true
+				continue
+			}
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
+			}
+			i.storeAllowIncomplete = b
 		case keyDanglingPrefix:
 			i.danglingPrefix = v
 		case keyNameCanonical:
@@ -148,63 +162,6 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
 			}
 			i.nameCanonical = b
-		case keyLayerCompression:
-			switch v {
-			case "gzip":
-				i.layerCompression = compression.Gzip
-			case "estargz":
-				i.layerCompression = compression.EStargz
-				esgz = true
-			case "zstd":
-				i.layerCompression = compression.Zstd
-			case "uncompressed":
-				i.layerCompression = compression.Uncompressed
-			default:
-				return nil, errors.Errorf("unsupported layer compression type: %v", v)
-			}
-		case keyForceCompression:
-			if v == "" {
-				i.forceCompression = true
-				continue
-			}
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "non-bool value %s specified for %s", v, k)
-			}
-			i.forceCompression = b
-		case keyCompressionLevel:
-			ii, err := strconv.ParseInt(v, 10, 64)
-			if err != nil {
-				return nil, errors.Wrapf(err, "non-integer value %s specified for %s", v, k)
-			}
-			v := int(ii)
-			i.compressionLevel = &v
-		case keyBuildInfo:
-			if v == "" {
-				i.buildInfo = true
-				continue
-			}
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
-			}
-			i.buildInfo = b
-		case keyBuildInfoAttrs:
-			if v == "" {
-				i.buildInfoAttrs = false
-				continue
-			}
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
-			}
-			i.buildInfoAttrs = b
-		case preferNondistLayersKey:
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "non-bool value %s specified for %s", v, k)
-			}
-			i.preferNondistLayers = b
 		default:
 			if i.meta == nil {
 				i.meta = make(map[string][]byte)
@@ -212,51 +169,32 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 			i.meta[k] = []byte(v)
 		}
 	}
-	if esgz && !i.ociTypes {
-		logrus.Warn("forcibly turning on oci-mediatype mode for estargz")
-		i.ociTypes = true
-	}
 	return i, nil
 }
 
 type imageExporterInstance struct {
 	*imageExporter
-	targetName          string
-	push                bool
-	pushByDigest        bool
-	unpack              bool
-	insecure            bool
-	ociTypes            bool
-	nameCanonical       bool
-	danglingPrefix      string
-	layerCompression    compression.Type
-	forceCompression    bool
-	compressionLevel    *int
-	buildInfo           bool
-	buildInfoAttrs      bool
-	meta                map[string][]byte
-	preferNondistLayers bool
+	opts                 ImageCommitOpts
+	push                 bool
+	pushByDigest         bool
+	unpack               bool
+	store                bool
+	storeAllowIncomplete bool
+	insecure             bool
+	nameCanonical        bool
+	danglingPrefix       string
+	meta                 map[string][]byte
 }
 
 func (e *imageExporterInstance) Name() string {
 	return "exporting to image"
 }
 
-func (e *imageExporterInstance) Config() exporter.Config {
-	return exporter.Config{
-		Compression: e.compression(),
-	}
+func (e *imageExporterInstance) Config() *exporter.Config {
+	return exporter.NewConfigWithCompression(e.opts.RefCfg.Compression)
 }
 
-func (e *imageExporterInstance) compression() compression.Config {
-	c := compression.New(e.layerCompression).SetForce(e.forceCompression)
-	if e.compressionLevel != nil {
-		c = c.SetLevel(*e.compressionLevel)
-	}
-	return c
-}
-
-func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source, sessionID string) (map[string]string, error) {
+func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source, sessionID string) (_ map[string]string, descref exporter.DescriptorReference, err error) {
 	if src.Metadata == nil {
 		src.Metadata = make(map[string][]byte)
 	}
@@ -264,39 +202,50 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 		src.Metadata[k] = v
 	}
 
+	opts := e.opts
+	as, _, err := ParseAnnotations(src.Metadata)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts.Annotations = opts.Annotations.Merge(as)
+
 	ctx, done, err := leaseutil.WithLease(ctx, e.opt.LeaseManager, leaseutil.MakeTemporary)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer done(context.TODO())
-
-	refCfg := e.refCfg()
-	desc, err := e.opt.ImageWriter.Commit(ctx, src, e.ociTypes, refCfg, e.buildInfo, e.buildInfoAttrs, sessionID)
-	if err != nil {
-		return nil, err
-	}
-
 	defer func() {
-		e.opt.ImageWriter.ContentStore().Delete(context.TODO(), desc.Digest)
+		if descref == nil {
+			done(context.TODO())
+		}
+	}()
+
+	desc, err := e.opt.ImageWriter.Commit(ctx, src, sessionID, &opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if err == nil {
+			descref = NewDescriptorReference(*desc, done)
+		}
 	}()
 
 	resp := make(map[string]string)
 
-	if n, ok := src.Metadata["image.name"]; e.targetName == "*" && ok {
-		e.targetName = string(n)
+	if n, ok := src.Metadata["image.name"]; e.opts.ImageName == "*" && ok {
+		e.opts.ImageName = string(n)
 	}
 
 	nameCanonical := e.nameCanonical
-	if e.targetName == "" && e.danglingPrefix != "" {
-		e.targetName = e.danglingPrefix + "@" + desc.Digest.String()
+	if e.opts.ImageName == "" && e.danglingPrefix != "" {
+		e.opts.ImageName = e.danglingPrefix + "@" + desc.Digest.String()
 		nameCanonical = false
 	}
 
-	if e.targetName != "" {
-		targetNames := strings.Split(e.targetName, ",")
+	if e.opts.ImageName != "" {
+		targetNames := strings.Split(e.opts.ImageName, ",")
 		for _, targetName := range targetNames {
-			if e.opt.Images != nil {
-				tagDone := oneOffProgress(ctx, "naming to "+targetName)
+			if e.opt.Images != nil && e.store {
+				tagDone := progress.OneOff(ctx, "naming to "+targetName)
 				img := images.Image{
 					Target:    *desc,
 					CreatedAt: time.Now(),
@@ -309,56 +258,59 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 					img.Name = targetName + sfx
 					if _, err := e.opt.Images.Update(ctx, img); err != nil {
 						if !errors.Is(err, errdefs.ErrNotFound) {
-							return nil, tagDone(err)
+							return nil, nil, tagDone(err)
 						}
 
 						if _, err := e.opt.Images.Create(ctx, img); err != nil {
-							return nil, tagDone(err)
+							return nil, nil, tagDone(err)
 						}
 					}
 				}
 				tagDone(nil)
 
-				if e.unpack {
+				if src.Ref != nil && e.unpack {
 					if err := e.unpackImage(ctx, img, src, session.NewGroup(sessionID)); err != nil {
-						return nil, err
+						return nil, nil, err
+					}
+				}
+
+				if !e.storeAllowIncomplete {
+					if src.Ref != nil {
+						remotes, err := src.Ref.GetRemotes(ctx, false, e.opts.RefCfg, false, session.NewGroup(sessionID))
+						if err != nil {
+							return nil, nil, err
+						}
+						remote := remotes[0]
+						if unlazier, ok := remote.Provider.(cache.Unlazier); ok {
+							if err := unlazier.Unlazy(ctx); err != nil {
+								return nil, nil, err
+							}
+						}
+					}
+					if len(src.Refs) > 0 {
+						for _, r := range src.Refs {
+							remotes, err := r.GetRemotes(ctx, false, e.opts.RefCfg, false, session.NewGroup(sessionID))
+							if err != nil {
+								return nil, nil, err
+							}
+							remote := remotes[0]
+							if unlazier, ok := remote.Provider.(cache.Unlazier); ok {
+								if err := unlazier.Unlazy(ctx); err != nil {
+									return nil, nil, err
+								}
+							}
+						}
 					}
 				}
 			}
 			if e.push {
-				annotations := map[digest.Digest]map[string]string{}
-				mprovider := contentutil.NewMultiProvider(e.opt.ImageWriter.ContentStore())
-				if src.Ref != nil {
-					remotes, err := src.Ref.GetRemotes(ctx, false, refCfg, false, session.NewGroup(sessionID))
-					if err != nil {
-						return nil, err
-					}
-					remote := remotes[0]
-					for _, desc := range remote.Descriptors {
-						mprovider.Add(desc.Digest, remote.Provider)
-						addAnnotations(annotations, desc)
-					}
-				}
-				if len(src.Refs) > 0 {
-					for _, r := range src.Refs {
-						remotes, err := r.GetRemotes(ctx, false, refCfg, false, session.NewGroup(sessionID))
-						if err != nil {
-							return nil, err
-						}
-						remote := remotes[0]
-						for _, desc := range remote.Descriptors {
-							mprovider.Add(desc.Digest, remote.Provider)
-							addAnnotations(annotations, desc)
-						}
-					}
-				}
-
-				if err := push.Push(ctx, e.opt.SessionManager, sessionID, mprovider, e.opt.ImageWriter.ContentStore(), desc.Digest, targetName, e.insecure, e.opt.RegistryHosts, e.pushByDigest, annotations); err != nil {
-					return nil, err
+				err := e.pushImage(ctx, src, sessionID, targetName, desc.Digest)
+				if err != nil {
+					return nil, nil, errors.Wrapf(err, "failed to push %v", targetName)
 				}
 			}
 		}
-		resp["image.name"] = e.targetName
+		resp["image.name"] = e.opts.ImageName
 	}
 
 	resp[exptypes.ExporterImageDigestKey] = desc.Digest.String()
@@ -369,22 +321,47 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 
 	dtdesc, err := json.Marshal(desc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resp[exptypes.ExporterImageDescriptorKey] = base64.StdEncoding.EncodeToString(dtdesc)
 
-	return resp, nil
+	return resp, nil, nil
 }
 
-func (e *imageExporterInstance) refCfg() cacheconfig.RefConfig {
-	return cacheconfig.RefConfig{
-		Compression:            e.compression(),
-		PreferNonDistributable: e.preferNondistLayers,
+func (e *imageExporterInstance) pushImage(ctx context.Context, src *exporter.Source, sessionID string, targetName string, dgst digest.Digest) error {
+	annotations := map[digest.Digest]map[string]string{}
+	mprovider := contentutil.NewMultiProvider(e.opt.ImageWriter.ContentStore())
+	if src.Ref != nil {
+		remotes, err := src.Ref.GetRemotes(ctx, false, e.opts.RefCfg, false, session.NewGroup(sessionID))
+		if err != nil {
+			return err
+		}
+		remote := remotes[0]
+		for _, desc := range remote.Descriptors {
+			mprovider.Add(desc.Digest, remote.Provider)
+			addAnnotations(annotations, desc)
+		}
 	}
+	if len(src.Refs) > 0 {
+		for _, r := range src.Refs {
+			remotes, err := r.GetRemotes(ctx, false, e.opts.RefCfg, false, session.NewGroup(sessionID))
+			if err != nil {
+				return err
+			}
+			remote := remotes[0]
+			for _, desc := range remote.Descriptors {
+				mprovider.Add(desc.Digest, remote.Provider)
+				addAnnotations(annotations, desc)
+			}
+		}
+	}
+
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, intoto.PayloadType, "intoto")
+	return push.Push(ctx, e.opt.SessionManager, sessionID, mprovider, e.opt.ImageWriter.ContentStore(), dgst, targetName, e.insecure, e.opt.RegistryHosts, e.pushByDigest, annotations)
 }
 
-func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Image, src exporter.Source, s session.Group) (err0 error) {
-	unpackDone := oneOffProgress(ctx, "unpacking to "+img.Name)
+func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Image, src *exporter.Source, s session.Group) (err0 error) {
+	unpackDone := progress.OneOff(ctx, "unpacking to "+img.Name)
 	defer func() {
 		unpackDone(err0)
 	}()
@@ -403,14 +380,14 @@ func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Imag
 
 	topLayerRef := src.Ref
 	if len(src.Refs) > 0 {
-		if r, ok := src.Refs[platforms.DefaultString()]; ok {
+		if r, ok := src.Refs[defaultPlatform()]; ok {
 			topLayerRef = r
 		} else {
-			return errors.Errorf("no reference for default platform %s", platforms.DefaultString())
+			return errors.Errorf("no reference for default platform %s", defaultPlatform())
 		}
 	}
 
-	remotes, err := topLayerRef.GetRemotes(ctx, true, e.refCfg(), false, s)
+	remotes, err := topLayerRef.GetRemotes(ctx, true, e.opts.RefCfg, false, s)
 	if err != nil {
 		return err
 	}
@@ -481,4 +458,30 @@ func addAnnotations(m map[digest.Digest]map[string]string, desc ocispecs.Descrip
 	for k, v := range desc.Annotations {
 		a[k] = v
 	}
+}
+
+func defaultPlatform() string {
+	// Use normalized platform string to avoid the mismatch with platform options which
+	// are normalized using platforms.Normalize()
+	return platforms.Format(platforms.Normalize(platforms.DefaultSpec()))
+}
+
+func NewDescriptorReference(desc ocispecs.Descriptor, release func(context.Context) error) exporter.DescriptorReference {
+	return &descriptorReference{
+		desc:    desc,
+		release: release,
+	}
+}
+
+type descriptorReference struct {
+	desc    ocispecs.Descriptor
+	release func(context.Context) error
+}
+
+func (d *descriptorReference) Descriptor() ocispecs.Descriptor {
+	return d.desc
+}
+
+func (d *descriptorReference) Release() error {
+	return d.release(context.TODO())
 }

@@ -2,8 +2,10 @@ package worker
 
 import (
 	"context"
+	"io"
 
 	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/leases"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
@@ -17,10 +19,12 @@ import (
 )
 
 type Worker interface {
+	io.Closer
 	// ID needs to be unique in the cluster
 	ID() string
 	Labels() map[string]string
 	Platforms(noCache bool) []ocispecs.Platform
+	BuildkitVersion() client.BuildkitVersion
 
 	GCPolicy() []client.PruneInfo
 	LoadRef(ctx context.Context, id string, hidden bool) (cache.ImmutableRef, error)
@@ -35,22 +39,10 @@ type Worker interface {
 	ContentStore() content.Store
 	Executor() executor.Executor
 	CacheManager() cache.Manager
+	LeaseManager() leases.Manager
 }
 
 type Infos interface {
 	GetDefault() (Worker, error)
 	WorkerInfos() []client.WorkerInfo
 }
-
-// Pre-defined label keys
-const (
-	labelPrefix              = "org.mobyproject.buildkit.worker."
-	LabelExecutor            = labelPrefix + "executor"    // "oci" or "containerd"
-	LabelSnapshotter         = labelPrefix + "snapshotter" // containerd snapshotter name ("overlay", "native", ...)
-	LabelHostname            = labelPrefix + "hostname"
-	LabelNetwork             = labelPrefix + "network" // "cni" or "host"
-	LabelApparmorProfile     = labelPrefix + "apparmor.profile"
-	LabelOCIProcessMode      = labelPrefix + "oci.process-mode"     // OCI worker: process mode ("sandbox", "no-sandbox")
-	LabelContainerdUUID      = labelPrefix + "containerd.uuid"      // containerd worker: containerd UUID
-	LabelContainerdNamespace = labelPrefix + "containerd.namespace" // containerd worker: containerd namespace
-)

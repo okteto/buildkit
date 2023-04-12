@@ -4,22 +4,28 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/containerd/continuity"
+	"github.com/docker/cli/cli/config"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/cmd/buildctl/build"
 	bccommon "github.com/moby/buildkit/cmd/buildctl/common"
+	gateway "github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/buildkit/solver/pb"
+	spb "github.com/moby/buildkit/sourcepolicy/pb"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/progress/progresswriter"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"golang.org/x/sync/errgroup"
 )
@@ -39,16 +45,6 @@ var buildCommand = cli.Command{
 			Usage: "Define exports for build result, e.g. --output type=image,name=docker.io/username/image,push=true",
 		},
 		cli.StringFlag{
-			Name:   "exporter",
-			Usage:  "Define exporter for build result (DEPRECATED: use --export type=<type>[,<opt>=<optval>]",
-			Hidden: true,
-		},
-		cli.StringSliceFlag{
-			Name:   "exporter-opt",
-			Usage:  "Define custom options for exporter (DEPRECATED: use --output type=<type>[,<opt>=<optval>]",
-			Hidden: true,
-		},
-		cli.StringFlag{
 			Name:  "progress",
 			Usage: "Set type of progress (auto, plain, tty). Use plain to show container output",
 			Value: "auto",
@@ -61,6 +57,10 @@ var buildCommand = cli.Command{
 			Name:  "local",
 			Usage: "Allow build access to the local directory",
 		},
+		cli.StringSliceFlag{
+			Name:  "oci-layout",
+			Usage: "Allow build access to the local OCI layout",
+		},
 		cli.StringFlag{
 			Name:  "frontend",
 			Usage: "Define frontend used for build",
@@ -69,11 +69,6 @@ var buildCommand = cli.Command{
 			Name:  "opt",
 			Usage: "Define custom options for frontend, e.g. --opt target=foo --opt build-arg:foo=bar",
 		},
-		cli.StringSliceFlag{
-			Name:   "frontend-opt",
-			Usage:  "Define custom options for frontend, e.g. --frontend-opt target=foo --frontend-opt build-arg:foo=bar (DEPRECATED: use --opt)",
-			Hidden: true,
-		},
 		cli.BoolFlag{
 			Name:  "no-cache",
 			Usage: "Disable cache for all the vertices",
@@ -81,11 +76,6 @@ var buildCommand = cli.Command{
 		cli.StringSliceFlag{
 			Name:  "export-cache",
 			Usage: "Export build cache, e.g. --export-cache type=registry,ref=example.com/foo/bar, or --export-cache type=local,dest=path/to/dir",
-		},
-		cli.StringSliceFlag{
-			Name:   "export-cache-opt",
-			Usage:  "Define custom options for cache exporting (DEPRECATED: use --export-cache type=<type>,<opt>=<optval>[,<opt>=<optval>]",
-			Hidden: true,
 		},
 		cli.StringSliceFlag{
 			Name:  "import-cache",
@@ -106,6 +96,14 @@ var buildCommand = cli.Command{
 		cli.StringFlag{
 			Name:  "metadata-file",
 			Usage: "Output build metadata (e.g., image digest) to a file as JSON",
+		},
+		cli.StringFlag{
+			Name:  "source-policy-file",
+			Usage: "Read source policy file from a JSON file",
+		},
+		cli.StringFlag{
+			Name:  "ref-file",
+			Usage: "Write build ref to a file",
 		},
 	},
 }
@@ -156,10 +154,11 @@ func buildAction(clicontext *cli.Context) error {
 		defer traceFile.Close()
 		traceEnc = json.NewEncoder(traceFile)
 
-		logrus.Infof("tracing logs to %s", traceFile.Name())
+		bklog.L.Infof("tracing logs to %s", traceFile.Name())
 	}
 
-	attachable := []session.Attachable{authprovider.NewDockerAuthProvider(os.Stderr)}
+	dockerConfig := config.LoadDefaultConfigFile(os.Stderr)
+	attachable := []session.Attachable{authprovider.NewDockerAuthProvider(dockerConfig)}
 
 	if ssh := clicontext.StringSlice("ssh"); len(ssh) > 0 {
 		configs, err := build.ParseSSH(ssh)
@@ -186,21 +185,12 @@ func buildAction(clicontext *cli.Context) error {
 		return err
 	}
 
-	var exports []client.ExportEntry
-	if legacyExporter := clicontext.String("exporter"); legacyExporter != "" {
-		logrus.Warnf("--exporter <exporter> is deprecated. Please use --output type=<exporter>[,<opt>=<optval>] instead.")
-		if len(clicontext.StringSlice("output")) > 0 {
-			return errors.New("--exporter cannot be used with --output")
-		}
-		exports, err = build.ParseLegacyExporter(clicontext.String("exporter"), clicontext.StringSlice("exporter-opt"))
-	} else {
-		exports, err = build.ParseOutput(clicontext.StringSlice("output"))
-	}
+	exports, err := build.ParseOutput(clicontext.StringSlice("output"))
 	if err != nil {
 		return err
 	}
 
-	cacheExports, err := build.ParseExportCache(clicontext.StringSlice("export-cache"), clicontext.StringSlice("export-cache-opt"))
+	cacheExports, err := build.ParseExportCache(clicontext.StringSlice("export-cache"))
 	if err != nil {
 		return err
 	}
@@ -209,20 +199,38 @@ func buildAction(clicontext *cli.Context) error {
 		return err
 	}
 
+	var srcPol *spb.Policy
+	if srcPolFile := clicontext.String("source-policy-file"); srcPolFile != "" {
+		b, err := os.ReadFile(srcPolFile)
+		if err != nil {
+			return err
+		}
+		var srcPolStruct spb.Policy
+		if err := json.Unmarshal(b, &srcPolStruct); err != nil {
+			return errors.Wrapf(err, "failed to unmarshal source-policy-file %q", srcPolFile)
+		}
+		srcPol = &srcPolStruct
+	}
+
 	eg, ctx := errgroup.WithContext(bccommon.CommandContext(clicontext))
+
+	ref := identity.NewID()
 
 	solveOpt := client.SolveOpt{
 		Exports: exports,
 		// LocalDirs is set later
 		Frontend: clicontext.String("frontend"),
 		// FrontendAttrs is set later
+		// OCILayouts is set later
 		CacheExports:        cacheExports,
 		CacheImports:        cacheImports,
 		Session:             attachable,
 		AllowedEntitlements: allowed,
+		SourcePolicy:        srcPol,
+		Ref:                 ref,
 	}
 
-	solveOpt.FrontendAttrs, err = build.ParseOpt(clicontext.StringSlice("opt"), clicontext.StringSlice("frontend-opt"))
+	solveOpt.FrontendAttrs, err = build.ParseOpt(clicontext.StringSlice("opt"))
 	if err != nil {
 		return errors.Wrap(err, "invalid opt")
 	}
@@ -230,6 +238,11 @@ func buildAction(clicontext *cli.Context) error {
 	solveOpt.LocalDirs, err = build.ParseLocal(clicontext.StringSlice("local"))
 	if err != nil {
 		return errors.Wrap(err, "invalid local")
+	}
+
+	solveOpt.OCIStores, err = build.ParseOCILayout(clicontext.StringSlice("oci-layout"))
+	if err != nil {
+		return errors.Wrap(err, "invalid oci-layout")
 	}
 
 	var def *llb.Definition
@@ -248,6 +261,13 @@ func buildAction(clicontext *cli.Context) error {
 		if clicontext.Bool("no-cache") {
 			solveOpt.FrontendAttrs["no-cache"] = ""
 		}
+	}
+
+	refFile := clicontext.String("ref-file")
+	if refFile != "" {
+		defer func() {
+			continuity.AtomicWriteFile(refFile, []byte(ref), 0666)
+		}()
 	}
 
 	// not using shared context to not disrupt display but let is finish reporting errors
@@ -283,18 +303,43 @@ func buildAction(clicontext *cli.Context) error {
 		}
 	}
 
+	var subMetadata map[string][]byte
+
 	eg.Go(func() error {
 		defer func() {
 			for _, w := range writers {
 				close(w.Status())
 			}
 		}()
-		resp, err := c.Solve(ctx, def, solveOpt, progresswriter.ResetTime(mw.WithPrefix("", false)).Status())
+
+		sreq := gateway.SolveRequest{
+			Frontend:    solveOpt.Frontend,
+			FrontendOpt: solveOpt.FrontendAttrs,
+		}
+		if def != nil {
+			sreq.Definition = def.ToPB()
+		}
+		resp, err := c.Build(ctx, solveOpt, "buildctl", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+			_, isSubRequest := sreq.FrontendOpt["requestid"]
+			if isSubRequest {
+				if _, ok := sreq.FrontendOpt["frontend.caps"]; !ok {
+					sreq.FrontendOpt["frontend.caps"] = "moby.buildkit.frontend.subrequests"
+				}
+			}
+			res, err := c.Solve(ctx, sreq)
+			if err != nil {
+				return nil, err
+			}
+			if isSubRequest && res != nil {
+				subMetadata = res.Metadata
+			}
+			return res, err
+		}, progresswriter.ResetTime(mw.WithPrefix("", false)).Status())
 		if err != nil {
 			return err
 		}
 		for k, v := range resp.ExporterResponse {
-			logrus.Debugf("exporter response: %s=%s", k, v)
+			bklog.G(ctx).Debugf("exporter response: %s=%s", k, v)
 		}
 
 		metadataFile := clicontext.String("metadata-file")
@@ -312,7 +357,20 @@ func buildAction(clicontext *cli.Context) error {
 		return pw.Err()
 	})
 
-	return eg.Wait()
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+
+	if txt, ok := subMetadata["result.txt"]; ok {
+		fmt.Print(string(txt))
+	} else {
+		for k, v := range subMetadata {
+			if strings.HasPrefix(k, "result.") {
+				fmt.Printf("%s\n%s\n", k, v)
+			}
+		}
+	}
+	return nil
 }
 
 func writeMetadataFile(filename string, exporterResponse map[string]string) error {

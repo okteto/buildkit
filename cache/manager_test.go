@@ -19,6 +19,7 @@ import (
 	"time"
 
 	ctdcompression "github.com/containerd/containerd/archive/compression"
+	"github.com/containerd/containerd/archive/tarheader"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/content/local"
 	"github.com/containerd/containerd/diff/apply"
@@ -42,6 +43,7 @@ import (
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
+	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/winlayers"
 	digest "github.com/opencontainers/go-digest"
@@ -64,7 +66,7 @@ type cmOut struct {
 	cs      content.Store
 }
 
-func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() error, err error) {
+func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, cleanup func(), err error) {
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
 		return nil, nil, errors.Errorf("namespace required for test")
@@ -74,31 +76,24 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 		opt.snapshotterName = "native"
 	}
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	if err != nil {
-		return nil, nil, err
-	}
+	tmpdir := t.TempDir()
 
 	defers := make([]func() error, 0)
-	cleanup = func() error {
+	cleanup = func() {
 		var err error
 		for i := range defers {
 			if err1 := defers[len(defers)-1-i](); err1 != nil && err == nil {
 				err = err1
 			}
 		}
-		return err
+		require.NoError(t, err)
 	}
 	defer func() {
 		if err != nil && cleanup != nil {
 			cleanup()
 		}
 	}()
-	if opt.tmpdir == "" {
-		defers = append(defers, func() error {
-			return os.RemoveAll(tmpdir)
-		})
-	} else {
+	if opt.tmpdir != "" {
 		os.RemoveAll(tmpdir)
 		tmpdir = opt.tmpdir
 	}
@@ -141,6 +136,9 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 	if err != nil {
 		return nil, nil, err
 	}
+	defers = append(defers, func() error {
+		return md.Close()
+	})
 
 	cm, err := NewManager(ManagerOpt{
 		Snapshotter:    snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
@@ -155,6 +153,10 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 	if err != nil {
 		return nil, nil, err
 	}
+	defers = append(defers, func() error {
+		return cm.Close()
+	})
+
 	return &cmOut{
 		manager: cm,
 		lm:      lm,
@@ -166,22 +168,20 @@ func TestSharableMountPoolCleanup(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Emulate the situation where the pool dir is dirty
 	mountPoolDir := filepath.Join(tmpdir, "cachemounts")
 	require.NoError(t, os.MkdirAll(mountPoolDir, 0700))
-	_, err = os.MkdirTemp(mountPoolDir, "buildkit")
+	_, err := os.MkdirTemp(mountPoolDir, "buildkit")
 	require.NoError(t, err)
 
 	// Initialize cache manager and check if pool is cleaned up
-	_, cleanup, err := newCacheManager(ctx, cmOpt{
+	_, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		tmpdir: tmpdir,
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	files, err := os.ReadDir(mountPoolDir)
 	require.NoError(t, err)
@@ -193,20 +193,21 @@ func TestManager(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
+	t.Cleanup(cleanup)
 
-	defer cleanup()
 	cm := co.manager
 
 	_, err = cm.Get(ctx, "foobar", nil)
@@ -325,19 +326,17 @@ func TestLazyGetByBlob(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	// Test for #2226 https://github.com/moby/buildkit/issues/2226, create lazy blobs with the same diff ID but
@@ -370,19 +369,17 @@ func TestMergeBlobchainID(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	// create a merge ref that has 3 inputs, with each input being a 3 layer blob chain
@@ -443,20 +440,17 @@ func TestSnapshotExtract(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	cm := co.manager
 
@@ -583,20 +577,17 @@ func TestExtractOnMutable(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	cm := co.manager
 
@@ -692,20 +683,20 @@ func TestSetBlob(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
 	require.NoError(t, err)
@@ -865,20 +856,21 @@ func TestPrune(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
+	t.Cleanup(cleanup)
 
-	defer cleanup()
 	cm := co.manager
 
 	active, err := cm.New(ctx, nil, nil)
@@ -976,14 +968,15 @@ func TestLazyCommit(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
@@ -1073,7 +1066,7 @@ func TestLazyCommit(t *testing.T) {
 	cleanup()
 
 	// we can't close snapshotter and open it twice (especially, its internal bbolt store)
-	co, cleanup, err = newCacheManager(ctx, cmOpt{
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
@@ -1102,13 +1095,13 @@ func TestLazyCommit(t *testing.T) {
 
 	cleanup()
 
-	co, cleanup, err = newCacheManager(ctx, cmOpt{
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm = co.manager
 
 	snap2, err = cm.Get(ctx, snap.ID(), nil)
@@ -1134,19 +1127,17 @@ func TestLoopLeaseContent(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
@@ -1251,19 +1242,17 @@ func TestSharingCompressionVariant(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	allCompressions := []compression.Type{compression.Uncompressed, compression.Gzip, compression.Zstd, compression.EStargz}
 
@@ -1358,7 +1347,7 @@ func testSharingCompressionVariant(ctx context.Context, t *testing.T, co *cmOut,
 			if err != nil {
 				return nil, "", err
 			}
-			return cw, testCase.a.DefaultMediaType(), nil
+			return cw, testCase.a.MediaType(), nil
 		})
 		require.NoError(t, err)
 		contentBuffer := contentutil.NewBuffer()
@@ -1399,9 +1388,9 @@ func testSharingCompressionVariant(ctx context.Context, t *testing.T, co *cmOut,
 
 		// check if all compression variables are available on the both refs
 		checkCompression := func(desc ocispecs.Descriptor, compressionType compression.Type) {
-			require.Equal(t, compressionType.DefaultMediaType(), desc.MediaType, "compression: %v", compressionType)
+			require.Equal(t, compressionType.MediaType(), desc.MediaType, "compression: %v", compressionType)
 			if compressionType == compression.EStargz {
-				ok, err := isEStargz(ctx, co.cs, desc.Digest)
+				ok, err := compression.EStargz.Is(ctx, co.cs, desc.Digest)
 				require.NoError(t, err, "compression: %v", compressionType)
 				require.True(t, ok, "compression: %v", compressionType)
 			}
@@ -1466,7 +1455,7 @@ func ensurePrune(ctx context.Context, t *testing.T, cm Manager, pruneNum, maxRet
 func getCompressor(w io.Writer, compressionType compression.Type, customized bool) (io.WriteCloser, error) {
 	switch compressionType {
 	case compression.Uncompressed:
-		return nil, fmt.Errorf("compression is not requested: %v", compressionType)
+		return nil, errors.Errorf("compression is not requested: %v", compressionType)
 	case compression.Gzip:
 		if customized {
 			gz, _ := gzip.NewWriterLevel(w, gzip.NoCompression)
@@ -1494,7 +1483,7 @@ func getCompressor(w io.Writer, compressionType compression.Type, customized boo
 			}
 			pr.Close()
 		}()
-		return &writeCloser{pw, func() error { <-done; return nil }}, nil
+		return &iohelper.WriteCloser{WriteCloser: pw, CloseFunc: func() error { <-done; return nil }}, nil
 	case compression.Zstd:
 		if customized {
 			skippableFrameMagic := []byte{0x50, 0x2a, 0x4d, 0x18}
@@ -1507,7 +1496,7 @@ func getCompressor(w io.Writer, compressionType compression.Type, customized boo
 		}
 		return zstd.NewWriter(w)
 	default:
-		return nil, fmt.Errorf("unknown compression type: %q", compressionType)
+		return nil, errors.Errorf("unknown compression type: %q", compressionType)
 	}
 }
 
@@ -1519,19 +1508,17 @@ func TestConversion(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	store := co.cs
 
 	// Preapre the original tar blob using archive/tar and tar command on the system
@@ -1546,7 +1533,7 @@ func TestConversion(t *testing.T) {
 	err = cw.Commit(ctx, 0, cw.Digest())
 	require.NoError(t, err)
 
-	orgBlobBytesSys, orgDescSys, err := mapToSystemTarBlob(m)
+	orgBlobBytesSys, orgDescSys, err := mapToSystemTarBlob(t, m)
 	require.NoError(t, err)
 	cw, err = store.Writer(ctx, content.WithRef(fmt.Sprintf("write-test-blob-%s", orgDescSys.Digest)))
 	require.NoError(t, err)
@@ -1616,19 +1603,17 @@ func TestGetRemotes(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
@@ -1784,7 +1769,7 @@ func TestGetRemotes(t *testing.T) {
 					r := refChain[i]
 					isLazy, err := r.isLazy(egctx)
 					require.NoError(t, err)
-					needs, err := needsConversion(ctx, co.cs, desc, compressionType)
+					needs, err := compressionType.NeedsConversion(ctx, co.cs, desc)
 					require.NoError(t, err)
 					if needs {
 						require.False(t, isLazy, "layer %q requires conversion so it must be unlazied", desc.Digest)
@@ -1916,19 +1901,17 @@ func TestNondistributableBlobs(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	cm := co.manager
 
@@ -2017,7 +2000,7 @@ func checkDescriptor(ctx context.Context, t *testing.T, cs content.Store, desc o
 	}
 
 	// Check annotation values are valid
-	c := new(counter)
+	c := new(iohelper.Counter)
 	ra, err := cs.ReaderAt(ctx, desc)
 	if err != nil && errdefs.IsNotFound(err) {
 		return // lazy layer
@@ -2032,7 +2015,7 @@ func checkDescriptor(ctx context.Context, t *testing.T, cs content.Store, desc o
 	require.NoError(t, err)
 	require.Equal(t, diffID.Digest().String(), uncompressedDgst)
 	if compressionType == compression.EStargz {
-		require.Equal(t, c.size(), uncompressedSize)
+		require.Equal(t, c.Size(), uncompressedSize)
 	}
 }
 
@@ -2047,19 +2030,17 @@ func TestMergeOp(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	emptyMerge, err := cm.Merge(ctx, nil, nil)
@@ -2091,6 +2072,7 @@ func TestMergeOp(t *testing.T) {
 
 	singleMerge, err := cm.Merge(ctx, baseRefs[:1], nil)
 	require.NoError(t, err)
+	require.True(t, singleMerge.(*immutableRef).getCommitted())
 	m, err := singleMerge.Mount(ctx, true, nil)
 	require.NoError(t, err)
 	ms, unmount, err := m.Mount()
@@ -2111,6 +2093,7 @@ func TestMergeOp(t *testing.T) {
 
 	merge1, err := cm.Merge(ctx, baseRefs[:3], nil)
 	require.NoError(t, err)
+	require.True(t, merge1.(*immutableRef).getCommitted())
 	_, err = merge1.Mount(ctx, true, nil)
 	require.NoError(t, err)
 	size1, err := merge1.(*immutableRef).size(ctx)
@@ -2120,6 +2103,7 @@ func TestMergeOp(t *testing.T) {
 
 	merge2, err := cm.Merge(ctx, baseRefs[3:], nil)
 	require.NoError(t, err)
+	require.True(t, merge2.(*immutableRef).getCommitted())
 	_, err = merge2.Mount(ctx, true, nil)
 	require.NoError(t, err)
 	size2, err := merge2.(*immutableRef).size(ctx)
@@ -2135,6 +2119,7 @@ func TestMergeOp(t *testing.T) {
 
 	merge3, err := cm.Merge(ctx, []ImmutableRef{merge1, merge2}, nil)
 	require.NoError(t, err)
+	require.True(t, merge3.(*immutableRef).getCommitted())
 	require.NoError(t, merge1.Release(ctx))
 	require.NoError(t, merge2.Release(ctx))
 	_, err = merge3.Mount(ctx, true, nil)
@@ -2163,19 +2148,17 @@ func TestDiffOp(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	newLower, err := cm.New(ctx, nil, nil)
@@ -2267,20 +2250,21 @@ func TestLoadHalfFinalizedRef(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager.(*cacheManager)
 
 	mref, err := cm.New(ctx, nil, nil, CachePolicyRetain)
@@ -2316,15 +2300,15 @@ func TestLoadHalfFinalizedRef(t *testing.T) {
 	require.NoError(t, iref.Release(ctx))
 
 	require.NoError(t, cm.Close())
-	require.NoError(t, cleanup())
+	cleanup()
 
-	co, cleanup, err = newCacheManager(ctx, cmOpt{
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm = co.manager.(*cacheManager)
 
 	_, err = cm.GetMutable(ctx, mutRef.ID())
@@ -2347,19 +2331,17 @@ func TestMountReadOnly(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "overlay",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	mutRef, err := cm.New(ctx, nil, nil)
@@ -2406,6 +2388,65 @@ func TestMountReadOnly(t *testing.T) {
 		mutRef, err = cm.New(ctx, immutRef, nil)
 		require.NoError(t, err)
 	}
+}
+
+func TestLoadBrokenParents(t *testing.T) {
+	// Test that a ref that has a parent that can't be loaded will not result in any leaks
+	// of other parent refs
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir := t.TempDir()
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager.(*cacheManager)
+
+	mutRef, err := cm.New(ctx, nil, nil)
+	require.NoError(t, err)
+	refA, err := mutRef.Commit(ctx)
+	require.NoError(t, err)
+	refAID := refA.ID()
+	mutRef, err = cm.New(ctx, nil, nil)
+	require.NoError(t, err)
+	refB, err := mutRef.Commit(ctx)
+	require.NoError(t, err)
+
+	_, err = cm.Merge(ctx, []ImmutableRef{refA, refB}, nil)
+	require.NoError(t, err)
+	checkDiskUsage(ctx, t, cm, 3, 0)
+
+	// set refB as deleted
+	require.NoError(t, refB.(*immutableRef).queueDeleted())
+	require.NoError(t, refB.(*immutableRef).commitMetadata())
+	require.NoError(t, cm.Close())
+	cleanup()
+
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm = co.manager.(*cacheManager)
+
+	checkDiskUsage(ctx, t, cm, 0, 1)
+	refA, err = cm.Get(ctx, refAID, nil)
+	require.NoError(t, err)
+	require.Len(t, refA.(*immutableRef).refs, 1)
 }
 
 func checkDiskUsage(ctx context.Context, t *testing.T, cm Manager, inuse, unused int) {
@@ -2557,7 +2598,7 @@ func fileToBlob(file *os.File, compress bool) ([]byte, ocispecs.Descriptor, erro
 		return nil, ocispecs.Descriptor{}, err
 	}
 
-	fi, err := tar.FileInfoHeader(info, "")
+	fi, err := tarheader.FileInfoHeaderNoLookups(info, "")
 	if err != nil {
 		return nil, ocispecs.Descriptor{}, err
 	}
@@ -2594,12 +2635,8 @@ func fileToBlob(file *os.File, compress bool) ([]byte, ocispecs.Descriptor, erro
 	}, nil
 }
 
-func mapToSystemTarBlob(m map[string]string) ([]byte, ocispecs.Descriptor, error) {
-	tmpdir, err := os.MkdirTemp("", "tarcreation")
-	if err != nil {
-		return nil, ocispecs.Descriptor{}, err
-	}
-	defer os.RemoveAll(tmpdir)
+func mapToSystemTarBlob(t *testing.T, m map[string]string) ([]byte, ocispecs.Descriptor, error) {
+	tmpdir := t.TempDir()
 
 	expected := map[string]string{}
 	for k, v := range m {

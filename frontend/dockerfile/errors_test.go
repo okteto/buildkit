@@ -2,12 +2,11 @@ package dockerfile
 
 import (
 	"fmt"
-	"os"
 	"testing"
 
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/frontend/dockerfile/builder"
+	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/stretchr/testify/require"
@@ -76,11 +75,11 @@ env bar=baz`,
 
 	for _, tc := range tcases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir, err := tmpdir(
+			dir, err := integration.Tmpdir(
+				t,
 				fstest.CreateFile("Dockerfile", []byte(tc.dockerfile), 0600),
 			)
 			require.NoError(t, err)
-			defer os.RemoveAll(dir)
 
 			c, err := client.New(sb.Context(), sb.Address())
 			require.NoError(t, err)
@@ -88,8 +87,8 @@ env bar=baz`,
 
 			_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 				LocalDirs: map[string]string{
-					builder.DefaultLocalNameDockerfile: dir,
-					builder.DefaultLocalNameContext:    dir,
+					dockerui.DefaultLocalNameDockerfile: dir,
+					dockerui.DefaultLocalNameContext:    dir,
 				},
 			}, nil)
 			require.Error(t, err)

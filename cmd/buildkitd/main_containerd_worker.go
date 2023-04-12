@@ -13,19 +13,18 @@ import (
 	ctd "github.com/containerd/containerd"
 	"github.com/containerd/containerd/pkg/userns"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/network/cniprovider"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/worker"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/containerd"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"golang.org/x/sync/semaphore"
 )
 
 const (
-	defaultContainerdAddress   = "/run/containerd/containerd.sock"
 	defaultContainerdNamespace = "buildkit"
 )
 
@@ -90,6 +89,11 @@ func init() {
 			Usage: "path of cni binary files",
 			Value: defaultConf.Workers.Containerd.NetworkConfig.CNIBinaryPath,
 		},
+		cli.IntFlag{
+			Name:  "containerd-cni-pool-size",
+			Usage: "size of cni network namespace pool",
+			Value: defaultConf.Workers.Containerd.NetworkConfig.CNIPoolSize,
+		},
 		cli.StringFlag{
 			Name:  "containerd-worker-snapshotter",
 			Usage: "snapshotter name to use",
@@ -98,6 +102,10 @@ func init() {
 		cli.StringFlag{
 			Name:  "containerd-worker-apparmor-profile",
 			Usage: "set the name of the apparmor profile applied to containers",
+		},
+		cli.BoolFlag{
+			Name:  "containerd-worker-selinux",
+			Usage: "apply SELinux labels",
 		},
 	}
 	n := "containerd-worker-rootless"
@@ -208,6 +216,9 @@ func applyContainerdFlags(c *cli.Context, cfg *config.Config) error {
 	if c.GlobalIsSet("containerd-cni-config-path") {
 		cfg.Workers.Containerd.NetworkConfig.CNIConfigPath = c.GlobalString("containerd-cni-config-path")
 	}
+	if c.GlobalIsSet("containerd-cni-pool-size") {
+		cfg.Workers.Containerd.NetworkConfig.CNIPoolSize = c.GlobalInt("containerd-cni-pool-size")
+	}
 	if c.GlobalIsSet("containerd-cni-binary-dir") {
 		cfg.Workers.Containerd.NetworkConfig.CNIBinaryPath = c.GlobalString("containerd-cni-binary-dir")
 	}
@@ -216,6 +227,9 @@ func applyContainerdFlags(c *cli.Context, cfg *config.Config) error {
 	}
 	if c.GlobalIsSet("containerd-worker-apparmor-profile") {
 		cfg.Workers.Containerd.ApparmorProfile = c.GlobalString("containerd-worker-apparmor-profile")
+	}
+	if c.GlobalIsSet("containerd-worker-selinux") {
+		cfg.Workers.Containerd.SELinux = c.GlobalBool("containerd-worker-selinux")
 	}
 
 	return nil
@@ -228,12 +242,12 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 
 	cfg := common.config.Workers.Containerd
 
-	if (cfg.Enabled == nil && !validContainerdSocket(cfg.Address)) || (cfg.Enabled != nil && !*cfg.Enabled) {
+	if (cfg.Enabled == nil && !validContainerdSocket(cfg)) || (cfg.Enabled != nil && !*cfg.Enabled) {
 		return nil, nil
 	}
 
 	if cfg.Rootless {
-		logrus.Debugf("running in rootless mode")
+		bklog.L.Debugf("running in rootless mode")
 		if common.config.Workers.Containerd.NetworkConfig.Mode == "auto" {
 			common.config.Workers.Containerd.NetworkConfig.Mode = "host"
 		}
@@ -247,6 +261,7 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 			Root:       common.config.Root,
 			ConfigPath: common.config.Workers.Containerd.CNIConfigPath,
 			BinaryDir:  common.config.Workers.Containerd.CNIBinaryPath,
+			PoolSize:   common.config.Workers.Containerd.CNIPoolSize,
 		},
 	}
 
@@ -259,11 +274,12 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 	if cfg.Snapshotter != "" {
 		snapshotter = cfg.Snapshotter
 	}
-	opt, err := containerd.NewWorkerOpt(common.config.Root, cfg.Address, snapshotter, cfg.Namespace, cfg.Rootless, cfg.Labels, dns, nc, common.config.Workers.Containerd.ApparmorProfile, parallelismSem, common.traceSocket, ctd.WithTimeout(60*time.Second))
+	opt, err := containerd.NewWorkerOpt(common.config.Root, cfg.Address, snapshotter, cfg.Namespace, cfg.Rootless, cfg.Labels, dns, nc, common.config.Workers.Containerd.ApparmorProfile, common.config.Workers.Containerd.SELinux, parallelismSem, common.traceSocket, ctd.WithTimeout(60*time.Second))
 	if err != nil {
 		return nil, err
 	}
 	opt.GCPolicy = getGCPolicy(cfg.GCConfig, common.config.Root)
+	opt.BuildkitVersion = getBuildkitVersion()
 	opt.RegistryHosts = resolverFunc(common.config)
 
 	if platformsStr := cfg.Platforms; len(platformsStr) != 0 {
@@ -280,7 +296,8 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 	return []worker.Worker{w}, nil
 }
 
-func validContainerdSocket(socket string) bool {
+func validContainerdSocket(cfg config.ContainerdConfig) bool {
+	socket := cfg.Address
 	if strings.HasPrefix(socket, "tcp://") {
 		// FIXME(AkihiroSuda): prohibit tcp?
 		return true
@@ -288,9 +305,17 @@ func validContainerdSocket(socket string) bool {
 	socketPath := strings.TrimPrefix(socket, "unix://")
 	if _, err := os.Stat(socketPath); errors.Is(err, os.ErrNotExist) {
 		// FIXME(AkihiroSuda): add more conditions
-		logrus.Warnf("skipping containerd worker, as %q does not exist", socketPath)
+		bklog.L.Warnf("skipping containerd worker, as %q does not exist", socketPath)
 		return false
 	}
-	// TODO: actually dial and call introspection API
+	c, err := ctd.New(socketPath, ctd.WithDefaultNamespace(cfg.Namespace))
+	if err != nil {
+		bklog.L.Warnf("skipping containerd worker, as failed to connect client to %q: %v", socketPath, err)
+		return false
+	}
+	if _, err := c.Server(context.Background()); err != nil {
+		bklog.L.Warnf("skipping containerd worker, as failed to call introspection API on %q: %v", socketPath, err)
+		return false
+	}
 	return true
 }

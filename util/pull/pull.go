@@ -10,14 +10,13 @@ import (
 	"github.com/containerd/containerd/reference"
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/containerd/remotes/docker/schema1"
+	"github.com/containerd/containerd/remotes/docker/schema1" //nolint:staticcheck // SA1019 deprecated
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/imageutil"
 	"github.com/moby/buildkit/util/progress/logs"
 	"github.com/moby/buildkit/util/pull/pullprogress"
-	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/util/resolver/limited"
 	"github.com/moby/buildkit/util/resolver/retryhandler"
 	digest "github.com/opencontainers/go-digest"
@@ -25,9 +24,11 @@ import (
 	"github.com/pkg/errors"
 )
 
+type SessionResolver func(g session.Group) remotes.Resolver
+
 type Puller struct {
 	ContentStore content.Store
-	Resolver     *resolver.Resolver
+	Resolver     remotes.Resolver
 	Src          reference.Spec
 	Platform     ocispecs.Platform
 
@@ -90,6 +91,11 @@ func (p *Puller) tryLocalResolve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	if ok, err := contentutil.HasSource(info, p.Src); err != nil || !ok {
+		return errors.Errorf("no matching source")
+	}
+
 	desc.Size = info.Size
 	p.ref = p.Src.String()
 	ra, err := p.ContentStore.ReaderAt(ctx, desc)
@@ -105,7 +111,7 @@ func (p *Puller) tryLocalResolve(ctx context.Context) error {
 	return nil
 }
 
-func (p *Puller) PullManifests(ctx context.Context) (*PulledManifests, error) {
+func (p *Puller) PullManifests(ctx context.Context, getResolver SessionResolver) (*PulledManifests, error) {
 	err := p.resolve(ctx, p.Resolver)
 	if err != nil {
 		return nil, err
@@ -196,7 +202,7 @@ func (p *Puller) PullManifests(ctx context.Context) (*PulledManifests, error) {
 		Nonlayers:        p.nonlayers,
 		Descriptors:      p.layers,
 		Provider: func(g session.Group) content.Provider {
-			return &provider{puller: p, resolver: p.Resolver.WithSession(g)}
+			return &provider{puller: p, resolver: getResolver(g)}
 		},
 	}, nil
 }

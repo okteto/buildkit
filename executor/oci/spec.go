@@ -11,12 +11,14 @@ import (
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/pkg/userns"
 	"github.com/containerd/continuity/fs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/util/network"
+	rootlessmountopts "github.com/moby/buildkit/util/rootless/mountopts"
 	traceexec "github.com/moby/buildkit/util/tracing/exec"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux"
@@ -35,6 +37,12 @@ const (
 	NoProcessSandbox
 )
 
+var tracingEnvVars = []string{
+	"OTEL_TRACES_EXPORTER=otlp",
+	"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=" + getTracingSocket(),
+	"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc",
+}
+
 func (pm ProcessMode) String() string {
 	switch pm {
 	case ProcessSandbox:
@@ -50,7 +58,7 @@ func (pm ProcessMode) String() string {
 
 // GenerateSpec generates spec using containerd functionality.
 // opts are ignored for s.Process, s.Hostname, and s.Mounts .
-func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mount, id, resolvConf, hostsFile string, namespace network.Namespace, cgroupParent string, processMode ProcessMode, idmap *idtools.IdentityMapping, apparmorProfile string, tracingSocket string, opts ...oci.SpecOpts) (*specs.Spec, func(), error) {
+func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mount, id, resolvConf, hostsFile string, namespace network.Namespace, cgroupParent string, processMode ProcessMode, idmap *idtools.IdentityMapping, apparmorProfile string, selinuxB bool, tracingSocket string, opts ...oci.SpecOpts) (*specs.Spec, func(), error) {
 	c := &containers.Container{
 		ID: id,
 	}
@@ -81,7 +89,7 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 		return nil, nil, err
 	}
 
-	if securityOpts, err := generateSecurityOpts(meta.SecurityMode, apparmorProfile); err == nil {
+	if securityOpts, err := generateSecurityOpts(meta.SecurityMode, apparmorProfile, selinuxB); err == nil {
 		opts = append(opts, securityOpts...)
 	} else {
 		return nil, nil, err
@@ -112,7 +120,7 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 
 	if tracingSocket != "" {
 		// https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/protocol/exporter.md
-		meta.Env = append(meta.Env, "OTEL_TRACES_EXPORTER=otlp", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=unix:///dev/otel-grpc.sock", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc")
+		meta.Env = append(meta.Env, tracingEnvVars...)
 		meta.Env = append(meta.Env, traceexec.Environ(ctx)...)
 	}
 
@@ -183,15 +191,18 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 	}
 
 	if tracingSocket != "" {
-		s.Mounts = append(s.Mounts, specs.Mount{
-			Destination: "/dev/otel-grpc.sock",
-			Type:        "bind",
-			Source:      tracingSocket,
-			Options:     []string{"ro", "rbind"},
-		})
+		s.Mounts = append(s.Mounts, getTracingSocketMount(tracingSocket))
 	}
 
 	s.Mounts = dedupMounts(s.Mounts)
+
+	if userns.RunningInUserNS() {
+		s.Mounts, err = rootlessmountopts.FixUpOCI(s.Mounts)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
 	return s, releaseAll, nil
 }
 

@@ -5,7 +5,6 @@ package snapshot
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,39 +21,21 @@ import (
 	"github.com/containerd/containerd/snapshots/native"
 	"github.com/containerd/containerd/snapshots/overlay"
 	"github.com/containerd/continuity/fs/fstest"
-	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
+	libcap "kernel.org/pub/linux/libs/security/libcap/cap"
 )
 
-func newSnapshotter(ctx context.Context, snapshotterName string) (_ context.Context, _ *mergeSnapshotter, _ func() error, rerr error) {
+func newSnapshotter(ctx context.Context, t *testing.T, snapshotterName string) (_ context.Context, _ *mergeSnapshotter, rerr error) {
 	ns := "buildkit-test"
 	ctx = namespaces.WithNamespace(ctx, ns)
 
-	defers := make([]func() error, 0)
-	cleanup := func() error {
-		var err error
-		for i := range defers {
-			err = multierror.Append(err, defers[len(defers)-1-i]()).ErrorOrNil()
-		}
-		return err
-	}
-	defer func() {
-		if rerr != nil && cleanup != nil {
-			cleanup()
-		}
-	}()
+	tmpdir := t.TempDir()
 
-	tmpdir, err := os.MkdirTemp("", "buildkit-test")
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	defers = append(defers, func() error {
-		return os.RemoveAll(tmpdir)
-	})
-
+	var err error
 	var ctdSnapshotter snapshots.Snapshotter
 	var noHardlink bool
 	switch snapshotterName {
@@ -64,35 +45,38 @@ func newSnapshotter(ctx context.Context, snapshotterName string) (_ context.Cont
 	case "native":
 		ctdSnapshotter, err = native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 	case "overlayfs":
 		ctdSnapshotter, err = overlay.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 	default:
-		return nil, nil, nil, fmt.Errorf("unhandled snapshotter: %s", snapshotterName)
+		return nil, nil, errors.Errorf("unhandled snapshotter: %s", snapshotterName)
 	}
+	t.Cleanup(func() {
+		require.NoError(t, ctdSnapshotter.Close())
+	})
 
 	store, err := local.NewStore(tmpdir)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	db, err := bolt.Open(filepath.Join(tmpdir, "containerdmeta.db"), 0644, nil)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	defers = append(defers, func() error {
-		return db.Close()
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
 	})
 
 	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{
 		snapshotterName: ctdSnapshotter,
 	})
 	if err := mdb.Init(context.TODO()); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), ns)
@@ -100,6 +84,9 @@ func newSnapshotter(ctx context.Context, snapshotterName string) (_ context.Cont
 	if noHardlink {
 		snapshotter.tryCrossSnapshotLink = false
 	}
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
 	leaseID := identity.NewID()
 	_, err = lm.Create(ctx, func(l *leases.Lease) error {
@@ -110,11 +97,11 @@ func newSnapshotter(ctx context.Context, snapshotterName string) (_ context.Cont
 		return nil
 	}, leaseutil.MakeTemporary)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	ctx = leases.WithLease(ctx, leaseID)
 
-	return ctx, snapshotter, cleanup, nil
+	return ctx, snapshotter, nil
 }
 
 func TestMerge(t *testing.T) {
@@ -126,9 +113,8 @@ func TestMerge(t *testing.T) {
 				requireRoot(t)
 			}
 
-			ctx, sn, cleanup, err := newSnapshotter(context.Background(), snName)
+			ctx, sn, err := newSnapshotter(context.Background(), t, snName)
 			require.NoError(t, err)
-			defer cleanup()
 
 			ts := time.Unix(0, 0)
 			snapA := committedKey(ctx, t, sn, identity.NewID(), "",
@@ -331,9 +317,8 @@ func TestHardlinks(t *testing.T) {
 				requireRoot(t)
 			}
 
-			ctx, sn, cleanup, err := newSnapshotter(context.Background(), snName)
+			ctx, sn, err := newSnapshotter(context.Background(), t, snName)
 			require.NoError(t, err)
-			defer cleanup()
 
 			base1Snap := committedKey(ctx, t, sn, identity.NewID(), "",
 				fstest.CreateFile("1", []byte("1"), 0600),
@@ -388,6 +373,41 @@ func TestHardlinks(t *testing.T) {
 	}
 }
 
+func TestMergeFileCapabilities(t *testing.T) {
+	requireRoot(t)
+	for _, snName := range []string{"overlayfs", "native", "native-nohardlink"} {
+		snName := snName
+		t.Run(snName, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, sn, err := newSnapshotter(context.Background(), t, snName)
+			require.NoError(t, err)
+
+			setCaps := "cap_net_bind_service=+ep"
+			base1Snap := committedKey(ctx, t, sn, identity.NewID(), "",
+				fstest.CreateFile("hasCaps", []byte("capable"), 0700),
+				fstest.Chown("hasCaps", 1000, 1000),
+				setFileCap("hasCaps", setCaps),
+			)
+			base2Snap := committedKey(ctx, t, sn, identity.NewID(), "",
+				fstest.CreateFile("foo", []byte("bar"), 0600),
+			)
+
+			mergeSnap := mergeKey(ctx, t, sn, identity.NewID(), []Diff{
+				{"", base1Snap.Name},
+				{"", base2Snap.Name},
+			})
+
+			actualCaps := getFileCap(ctx, t, sn, mergeSnap.Name, "hasCaps")
+			require.Equal(t, "cap_net_bind_service=ep", actualCaps)
+			stat := statPath(ctx, t, sn, mergeSnap.Name, "hasCaps")
+			require.EqualValues(t, 1000, stat.Uid)
+			require.EqualValues(t, 1000, stat.Gid)
+			require.EqualValues(t, 0700, stat.Mode&0777)
+		})
+	}
+}
+
 func TestUsage(t *testing.T) {
 	for _, snName := range []string{"overlayfs", "native", "native-nohardlink"} {
 		snName := snName
@@ -397,9 +417,8 @@ func TestUsage(t *testing.T) {
 				requireRoot(t)
 			}
 
-			ctx, sn, cleanup, err := newSnapshotter(context.Background(), snName)
+			ctx, sn, err := newSnapshotter(context.Background(), t, snName)
 			require.NoError(t, err)
-			defer cleanup()
 
 			const direntByteSize = 4096
 
@@ -576,7 +595,7 @@ func requireMtime(t *testing.T, path string, mtime time.Time) {
 	require.Equal(t, mtime.UnixNano(), stat.Mtim.Nano())
 }
 
-func tryStatPath(ctx context.Context, t *testing.T, sn *mergeSnapshotter, key, path string) (st *syscall.Stat_t) {
+func pathCallback[T any](ctx context.Context, t *testing.T, sn *mergeSnapshotter, key, path string, cb func(t *testing.T, path string) *T) *T {
 	t.Helper()
 	mounts, cleanup := getMounts(ctx, t, sn, key)
 	defer cleanup()
@@ -594,24 +613,32 @@ func tryStatPath(ctx context.Context, t *testing.T, sn *mergeSnapshotter, key, p
 			}
 		}
 		if upperdir != "" {
-			st = trySyscallStat(t, filepath.Join(upperdir, path))
-			if st != nil {
-				return st
+			r := cb(t, filepath.Join(upperdir, path))
+			if r != nil {
+				return r
 			}
 		}
 		for _, lowerdir := range lowerdirs {
-			st = trySyscallStat(t, filepath.Join(lowerdir, path))
-			if st != nil {
-				return st
+			r := cb(t, filepath.Join(lowerdir, path))
+			if r != nil {
+				return r
 			}
 		}
 		return nil
 	}
 
+	var r *T
 	withMount(ctx, t, sn, key, func(root string) {
-		st = trySyscallStat(t, filepath.Join(root, path))
+		r = cb(t, filepath.Join(root, path))
 	})
-	return st
+	return r
+}
+
+func tryStatPath(ctx context.Context, t *testing.T, sn *mergeSnapshotter, key, path string) *syscall.Stat_t {
+	t.Helper()
+	return pathCallback(ctx, t, sn, key, path, func(t *testing.T, path string) *syscall.Stat_t {
+		return trySyscallStat(t, path)
+	})
 }
 
 func statPath(ctx context.Context, t *testing.T, sn *mergeSnapshotter, key, path string) (st *syscall.Stat_t) {
@@ -626,4 +653,37 @@ func requireRoot(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("test requires root")
 	}
+}
+
+func setFileCap(path string, caps string) fstest.Applier {
+	return applyFn(func(root string) error {
+		path := filepath.Join(root, path)
+		capSet, err := libcap.FromText(caps)
+		if err != nil {
+			return err
+		}
+		return capSet.SetFile(path)
+	})
+}
+
+func getFileCap(ctx context.Context, t *testing.T, sn *mergeSnapshotter, key, path string) string {
+	t.Helper()
+	caps := pathCallback(ctx, t, sn, key, path, func(t *testing.T, path string) *string {
+		t.Helper()
+		capSet, err := libcap.GetFile(path)
+		if err != nil {
+			require.ErrorIs(t, err, os.ErrNotExist)
+			return nil
+		}
+		caps := capSet.String()
+		return &caps
+	})
+	require.NotNil(t, caps)
+	return *caps
+}
+
+type applyFn func(root string) error
+
+func (a applyFn) Apply(root string) error {
+	return a(root)
 }

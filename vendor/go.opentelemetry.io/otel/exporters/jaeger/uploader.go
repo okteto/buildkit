@@ -19,21 +19,24 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/go-logr/stdr"
 
 	gen "go.opentelemetry.io/otel/exporters/jaeger/internal/gen-go/jaeger"
 	"go.opentelemetry.io/otel/exporters/jaeger/internal/third_party/thrift/lib/go/thrift"
 )
 
-// batchUploader send a batch of spans to Jaeger
+// batchUploader send a batch of spans to Jaeger.
 type batchUploader interface {
 	upload(context.Context, *gen.Batch) error
 	shutdown(context.Context) error
 }
 
+// EndpointOption configures a Jaeger endpoint.
 type EndpointOption interface {
 	newBatchUploader() (batchUploader, error)
 }
@@ -75,6 +78,7 @@ func WithAgentEndpoint(options ...AgentEndpointOption) EndpointOption {
 	})
 }
 
+// AgentEndpointOption configures a Jaeger agent endpoint.
 type AgentEndpointOption interface {
 	apply(agentEndpointConfig) agentEndpointConfig
 }
@@ -111,8 +115,17 @@ func WithAgentPort(port string) AgentEndpointOption {
 	})
 }
 
+var emptyLogger = logr.Logger{}
+
 // WithLogger sets a logger to be used by agent client.
+// WithLogger and WithLogr will overwrite each other.
 func WithLogger(logger *log.Logger) AgentEndpointOption {
+	return WithLogr(stdr.New(logger))
+}
+
+// WithLogr sets a logr.Logger to be used by agent client.
+// WithLogr and WithLogger will overwrite each other.
+func WithLogr(logger logr.Logger) AgentEndpointOption {
 	return agentEndpointOptionFunc(func(o agentEndpointConfig) agentEndpointConfig {
 		o.Logger = logger
 		return o
@@ -175,6 +188,7 @@ func WithCollectorEndpoint(options ...CollectorEndpointOption) EndpointOption {
 	})
 }
 
+// CollectorEndpointOption configures a Jaeger collector endpoint.
 type CollectorEndpointOption interface {
 	apply(collectorEndpointConfig) collectorEndpointConfig
 }
@@ -305,8 +319,10 @@ func (c *collectorUploader) upload(ctx context.Context, batch *gen.Batch) error 
 		return err
 	}
 
-	_, _ = io.Copy(ioutil.Discard, resp.Body)
-	resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if err = resp.Body.Close(); err != nil {
+		return err
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("failed to upload traces; HTTP status code: %d", resp.StatusCode)

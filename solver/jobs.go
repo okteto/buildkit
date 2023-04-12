@@ -3,7 +3,6 @@ package solver
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 	"github.com/moby/buildkit/util/tracing"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -24,7 +24,7 @@ import (
 type ResolveOpFunc func(Vertex, Builder) (Op, error)
 
 type Builder interface {
-	Build(ctx context.Context, e Edge) (CachedResult, BuildSources, error)
+	Build(ctx context.Context, e Edge) (CachedResultWithProvenance, error)
 	InContext(ctx context.Context, f func(ctx context.Context, g session.Group) error) error
 	EachValue(ctx context.Context, key string, fn func(interface{}) error) error
 }
@@ -199,16 +199,15 @@ type subBuilder struct {
 	exporters []ExportableCacheKey
 }
 
-func (sb *subBuilder) Build(ctx context.Context, e Edge) (CachedResult, BuildSources, error) {
-	// TODO(@crazy-max): Handle BuildInfo from subbuild
+func (sb *subBuilder) Build(ctx context.Context, e Edge) (CachedResultWithProvenance, error) {
 	res, err := sb.solver.subBuild(ctx, e, sb.vtx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	sb.mu.Lock()
 	sb.exporters = append(sb.exporters, res.CacheKeys()[0]) // all keys already have full export chain
 	sb.mu.Unlock()
-	return res, nil, nil
+	return &withProvenance{CachedResult: res}, nil
 }
 
 func (sb *subBuilder) InContext(ctx context.Context, f func(context.Context, session.Group) error) error {
@@ -231,15 +230,18 @@ func (sb *subBuilder) EachValue(ctx context.Context, key string, fn func(interfa
 }
 
 type Job struct {
-	list   *Solver
-	pr     *progress.MultiReader
-	pw     progress.Writer
-	span   trace.Span
-	values sync.Map
-	id     string
+	list          *Solver
+	pr            *progress.MultiReader
+	pw            progress.Writer
+	span          trace.Span
+	values        sync.Map
+	id            string
+	startedTime   time.Time
+	completedTime time.Time
 
 	progressCloser func()
 	SessionID      string
+	uniqueID       string // unique ID is used for provenance. We use a different field that client can't control
 }
 
 type SolverOpt struct {
@@ -449,6 +451,8 @@ func (jl *Solver) NewJob(id string) (*Job, error) {
 		progressCloser: progressCloser,
 		span:           span,
 		id:             id,
+		startedTime:    time.Now(),
+		uniqueID:       identity.NewID(),
 	}
 	jl.jobs[id] = j
 
@@ -498,48 +502,70 @@ func (jl *Solver) deleteIfUnreferenced(k digest.Digest, st *state) {
 	}
 }
 
-func (j *Job) Build(ctx context.Context, e Edge) (CachedResult, BuildSources, error) {
+func (j *Job) Build(ctx context.Context, e Edge) (CachedResultWithProvenance, error) {
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
 		j.span = span
 	}
 
 	v, err := j.list.load(e.Vertex, nil, j)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	e.Vertex = v
 
 	res, err := j.list.s.build(ctx, e)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	j.list.mu.Lock()
 	defer j.list.mu.Unlock()
-	return res, j.walkBuildSources(ctx, e, make(BuildSources)), nil
+	return &withProvenance{CachedResult: res, j: j, e: e}, nil
 }
 
-func (j *Job) walkBuildSources(ctx context.Context, e Edge, bsrc BuildSources) BuildSources {
-	for _, inp := range e.Vertex.Inputs() {
-		if st, ok := j.list.actives[inp.Vertex.Digest()]; ok {
-			st.mu.Lock()
-			for _, cacheRes := range st.op.cacheRes {
-				for key, val := range cacheRes.BuildSources {
-					if _, ok := bsrc[key]; !ok {
-						bsrc[key] = val
-					}
-				}
+type withProvenance struct {
+	CachedResult
+	j *Job
+	e Edge
+}
+
+func (wp *withProvenance) WalkProvenance(ctx context.Context, f func(ProvenanceProvider) error) error {
+	if wp.j == nil {
+		return nil
+	}
+	m := map[digest.Digest]struct{}{}
+	return wp.j.walkProvenance(ctx, wp.e, f, m)
+}
+
+func (j *Job) walkProvenance(ctx context.Context, e Edge, f func(ProvenanceProvider) error, visited map[digest.Digest]struct{}) error {
+	if _, ok := visited[e.Vertex.Digest()]; ok {
+		return nil
+	}
+	visited[e.Vertex.Digest()] = struct{}{}
+	if st, ok := j.list.actives[e.Vertex.Digest()]; ok {
+		st.mu.Lock()
+		if wp, ok := st.op.op.(ProvenanceProvider); ok {
+			if err := f(wp); err != nil {
+				st.mu.Unlock()
+				return err
 			}
-			st.mu.Unlock()
-			bsrc = j.walkBuildSources(ctx, inp, bsrc)
+		}
+		st.mu.Unlock()
+	}
+	for _, inp := range e.Vertex.Inputs() {
+		if err := j.walkProvenance(ctx, inp, f, visited); err != nil {
+			return err
 		}
 	}
-	return bsrc
+	return nil
+}
+
+func (j *Job) CloseProgress() {
+	j.progressCloser()
+	j.pw.Close()
 }
 
 func (j *Job) Discard() error {
-	defer j.progressCloser()
-
 	j.list.mu.Lock()
 	defer j.list.mu.Unlock()
 
@@ -551,9 +577,7 @@ func (j *Job) Discard() error {
 			delete(st.jobs, j)
 			j.list.deleteIfUnreferenced(k, st)
 		}
-		if _, ok := st.allPw[j.pw]; ok {
-			delete(st.allPw, j.pw)
-		}
+		delete(st.allPw, j.pw)
 		st.mu.Unlock()
 	}
 
@@ -565,6 +589,21 @@ func (j *Job) Discard() error {
 		delete(j.list.jobs, j.id)
 	}()
 	return nil
+}
+
+func (j *Job) StartedTime() time.Time {
+	return j.startedTime
+}
+
+func (j *Job) RegisterCompleteTime() time.Time {
+	if j.completedTime.IsZero() {
+		j.completedTime = time.Now()
+	}
+	return j.completedTime
+}
+
+func (j *Job) UniqueID() string {
+	return j.uniqueID
 }
 
 func (j *Job) InContext(ctx context.Context, f func(context.Context, session.Group) error) error {
@@ -622,8 +661,9 @@ type sharedOp struct {
 	subBuilder *subBuilder
 	err        error
 
-	execRes *execRes
-	execErr error
+	execRes  *execRes
+	execDone bool
+	execErr  error
 
 	cacheRes  []*CacheMap
 	cacheDone bool
@@ -639,7 +679,18 @@ func (s *sharedOp) IgnoreCache() bool {
 }
 
 func (s *sharedOp) Cache() CacheManager {
-	return s.st.combinedCacheManager()
+	return &cacheWithCacheOpts{s.st.combinedCacheManager(), s.st}
+}
+
+type cacheWithCacheOpts struct {
+	CacheManager
+	st *state
+}
+
+func (c cacheWithCacheOpts) Records(ctx context.Context, ck *CacheKey) ([]*CacheRecord, error) {
+	// Allow Records accessing to cache opts through ctx. This enable to use remote provider
+	// during checking the cache existence.
+	return c.CacheManager.Records(withAncestorCacheOpts(ctx, c.st), ck)
 }
 
 func (s *sharedOp) LoadCache(ctx context.Context, rec *CacheRecord) (Result, error) {
@@ -648,7 +699,7 @@ func (s *sharedOp) LoadCache(ctx context.Context, rec *CacheRecord) (Result, err
 		ctx = trace.ContextWithSpan(ctx, s.st.mspan)
 	}
 	// no cache hit. start evaluating the node
-	span, ctx := tracing.StartSpan(ctx, "load cache: "+s.st.vtx.Name())
+	span, ctx := tracing.StartSpan(ctx, "load cache: "+s.st.vtx.Name(), trace.WithAttributes(attribute.String("vertex", s.st.vtx.Digest().String())))
 	notifyCompleted := notifyStarted(ctx, &s.st.clientVertex, true)
 	res, err := s.Cache().Load(withAncestorCacheOpts(ctx, s.st), rec)
 	tracing.FinishWithError(span, err)
@@ -706,7 +757,7 @@ func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, p PreprocessF
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				if strings.Contains(err.Error(), context.Canceled.Error()) {
+				if errdefs.IsCanceled(ctx, err) {
 					complete = false
 					releaseError(err)
 					err = errors.Wrap(ctx.Err(), err.Error())
@@ -760,7 +811,7 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 		ctx = withAncestorCacheOpts(ctx, s.st)
 		if len(s.st.vtx.Inputs()) == 0 {
 			// no cache hit. start evaluating the node
-			span, ctx := tracing.StartSpan(ctx, "cache request: "+s.st.vtx.Name())
+			span, ctx := tracing.StartSpan(ctx, "cache request: "+s.st.vtx.Name(), trace.WithAttributes(attribute.String("vertex", s.st.vtx.Digest().String())))
 			notifyCompleted := notifyStarted(ctx, &s.st.clientVertex, false)
 			defer func() {
 				tracing.FinishWithError(span, retErr)
@@ -772,7 +823,7 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				if strings.Contains(err.Error(), context.Canceled.Error()) {
+				if errdefs.IsCanceled(ctx, err) {
 					complete = false
 					releaseError(err)
 					err = errors.Wrap(ctx.Err(), err.Error())
@@ -820,8 +871,11 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 	}
 	flightControlKey := "exec"
 	res, err := s.g.Do(ctx, flightControlKey, func(ctx context.Context) (ret interface{}, retErr error) {
-		if s.execRes != nil || s.execErr != nil {
-			return s.execRes, s.execErr
+		if s.execDone {
+			if s.execErr != nil {
+				return nil, s.execErr
+			}
+			return s.execRes, nil
 		}
 		release, err := op.Acquire(ctx)
 		if err != nil {
@@ -836,7 +890,7 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 		ctx = withAncestorCacheOpts(ctx, s.st)
 
 		// no cache hit. start evaluating the node
-		span, ctx := tracing.StartSpan(ctx, s.st.vtx.Name())
+		span, ctx := tracing.StartSpan(ctx, s.st.vtx.Name(), trace.WithAttributes(attribute.String("vertex", s.st.vtx.Digest().String())))
 		notifyCompleted := notifyStarted(ctx, &s.st.clientVertex, false)
 		defer func() {
 			tracing.FinishWithError(span, retErr)
@@ -848,7 +902,7 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				if strings.Contains(err.Error(), context.Canceled.Error()) {
+				if errdefs.IsCanceled(ctx, err) {
 					complete = false
 					releaseError(err)
 					err = errors.Wrap(ctx.Err(), err.Error())
@@ -857,6 +911,7 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 			}
 		}
 		if complete {
+			s.execDone = true
 			if res != nil {
 				var subExporters []ExportableCacheKey
 				s.subBuilder.mu.Lock()
@@ -869,9 +924,12 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 			}
 			s.execErr = err
 		}
-		return s.execRes, err
+		if s.execRes == nil || err != nil {
+			return nil, err
+		}
+		return s.execRes, nil
 	})
-	if err != nil {
+	if res == nil || err != nil {
 		return nil, nil, err
 	}
 	r := res.(*execRes)

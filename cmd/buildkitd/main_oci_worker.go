@@ -33,6 +33,7 @@ import (
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/executor/oci"
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/network/cniprovider"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/util/resolver"
@@ -101,6 +102,11 @@ func init() {
 			Usage: "path of cni binary files",
 			Value: defaultConf.Workers.OCI.NetworkConfig.CNIBinaryPath,
 		},
+		cli.IntFlag{
+			Name:  "oci-cni-pool-size",
+			Usage: "size of cni network namespace pool",
+			Value: defaultConf.Workers.OCI.NetworkConfig.CNIPoolSize,
+		},
 		cli.StringFlag{
 			Name:  "oci-worker-binary",
 			Usage: "name of specified oci worker binary",
@@ -109,6 +115,10 @@ func init() {
 		cli.StringFlag{
 			Name:  "oci-worker-apparmor-profile",
 			Usage: "set the name of the apparmor profile applied to containers",
+		},
+		cli.BoolFlag{
+			Name:  "oci-worker-selinux",
+			Usage: "apply SELinux labels",
 		},
 	}
 	n := "oci-worker-rootless"
@@ -223,6 +233,9 @@ func applyOCIFlags(c *cli.Context, cfg *config.Config) error {
 	if c.GlobalIsSet("oci-cni-binary-dir") {
 		cfg.Workers.OCI.NetworkConfig.CNIBinaryPath = c.GlobalString("oci-cni-binary-dir")
 	}
+	if c.GlobalIsSet("oci-cni-pool-size") {
+		cfg.Workers.OCI.NetworkConfig.CNIPoolSize = c.GlobalInt("oci-cni-pool-size")
+	}
 	if c.GlobalIsSet("oci-worker-binary") {
 		cfg.Workers.OCI.Binary = c.GlobalString("oci-worker-binary")
 	}
@@ -232,6 +245,10 @@ func applyOCIFlags(c *cli.Context, cfg *config.Config) error {
 	if c.GlobalIsSet("oci-worker-apparmor-profile") {
 		cfg.Workers.OCI.ApparmorProfile = c.GlobalString("oci-worker-apparmor-profile")
 	}
+	if c.GlobalIsSet("oci-worker-selinux") {
+		cfg.Workers.OCI.SELinux = c.GlobalBool("oci-worker-selinux")
+	}
+
 	return nil
 }
 
@@ -259,7 +276,7 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 	}
 
 	if cfg.Rootless {
-		logrus.Debugf("running in rootless mode")
+		bklog.L.Debugf("running in rootless mode")
 		if common.config.Workers.OCI.NetworkConfig.Mode == "auto" {
 			common.config.Workers.OCI.NetworkConfig.Mode = "host"
 		}
@@ -267,7 +284,7 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 
 	processMode := oci.ProcessSandbox
 	if cfg.NoProcessSandbox {
-		logrus.Warn("NoProcessSandbox is enabled. Note that NoProcessSandbox allows build containers to kill (and potentially ptrace) an arbitrary process in the BuildKit host namespace. NoProcessSandbox should be enabled only when the BuildKit is running in a container as an unprivileged user.")
+		bklog.L.Warn("NoProcessSandbox is enabled. Note that NoProcessSandbox allows build containers to kill (and potentially ptrace) an arbitrary process in the BuildKit host namespace. NoProcessSandbox should be enabled only when the BuildKit is running in a container as an unprivileged user.")
 		if !cfg.Rootless {
 			return nil, errors.New("can't enable NoProcessSandbox without Rootless")
 		}
@@ -282,6 +299,7 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 			Root:       common.config.Root,
 			ConfigPath: common.config.Workers.OCI.CNIConfigPath,
 			BinaryDir:  common.config.Workers.OCI.CNIBinaryPath,
+			PoolSize:   common.config.Workers.OCI.CNIPoolSize,
 		},
 	}
 
@@ -290,11 +308,12 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 		parallelismSem = semaphore.NewWeighted(int64(cfg.MaxParallelism))
 	}
 
-	opt, err := runc.NewWorkerOpt(common.config.Root, snFactory, cfg.Rootless, processMode, cfg.Labels, idmapping, nc, dns, cfg.Binary, cfg.ApparmorProfile, parallelismSem, common.traceSocket, cfg.DefaultCgroupParent)
+	opt, err := runc.NewWorkerOpt(common.config.Root, snFactory, cfg.Rootless, processMode, cfg.Labels, idmapping, nc, dns, cfg.Binary, cfg.ApparmorProfile, cfg.SELinux, parallelismSem, common.traceSocket, cfg.DefaultCgroupParent)
 	if err != nil {
 		return nil, err
 	}
 	opt.GCPolicy = getGCPolicy(cfg.GCConfig, common.config.Root)
+	opt.BuildkitVersion = getBuildkitVersion()
 	opt.RegistryHosts = hosts
 
 	if platformsStr := cfg.Platforms; len(platformsStr) != 0 {
@@ -349,15 +368,15 @@ func snapshotterFactory(commonRoot string, cfg config.OCIConfig, sm *session.Man
 		if err := overlayutils.Supported(commonRoot); err == nil {
 			name = "overlayfs"
 		} else {
-			logrus.Debugf("auto snapshotter: overlayfs is not available for %s, trying fuse-overlayfs: %v", commonRoot, err)
+			bklog.L.Debugf("auto snapshotter: overlayfs is not available for %s, trying fuse-overlayfs: %v", commonRoot, err)
 			if err2 := fuseoverlayfs.Supported(commonRoot); err2 == nil {
 				name = "fuse-overlayfs"
 			} else {
-				logrus.Debugf("auto snapshotter: fuse-overlayfs is not available for %s, falling back to native: %v", commonRoot, err2)
+				bklog.L.Debugf("auto snapshotter: fuse-overlayfs is not available for %s, falling back to native: %v", commonRoot, err2)
 				name = "native"
 			}
 		}
-		logrus.Infof("auto snapshotter: using %s", name)
+		bklog.L.Infof("auto snapshotter: using %s", name)
 	}
 
 	snFactory := runc.SnapshotterFactory{
@@ -394,7 +413,7 @@ func snapshotterFactory(commonRoot string, cfg config.OCIConfig, sm *session.Man
 		snFactory.New = func(root string) (ctdsnapshot.Snapshotter, error) {
 			userxattr, err := overlayutils.NeedsUserXAttr(root)
 			if err != nil {
-				logrus.WithError(err).Warnf("cannot detect whether \"userxattr\" option needs to be used, assuming to be %v", userxattr)
+				bklog.L.WithError(err).Warnf("cannot detect whether \"userxattr\" option needs to be used, assuming to be %v", userxattr)
 			}
 			opq := sgzlayer.OverlayOpaqueTrusted
 			if userxattr {
@@ -424,7 +443,7 @@ func validOCIBinary() bool {
 	_, err := exec.LookPath("runc")
 	_, err1 := exec.LookPath("buildkit-runc")
 	if err != nil && err1 != nil {
-		logrus.Warnf("skipping oci worker, as runc does not exist")
+		bklog.L.Warnf("skipping oci worker, as runc does not exist")
 		return false
 	}
 	return true

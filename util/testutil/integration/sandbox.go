@@ -14,18 +14,19 @@ import (
 	"time"
 
 	"github.com/google/shlex"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 const buildkitdConfigFile = "buildkitd.toml"
 
 type backend struct {
-	address           string
-	containerdAddress string
-	rootless          bool
-	snapshotter       string
-	isDockerd         bool
+	address             string
+	containerdAddress   string
+	rootless            bool
+	snapshotter         string
+	unsupportedFeatures []string
+	isDockerd           bool
 }
 
 func (b backend) Address() string {
@@ -42,6 +43,29 @@ func (b backend) Rootless() bool {
 
 func (b backend) Snapshotter() string {
 	return b.snapshotter
+}
+
+func (b backend) isUnsupportedFeature(feature string) bool {
+	if enabledFeatures := os.Getenv("BUILDKIT_TEST_ENABLE_FEATURES"); enabledFeatures != "" {
+		for _, enabledFeature := range strings.Split(enabledFeatures, ",") {
+			if feature == enabledFeature {
+				return false
+			}
+		}
+	}
+	if disabledFeatures := os.Getenv("BUILDKIT_TEST_DISABLE_FEATURES"); disabledFeatures != "" {
+		for _, disabledFeature := range strings.Split(disabledFeatures, ",") {
+			if feature == disabledFeature {
+				return true
+			}
+		}
+	}
+	for _, unsupportedFeature := range b.unsupportedFeatures {
+		if feature == unsupportedFeature {
+			return true
+		}
+	}
+	return false
 }
 
 type sandbox struct {
@@ -62,8 +86,16 @@ func (sb *sandbox) Context() context.Context {
 	return sb.ctx
 }
 
+func (sb *sandbox) Logs() map[string]*bytes.Buffer {
+	return sb.logs
+}
+
 func (sb *sandbox) PrintLogs(t *testing.T) {
 	printLogs(sb.logs, t.Log)
+}
+
+func (sb *sandbox) ClearLogs() {
+	sb.logs = make(map[string]*bytes.Buffer)
 }
 
 func (sb *sandbox) NewRegistry() (string, error) {
@@ -186,7 +218,7 @@ func runBuildkitd(ctx context.Context, conf *BackendConfig, args []string, logs 
 	address = getBuildkitdAddr(tmpdir)
 
 	args = append(args, "--root", tmpdir, "--addr", address, "--debug")
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.Command(args[0], args[1:]...) //nolint:gosec // test utility
 	cmd.Env = append(os.Environ(), "BUILDKIT_DEBUG_EXEC_OUTPUT=1", "BUILDKIT_DEBUG_PANIC_ON_ERROR=1", "TMPDIR="+filepath.Join(tmpdir, "tmp"))
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.SysProcAttr = getSysProcAttr()
@@ -219,11 +251,23 @@ func runBuildkitd(ctx context.Context, conf *BackendConfig, args []string, logs 
 	return address, cl, err
 }
 
+func getBackend(sb Sandbox) (*backend, error) {
+	sbx, ok := sb.(*sandbox)
+	if !ok {
+		return nil, errors.Errorf("invalid sandbox type %T", sb)
+	}
+	b, ok := sbx.Backend.(backend)
+	if !ok {
+		return nil, errors.Errorf("invalid backend type %T", b)
+	}
+	return &b, nil
+}
+
 func rootlessSupported(uid int) bool {
-	cmd := exec.Command("sudo", "-u", fmt.Sprintf("#%d", uid), "-i", "--", "exec", "unshare", "-U", "true")
+	cmd := exec.Command("sudo", "-u", fmt.Sprintf("#%d", uid), "-i", "--", "exec", "unshare", "-U", "true") //nolint:gosec // test utility
 	b, err := cmd.CombinedOutput()
 	if err != nil {
-		logrus.Warnf("rootless mode is not supported on this host: %v (%s)", err, string(b))
+		bklog.L.Warnf("rootless mode is not supported on this host: %v (%s)", err, string(b))
 		return false
 	}
 	return true
@@ -236,5 +280,85 @@ func printLogs(logs map[string]*bytes.Buffer, f func(args ...interface{})) {
 		for s.Scan() {
 			f(s.Text())
 		}
+	}
+}
+
+const (
+	FeatureCacheExport          = "cache_export"
+	FeatureCacheImport          = "cache_import"
+	FeatureCacheBackendAzblob   = "cache_backend_azblob"
+	FeatureCacheBackendGha      = "cache_backend_gha"
+	FeatureCacheBackendInline   = "cache_backend_inline"
+	FeatureCacheBackendLocal    = "cache_backend_local"
+	FeatureCacheBackendRegistry = "cache_backend_registry"
+	FeatureCacheBackendS3       = "cache_backend_s3"
+	FeatureDirectPush           = "direct_push"
+	FeatureFrontendOutline      = "frontend_outline"
+	FeatureFrontendTargets      = "frontend_targets"
+	FeatureImageExporter        = "image_exporter"
+	FeatureInfo                 = "info"
+	FeatureMergeDiff            = "merge_diff"
+	FeatureMultiCacheExport     = "multi_cache_export"
+	FeatureMultiPlatform        = "multi_platform"
+	FeatureOCIExporter          = "oci_exporter"
+	FeatureOCILayout            = "oci_layout"
+	FeatureProvenance           = "provenance"
+	FeatureSBOM                 = "sbom"
+	FeatureSecurityMode         = "security_mode"
+	FeatureSourceDateEpoch      = "source_date_epoch"
+	FeatureCNINetwork           = "cni_network"
+)
+
+var features = map[string]struct{}{
+	FeatureCacheExport:          {},
+	FeatureCacheImport:          {},
+	FeatureCacheBackendAzblob:   {},
+	FeatureCacheBackendGha:      {},
+	FeatureCacheBackendInline:   {},
+	FeatureCacheBackendLocal:    {},
+	FeatureCacheBackendRegistry: {},
+	FeatureCacheBackendS3:       {},
+	FeatureDirectPush:           {},
+	FeatureFrontendOutline:      {},
+	FeatureFrontendTargets:      {},
+	FeatureImageExporter:        {},
+	FeatureInfo:                 {},
+	FeatureMergeDiff:            {},
+	FeatureMultiCacheExport:     {},
+	FeatureMultiPlatform:        {},
+	FeatureOCIExporter:          {},
+	FeatureOCILayout:            {},
+	FeatureProvenance:           {},
+	FeatureSBOM:                 {},
+	FeatureSecurityMode:         {},
+	FeatureSourceDateEpoch:      {},
+	FeatureCNINetwork:           {},
+}
+
+func CheckFeatureCompat(t *testing.T, sb Sandbox, reason ...string) {
+	t.Helper()
+	if len(reason) == 0 {
+		t.Fatal("no reason provided")
+	}
+	b, err := getBackend(sb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.unsupportedFeatures) == 0 {
+		return
+	}
+	var ereasons []string
+	for _, r := range reason {
+		if _, ok := features[r]; ok {
+			if b.isUnsupportedFeature(r) {
+				ereasons = append(ereasons, r)
+			}
+		} else {
+			sb.ClearLogs()
+			t.Fatalf("unknown reason %q to skip test", r)
+		}
+	}
+	if len(ereasons) > 0 {
+		t.Skipf("%s worker can not currently run this test due to missing features (%s)", sb.Name(), strings.Join(ereasons, ", "))
 	}
 }

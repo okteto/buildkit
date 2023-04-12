@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
@@ -11,23 +12,29 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"testing"
 	"time"
 
+	"github.com/containerd/continuity/fs/fstest"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
 
+func runCmd(cmd *exec.Cmd, logs map[string]*bytes.Buffer) error {
+	if logs != nil {
+		setCmdLogs(cmd, logs)
+	}
+	fmt.Fprintf(cmd.Stderr, "> runCmd %v %+v\n", time.Now(), cmd.String())
+	return cmd.Run()
+}
+
 func startCmd(cmd *exec.Cmd, logs map[string]*bytes.Buffer) (func() error, error) {
 	if logs != nil {
-		b := new(bytes.Buffer)
-		logs["stdout: "+cmd.Path] = b
-		cmd.Stdout = &lockingWriter{Writer: b}
-		b = new(bytes.Buffer)
-		logs["stderr: "+cmd.Path] = b
-		cmd.Stderr = &lockingWriter{Writer: b}
+		setCmdLogs(cmd, logs)
 	}
 
-	fmt.Fprintf(cmd.Stderr, "> startCmd %v %+v\n", time.Now(), cmd.Args)
+	fmt.Fprintf(cmd.Stderr, "> startCmd %v %+v\n", time.Now(), cmd.String())
 
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -72,11 +79,20 @@ func startCmd(cmd *exec.Cmd, logs map[string]*bytes.Buffer) (func() error, error
 	}, nil
 }
 
+func setCmdLogs(cmd *exec.Cmd, logs map[string]*bytes.Buffer) {
+	b := new(bytes.Buffer)
+	logs["stdout: "+cmd.String()] = b
+	cmd.Stdout = &lockingWriter{Writer: b}
+	b = new(bytes.Buffer)
+	logs["stderr: "+cmd.String()] = b
+	cmd.Stderr = &lockingWriter{Writer: b}
+}
+
 func waitUnix(address string, d time.Duration) error {
 	address = strings.TrimPrefix(address, "unix://")
 	addr, err := net.ResolveUnixAddr("unix", address)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "failed resolving unix addr: %s", address)
 	}
 
 	step := 50 * time.Millisecond
@@ -143,4 +159,34 @@ func (w *lockingWriter) Write(dt []byte) (int, error) {
 	n, err := w.Writer.Write(dt)
 	w.mu.Unlock()
 	return n, err
+}
+
+func Tmpdir(t *testing.T, appliers ...fstest.Applier) (string, error) {
+	// We cannot use t.TempDir() to create a temporary directory here because
+	// appliers might contain fstest.CreateSocket. If the test name is too long,
+	// t.TempDir() could return a path that is longer than 108 characters. This
+	// would result in "bind: invalid argument" when we listen on the socket.
+	tmpdir, err := os.MkdirTemp("", "buildkit")
+	if err != nil {
+		return "", err
+	}
+
+	t.Cleanup(func() {
+		require.NoError(t, os.RemoveAll(tmpdir))
+	})
+
+	if err := fstest.Apply(appliers...).Apply(tmpdir); err != nil {
+		return "", err
+	}
+	return tmpdir, nil
+}
+
+func randomString(n int) string {
+	chars := "abcdefghijklmnopqrstuvwxyz"
+	var b = make([]byte, n)
+	_, _ = rand.Read(b)
+	for k, v := range b {
+		b[k] = chars[v%byte(len(chars))]
+	}
+	return string(b)
 }

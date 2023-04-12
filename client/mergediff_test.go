@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
@@ -1188,8 +1187,16 @@ func (tc verifyContents) Name() string {
 }
 
 func (tc verifyContents) Run(t *testing.T, sb integration.Sandbox) {
+	integration.CheckFeatureCompat(t, sb, integration.FeatureMergeDiff)
 	if tc.skipOnRootless && sb.Rootless() {
 		t.Skip("rootless")
+	}
+
+	switch tc.name {
+	case "TestDiffUpperScratch":
+		if integration.IsTestDockerdMoby(sb) {
+			t.Skip("failed to handle changes: lstat ... no such file or directory: https://github.com/moby/buildkit/pull/2726#issuecomment-1070978499")
+		}
 	}
 
 	requiresLinux(t)
@@ -1218,7 +1225,7 @@ func (tc verifyContents) Run(t *testing.T, sb integration.Sandbox) {
 	var exportInlineCacheOpts []CacheOptionsEntry
 	var importRegistryCacheOpts []CacheOptionsEntry
 	var exportRegistryCacheOpts []CacheOptionsEntry
-	if os.Getenv("TEST_DOCKERD") != "1" {
+	if !integration.IsTestDockerd() {
 		importInlineCacheOpts = []CacheOptionsEntry{{
 			Type: "registry",
 			Attrs: map[string]string{
@@ -1245,7 +1252,7 @@ func (tc verifyContents) Run(t *testing.T, sb integration.Sandbox) {
 	resetState(t, c, sb)
 	requireContents(ctx, t, c, sb, tc.state, nil, exportInlineCacheOpts, imageTarget, tc.contents(sb))
 
-	if os.Getenv("TEST_DOCKERD") == "1" {
+	if integration.IsTestDockerd() {
 		return
 	}
 
@@ -1266,8 +1273,9 @@ func (tc verifyContents) Run(t *testing.T, sb integration.Sandbox) {
 					{
 						Type: ExporterImage,
 						Attrs: map[string]string{
-							"name": imageTarget,
-							"push": "true",
+							"name":                                   imageTarget,
+							"push":                                   "true",
+							"unsafe-internal-store-allow-incomplete": "true",
 						},
 					},
 				},

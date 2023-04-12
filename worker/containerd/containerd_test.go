@@ -24,17 +24,16 @@ func TestContainerdWorkerIntegration(t *testing.T) {
 	integration.Run(t, integration.TestFuncs(
 		testContainerdWorkerExec,
 		testContainerdWorkerExecFailures,
+		testContainerdWorkerCancel,
 	))
 }
 
-func newWorkerOpt(t *testing.T, addr string) (base.WorkerOpt, func()) {
-	tmpdir, err := os.MkdirTemp("", "workertest")
-	require.NoError(t, err)
-	cleanup := func() { os.RemoveAll(tmpdir) }
+func newWorkerOpt(t *testing.T, addr string) base.WorkerOpt {
+	tmpdir := t.TempDir()
 	rootless := false
-	workerOpt, err := NewWorkerOpt(tmpdir, addr, "overlayfs", "buildkit-test", rootless, nil, nil, netproviders.Opt{Mode: "host"}, "", nil, "")
+	workerOpt, err := NewWorkerOpt(tmpdir, addr, "overlayfs", "buildkit-test", rootless, nil, nil, netproviders.Opt{Mode: "host"}, "", false, nil, "")
 	require.NoError(t, err)
-	return workerOpt, cleanup
+	return workerOpt
 }
 
 func checkRequirement(t *testing.T) {
@@ -47,8 +46,7 @@ func testContainerdWorkerExec(t *testing.T, sb integration.Sandbox) {
 	if sb.Rootless() {
 		t.Skip("requires root")
 	}
-	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, sb.ContainerdAddress())
-	defer cleanupWorkerOpt()
+	workerOpt := newWorkerOpt(t, sb.ContainerdAddress())
 	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
@@ -59,10 +57,20 @@ func testContainerdWorkerExecFailures(t *testing.T, sb integration.Sandbox) {
 	if sb.Rootless() {
 		t.Skip("requires root")
 	}
-	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, sb.ContainerdAddress())
-	defer cleanupWorkerOpt()
+	workerOpt := newWorkerOpt(t, sb.ContainerdAddress())
 	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExecFailures(t, w)
+}
+
+func testContainerdWorkerCancel(t *testing.T, sb integration.Sandbox) {
+	if sb.Rootless() {
+		t.Skip("requires root")
+	}
+	workerOpt := newWorkerOpt(t, sb.ContainerdAddress())
+	w, err := base.NewWorker(context.TODO(), workerOpt)
+	require.NoError(t, err)
+
+	tests.TestWorkerCancel(t, w)
 }

@@ -24,10 +24,10 @@ import (
 
 func testBuildWithLocalFiles(t *testing.T, sb integration.Sandbox) {
 	dir, err := tmpdir(
+		t,
 		fstest.CreateFile("foo", []byte("bar"), 0600),
 	)
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	st := llb.Image("busybox").
 		Run(llb.Shlex("sh -c 'echo -n bar > foo2'")).
@@ -54,11 +54,9 @@ func testBuildLocalExporter(t *testing.T, sb integration.Sandbox) {
 	rdr, err := marshal(sb.Context(), out)
 	require.NoError(t, err)
 
-	tmpdir, err := os.MkdirTemp("", "buildkit-buildctl")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
-	cmd := sb.Cmd(fmt.Sprintf("build --progress=plain --exporter=local --exporter-opt output=%s", tmpdir))
+	cmd := sb.Cmd(fmt.Sprintf("build --progress=plain --output type=local,dest=%s", tmpdir))
 	cmd.Stdin = rdr
 	err = cmd.Run()
 
@@ -85,8 +83,7 @@ func testBuildContainerdExporter(t *testing.T, sb integration.Sandbox) {
 
 	buildCmd := []string{
 		"build", "--progress=plain",
-		"--exporter=image", "--exporter-opt", "unpack=true",
-		"--exporter-opt", "name=" + imageName,
+		"--output", "type=image,unpack=true,name=" + imageName,
 	}
 
 	cmd := sb.Cmd(strings.Join(buildCmd, " "))
@@ -120,9 +117,7 @@ func testBuildMetadataFile(t *testing.T, sb integration.Sandbox) {
 	rdr, err := marshal(sb.Context(), st.Root())
 	require.NoError(t, err)
 
-	tmpDir, err := os.MkdirTemp("", "buildkit-buildctl")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	imageName := "example.com/moby/metadata:test"
 	metadataFile := filepath.Join(tmpDir, "metadata.json")
@@ -191,11 +186,8 @@ func marshal(ctx context.Context, st llb.State) (io.Reader, error) {
 	return bytes.NewBuffer(dt), nil
 }
 
-func tmpdir(appliers ...fstest.Applier) (string, error) {
-	tmpdir, err := os.MkdirTemp("", "buildkit-buildctl")
-	if err != nil {
-		return "", err
-	}
+func tmpdir(t *testing.T, appliers ...fstest.Applier) (string, error) {
+	tmpdir := t.TempDir()
 	if err := fstest.Apply(appliers...).Apply(tmpdir); err != nil {
 		return "", err
 	}

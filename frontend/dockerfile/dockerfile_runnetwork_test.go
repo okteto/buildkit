@@ -8,7 +8,7 @@ import (
 
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/frontend/dockerfile/builder"
+	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/testutil/echoserver"
 	"github.com/moby/buildkit/util/testutil/integration"
@@ -41,11 +41,11 @@ FROM busybox
 RUN ip link show eth0
 `)
 
-	dir, err := tmpdir(
+	dir, err := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -53,8 +53,8 @@ RUN ip link show eth0
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 
@@ -77,11 +77,11 @@ RUN --network=none ! ip link show eth0
 		dockerfile += "RUN ip link show eth0"
 	}
 
-	dir, err := tmpdir(
+	dir, err := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -89,8 +89,8 @@ RUN --network=none ! ip link show eth0
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 
@@ -118,11 +118,11 @@ RUN --network=host nc 127.0.0.1 %s | grep foo
 		dockerfile += fmt.Sprintf(`RUN ! nc 127.0.0.1 %s | grep foo`, port)
 	}
 
-	dir, err := tmpdir(
+	dir, err := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -130,8 +130,8 @@ RUN --network=host nc 127.0.0.1 %s | grep foo
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementNetworkHost},
 	}, nil)
@@ -141,8 +141,12 @@ RUN --network=host nc 127.0.0.1 %s | grep foo
 	case networkHostGranted:
 		require.NoError(t, err)
 	case networkHostDenied:
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "entitlement network.host is not allowed")
+		if !integration.IsTestDockerd() {
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "entitlement network.host is not allowed")
+		} else {
+			require.NoError(t, err)
+		}
 	default:
 		require.Fail(t, "unexpected network.host mode %q", hostAllowed)
 	}
@@ -162,11 +166,11 @@ RUN nc 127.0.0.1 %s | grep foo
 RUN --network=none ! nc -z 127.0.0.1 %s
 `, port, port)
 
-	dir, err := tmpdir(
+	dir, err := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -174,8 +178,8 @@ RUN --network=none ! nc -z 127.0.0.1 %s
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementNetworkHost},
 		FrontendAttrs: map[string]string{
@@ -188,8 +192,12 @@ RUN --network=none ! nc -z 127.0.0.1 %s
 	case networkHostGranted:
 		require.NoError(t, err)
 	case networkHostDenied:
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "entitlement network.host is not allowed")
+		if !integration.IsTestDockerd() {
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "entitlement network.host is not allowed")
+		} else {
+			require.NoError(t, err)
+		}
 	default:
 		require.Fail(t, "unexpected network.host mode %q", hostAllowed)
 	}

@@ -212,8 +212,8 @@ func (sr *immutableRef) getRemote(ctx context.Context, createIfNeeded bool, refC
 			}
 		}
 
-		if refCfg.Compression.Force {
-			if needs, err := needsConversion(ctx, sr.cm.ContentStore, desc, refCfg.Compression.Type); err != nil {
+		if needsForceCompression(ctx, sr.cm.ContentStore, desc, refCfg) {
+			if needs, err := refCfg.Compression.Type.NeedsConversion(ctx, sr.cm.ContentStore, desc); err != nil {
 				return nil, err
 			} else if needs {
 				// ensure the compression type.
@@ -228,13 +228,13 @@ func (sr *immutableRef) getRemote(ctx context.Context, createIfNeeded bool, refC
 				newDesc.Size = blobDesc.Size
 				newDesc.URLs = blobDesc.URLs
 				newDesc.Annotations = nil
+				if len(addAnnotations) > 0 || len(blobDesc.Annotations) > 0 {
+					newDesc.Annotations = make(map[string]string)
+				}
 				for _, k := range addAnnotations {
 					newDesc.Annotations[k] = desc.Annotations[k]
 				}
 				for k, v := range blobDesc.Annotations {
-					if newDesc.Annotations == nil {
-						newDesc.Annotations = make(map[string]string)
-					}
 					newDesc.Annotations[k] = v
 				}
 				desc = newDesc

@@ -59,8 +59,6 @@ The following command installs `buildkitd` and `buildctl` to `/usr/local/bin`:
 make && sudo make install
 ```
 
-You can also use `make binaries-all` to prepare `buildkitd.containerd_only` and `buildkitd.oci_only`.
-
 To build containerized `moby/buildkit:local` and `moby/buildkit:local-rootless` images:
 ```bash
 make images
@@ -98,6 +96,10 @@ DOCKERFILE_RELEASES=labs TESTFLAGS="--run /TestRunGlobalNetwork/worker=oci$/ -v"
 
 Set `TEST_KEEP_CACHE=1` for the test framework to keep external dependant images in a docker volume
 if you are repeatedly calling `./hack/test` script. This helps to avoid rate limiting on the remote registry side.
+
+If you are working behind a proxy, you can set some of or all
+`HTTP_PROXY=http://ip:port`, `HTTPS_PROXY=http://ip:port`, `NO_PROXY=http://ip:port` for the test framework
+to specify the proxy build args.
 
 Updating vendored dependencies:
 
@@ -152,7 +154,7 @@ otherwise cleanup our project.
     <td>
       <p>
         Register for the Docker Community Slack (dockercommunity.slack.com)
-        <a href="https://join.slack.com/t/dockercommunity/shared_invite/enQtNDY4MDc1Mzc0MzIwLTgxZDBlMmM4ZGEyNDc1N2FkMzlhODJkYmE1YTVkYjM1MDE3ZjAwZjBkOGFlOTJkZjRmZGYzNjYyY2M3ZTUxYzQ" target="_blank">Click here for an invite to docker community slack</a>.
+        <a href="https://dockr.ly/comm-slack" target="_blank">Click here for an invite to docker community slack</a>.
         You'll find us in <code>#buildkit</code> channel, and the <code>#moby-project</code> channel for general discussions.
       </p>
     </td>

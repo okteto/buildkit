@@ -21,11 +21,37 @@ import (
 	"golang.org/x/time/rate"
 )
 
-func DisplaySolveStatus(ctx context.Context, phase string, c console.Console, w io.Writer, ch chan *client.SolveStatus) ([]client.VertexWarning, error) {
+type displaySolveStatusOpts struct {
+	phase       string
+	textDesc    string
+	consoleDesc string
+}
+
+type DisplaySolveStatusOpt func(b *displaySolveStatusOpts)
+
+func WithPhase(phase string) DisplaySolveStatusOpt {
+	return func(b *displaySolveStatusOpts) {
+		b.phase = phase
+	}
+}
+
+func WithDesc(text string, console string) DisplaySolveStatusOpt {
+	return func(b *displaySolveStatusOpts) {
+		b.textDesc = text
+		b.consoleDesc = console
+	}
+}
+
+func DisplaySolveStatus(ctx context.Context, c console.Console, w io.Writer, ch chan *client.SolveStatus, opts ...DisplaySolveStatusOpt) ([]client.VertexWarning, error) {
 	modeConsole := c != nil
 
-	disp := &display{c: c, phase: phase}
-	printer := &textMux{w: w}
+	dsso := &displaySolveStatusOpts{}
+	for _, opt := range opts {
+		opt(dsso)
+	}
+
+	disp := &display{c: c, phase: dsso.phase, desc: dsso.consoleDesc}
+	printer := &textMux{w: w, desc: dsso.textDesc}
 
 	if disp.phase == "" {
 		disp.phase = "Building"
@@ -108,6 +134,7 @@ type job struct {
 	name        string
 	status      string
 	hasError    bool
+	hasWarning  bool // This is currently unused, but it's here for future use.
 	isCanceled  bool
 	vertex      *vertex
 	showTerm    bool
@@ -710,6 +737,7 @@ func addTime(tm *time.Time, d time.Duration) *time.Time {
 type display struct {
 	c         console.Console
 	phase     string
+	desc      string
 	lineCount int
 	repeated  bool
 }
@@ -783,7 +811,11 @@ func (disp *display) print(d displayInfo, width, height int, all bool) {
 	defer fmt.Fprint(disp.c, aec.Show)
 
 	out := fmt.Sprintf("[+] %s %.1fs (%d/%d) %s", disp.phase, time.Since(d.startTime).Seconds(), d.countCompleted, d.countTotal, statusStr)
-	out = align(out, "", width)
+	if disp.desc != "" {
+		out = align(out, disp.desc, width-1)
+	} else {
+		out = align(out, "", width)
+	}
 	fmt.Fprintln(disp.c, out)
 	lineCount := 0
 	for _, j := range d.jobs {
@@ -829,8 +861,13 @@ func (disp *display) print(d displayInfo, width, height int, all bool) {
 				color = colorCancel
 			} else if j.hasError {
 				color = colorError
+			} else if j.hasWarning {
+				// This is currently unused, but it's here for future use.
+				color = colorWarning
 			}
-			out = aec.Apply(out, color)
+			if color != nil {
+				out = aec.Apply(out, color)
+			}
 		}
 		fmt.Fprint(disp.c, out)
 		lineCount++

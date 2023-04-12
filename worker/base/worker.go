@@ -15,6 +15,7 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/docker/docker/pkg/idtools"
+	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/client"
@@ -41,6 +42,7 @@ import (
 	"github.com/moby/buildkit/source/local"
 	"github.com/moby/buildkit/util/archutil"
 	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/network"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/progress/controller"
 	digest "github.com/opencontainers/go-digest"
@@ -57,33 +59,36 @@ const labelCreatedAt = "buildkit/createdat"
 // WorkerOpt is specific to a worker.
 // See also CommonOpt.
 type WorkerOpt struct {
-	ID              string
-	Labels          map[string]string
-	Platforms       []ocispecs.Platform
-	GCPolicy        []client.PruneInfo
-	Executor        executor.Executor
-	Snapshotter     snapshot.Snapshotter
-	ContentStore    content.Store
-	Applier         diff.Applier
-	Differ          diff.Comparer
-	ImageStore      images.Store // optional
-	RegistryHosts   docker.RegistryHosts
-	IdentityMapping *idtools.IdentityMapping
-	LeaseManager    leases.Manager
-	GarbageCollect  func(context.Context) (gc.Stats, error)
-	ParallelismSem  *semaphore.Weighted
-	MetadataStore   *metadata.Store
-	MountPoolRoot   string
+	ID               string
+	Labels           map[string]string
+	Platforms        []ocispecs.Platform
+	GCPolicy         []client.PruneInfo
+	BuildkitVersion  client.BuildkitVersion
+	NetworkProviders map[pb.NetMode]network.Provider
+	Executor         executor.Executor
+	Snapshotter      snapshot.Snapshotter
+	ContentStore     content.Store
+	Applier          diff.Applier
+	Differ           diff.Comparer
+	ImageStore       images.Store // optional
+	RegistryHosts    docker.RegistryHosts
+	IdentityMapping  *idtools.IdentityMapping
+	LeaseManager     leases.Manager
+	GarbageCollect   func(context.Context) (gc.Stats, error)
+	ParallelismSem   *semaphore.Weighted
+	MetadataStore    *metadata.Store
+	MountPoolRoot    string
 }
 
 // Worker is a local worker instance with dedicated snapshotter, cache, and so on.
 // TODO: s/Worker/OpWorker/g ?
 type Worker struct {
 	WorkerOpt
-	CacheMgr      cache.Manager
-	SourceManager *source.Manager
-	imageWriter   *imageexporter.ImageWriter
-	ImageSource   *containerimage.Source
+	CacheMgr        cache.Manager
+	SourceManager   *source.Manager
+	imageWriter     *imageexporter.ImageWriter
+	ImageSource     *containerimage.Source
+	OCILayoutSource *containerimage.Source
 }
 
 // NewWorker instantiates a local worker
@@ -120,6 +125,7 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 		ImageStore:    opt.ImageStore,
 		CacheAccessor: cm,
 		RegistryHosts: opt.RegistryHosts,
+		ResolverType:  containerimage.ResolverTypeRegistry,
 		LeaseManager:  opt.LeaseManager,
 	})
 	if err != nil {
@@ -157,6 +163,21 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 	}
 	sm.Register(ss)
 
+	os, err := containerimage.NewSource(containerimage.SourceOpt{
+		Snapshotter:   opt.Snapshotter,
+		ContentStore:  opt.ContentStore,
+		Applier:       opt.Applier,
+		ImageStore:    opt.ImageStore,
+		CacheAccessor: cm,
+		ResolverType:  containerimage.ResolverTypeOCILayout,
+		LeaseManager:  opt.LeaseManager,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sm.Register(os)
+
 	iw, err := imageexporter.NewImageWriter(imageexporter.WriterOpt{
 		Snapshotter:  opt.Snapshotter,
 		ContentStore: opt.ContentStore,
@@ -176,16 +197,31 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 	}
 
 	return &Worker{
-		WorkerOpt:     opt,
-		CacheMgr:      cm,
-		SourceManager: sm,
-		imageWriter:   iw,
-		ImageSource:   is,
+		WorkerOpt:       opt,
+		CacheMgr:        cm,
+		SourceManager:   sm,
+		imageWriter:     iw,
+		ImageSource:     is,
+		OCILayoutSource: os,
 	}, nil
+}
+
+func (w *Worker) Close() error {
+	var rerr error
+	for _, provider := range w.NetworkProviders {
+		if err := provider.Close(); err != nil {
+			rerr = multierror.Append(rerr, err)
+		}
+	}
+	return rerr
 }
 
 func (w *Worker) ContentStore() content.Store {
 	return w.WorkerOpt.ContentStore
+}
+
+func (w *Worker) LeaseManager() leases.Manager {
+	return w.WorkerOpt.LeaseManager
 }
 
 func (w *Worker) ID() string {
@@ -216,6 +252,10 @@ func (w *Worker) Platforms(noCache bool) []ocispecs.Platform {
 
 func (w *Worker) GCPolicy() []client.PruneInfo {
 	return w.WorkerOpt.GCPolicy
+}
+
+func (w *Worker) BuildkitVersion() client.BuildkitVersion {
+	return w.WorkerOpt.BuildkitVersion
 }
 
 func (w *Worker) LoadRef(ctx context.Context, id string, hidden bool) (cache.ImmutableRef, error) {
@@ -315,6 +355,14 @@ func (w *Worker) PruneCacheMounts(ctx context.Context, ids []string) error {
 }
 
 func (w *Worker) ResolveImageConfig(ctx context.Context, ref string, opt llb.ResolveImageConfigOpt, sm *session.Manager, g session.Group) (digest.Digest, []byte, error) {
+	// is this an registry source? Or an OCI layout source?
+	switch opt.ResolverType {
+	case llb.ResolverTypeOCILayout:
+		return w.OCILayoutSource.ResolveImageConfig(ctx, ref, opt, sm, g)
+		// we probably should put an explicit case llb.ResolverTypeRegistry and default here,
+		// but then go complains that we do not have a return statement,
+		// so we just add it after
+	}
 	return w.ImageSource.ResolveImageConfig(ctx, ref, opt, sm, g)
 }
 
@@ -334,7 +382,7 @@ func (w *Worker) Exporter(name string, sm *session.Manager) (exporter.Exporter, 
 			SessionManager: sm,
 			ImageWriter:    w.imageWriter,
 			RegistryHosts:  w.RegistryHosts,
-			LeaseManager:   w.LeaseManager,
+			LeaseManager:   w.LeaseManager(),
 		})
 	case client.ExporterLocal:
 		return localexporter.New(localexporter.Opt{
@@ -349,14 +397,14 @@ func (w *Worker) Exporter(name string, sm *session.Manager) (exporter.Exporter, 
 			SessionManager: sm,
 			ImageWriter:    w.imageWriter,
 			Variant:        ociexporter.VariantOCI,
-			LeaseManager:   w.LeaseManager,
+			LeaseManager:   w.LeaseManager(),
 		})
 	case client.ExporterDocker:
 		return ociexporter.New(ociexporter.Opt{
 			SessionManager: sm,
 			ImageWriter:    w.imageWriter,
 			Variant:        ociexporter.VariantDocker,
-			LeaseManager:   w.LeaseManager,
+			LeaseManager:   w.LeaseManager(),
 		})
 	default:
 		return nil, errors.Errorf("exporter %q could not be found", name)
@@ -428,6 +476,14 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cac
 			cache.WithDescription(descr),
 			cache.WithCreationTime(tm),
 			descHandlers,
+		}
+		if ul, ok := remote.Provider.(interface {
+			UnlazySession(ocispecs.Descriptor) session.Group
+		}); ok {
+			s := ul.UnlazySession(desc)
+			if s != nil {
+				opts = append(opts, cache.Unlazy(s))
+			}
 		}
 		if dh, ok := descHandlers[desc.Digest]; ok {
 			if ref, ok := dh.Annotations["containerd.io/distribution.source.ref"]; ok {
