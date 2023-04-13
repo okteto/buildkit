@@ -27,6 +27,8 @@ type Config struct {
 	DNS *DNSConfig `toml:"dns"`
 
 	History *HistoryConfig `toml:"history"`
+
+	AuthorizationEndpoint string `tolm:"authorization-endpoint"`
 }
 
 type GRPCConfig struct {
