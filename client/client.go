@@ -202,7 +202,11 @@ func loadCredentials(opts *withCredentials) (grpc.DialOption, error) {
 		return nil, errors.Wrap(err, "could not read ca certificate")
 	}
 
-	certPool := x509.NewCertPool()
+	certPool, err := x509.SystemCertPool()
+	if err != nil {
+		certPool = x509.NewCertPool()
+	}
+
 	if ok := certPool.AppendCertsFromPEM(ca); !ok {
 		return nil, errors.New("failed to append ca certs")
 	}
