@@ -62,6 +62,14 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 			gopts = append(gopts, opt)
 			needWithInsecure = false
 		}
+		if credInfo, ok := o.(*withCredentialsAndSystemRoots); ok {
+			opt, err := loadCredentialsAndSystemRoots(credInfo)
+			if err != nil {
+				return nil, err
+			}
+			gopts = append(gopts, opt)
+			needWithInsecure = false
+		}
 		if wt, ok := o.(*withTracer); ok {
 			customTracer = true
 			tracerProvider = wt.tp
@@ -179,6 +187,50 @@ func WithContextDialer(df func(context.Context, string) (net.Conn, error)) Clien
 	return &withDialer{dialer: df}
 }
 
+type withCredentialsAndSystemRoots struct {
+	ServerName string
+	CACert     string
+	Cert       string
+	Key        string
+}
+
+func WithCredentialsAndSystemRoots(serverName, ca, cert, key string) ClientOpt {
+	return &withCredentialsAndSystemRoots{serverName, ca, cert, key}
+}
+
+func loadCredentialsAndSystemRoots(opts *withCredentialsAndSystemRoots) (grpc.DialOption, error) {
+	ca, err := ioutil.ReadFile(opts.CACert)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not read ca certificate")
+	}
+
+	certPool, err := x509.SystemCertPool()
+	if err != nil {
+		certPool = x509.NewCertPool()
+	}
+
+	if ok := certPool.AppendCertsFromPEM(ca); !ok {
+		return nil, errors.New("failed to append ca certs")
+	}
+
+	cfg := &tls.Config{
+		ServerName: opts.ServerName,
+		RootCAs:    certPool,
+	}
+
+	// we will produce an error if the user forgot about either cert or key if at least one is specified
+	if opts.Cert != "" || opts.Key != "" {
+		cert, err := tls.LoadX509KeyPair(opts.Cert, opts.Key)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not read certificate/key")
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+		cfg.BuildNameToCertificate()
+	}
+
+	return grpc.WithTransportCredentials(credentials.NewTLS(cfg)), nil
+}
+
 type withCredentials struct {
 	ServerName string
 	CACert     string
@@ -202,11 +254,7 @@ func loadCredentials(opts *withCredentials) (grpc.DialOption, error) {
 		return nil, errors.Wrap(err, "could not read ca certificate")
 	}
 
-	certPool, err := x509.SystemCertPool()
-	if err != nil {
-		certPool = x509.NewCertPool()
-	}
-
+	certPool := x509.NewCertPool()
 	if ok := certPool.AppendCertsFromPEM(ca); !ok {
 		return nil, errors.New("failed to append ca certs")
 	}
