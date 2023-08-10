@@ -225,7 +225,7 @@ func WithCredentialsAndSystemRoots(serverName, ca, cert, key string) ClientOpt {
 }
 
 func loadCredentialsAndSystemRoots(opts *withCredentialsAndSystemRoots) (grpc.DialOption, error) {
-	ca, err := ioutil.ReadFile(opts.CACert)
+	ca, err := os.ReadFile(opts.CACert)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not read ca certificate")
 	}
