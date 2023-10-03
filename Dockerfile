@@ -23,6 +23,7 @@ FROM alpine:${ALPINE_VERSION} AS alpine-s390x
 FROM alpine:${ALPINE_VERSION} AS alpine-ppc64le
 FROM alpine:edge@sha256:c223f84e05c23c0571ce8decefef818864869187e1a3ea47719412e205c8c64e AS alpine-riscv64
 FROM alpine-$TARGETARCH AS alpinebase
+RUN apk --no-cache add libcurl=8.3.0-r0
 
 # xx is a helper for cross-compilation
 FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.2.1 AS xx
