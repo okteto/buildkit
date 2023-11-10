@@ -76,6 +76,7 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 			}
 			gopts = append(gopts, opt)
 			needWithInsecure = false
+			tlsServerName = credInfo.ServerName
 		}
 		if wt, ok := o.(*withTracer); ok {
 			customTracer = true
@@ -251,7 +252,6 @@ func loadCredentialsAndSystemRoots(opts *withCredentialsAndSystemRoots) (grpc.Di
 			return nil, errors.Wrap(err, "could not read certificate/key")
 		}
 		cfg.Certificates = []tls.Certificate{cert}
-		cfg.BuildNameToCertificate()
 	}
 
 	return grpc.WithTransportCredentials(credentials.NewTLS(cfg)), nil
