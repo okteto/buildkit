@@ -75,6 +75,7 @@ func New(ctx context.Context, address string, opts ...ClientOpt) (*Client, error
 			}
 			gopts = append(gopts, opt)
 			needWithInsecure = false
+			tlsServerName = credInfo.ServerName
 		}
 		if wt, ok := o.(*withTracer); ok {
 			customTracer = true
