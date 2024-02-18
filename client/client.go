@@ -312,6 +312,16 @@ func WithServerConfigSystem(serverName string) ClientOpt {
 	}
 }
 
+// WithCAAndSystemRoot is similar to WithServerConfig but it also enables
+// the system's certificate pool.
+func WithCAAndSystemRoot(serverName, caCert string) ClientOpt {
+	return &withCredentials{
+		serverName:   serverName,
+		caCert:       caCert,
+		caCertSystem: true,
+	}
+}
+
 func loadCredentials(opts *withCredentials) (grpc.DialOption, error) {
 	cfg := &tls.Config{}
 
