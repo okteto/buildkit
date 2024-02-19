@@ -91,6 +91,11 @@ func main() {
 			Name:  "wait",
 			Usage: "block RPCs until the connection becomes available",
 		},
+		cli.StringFlag{
+			Name:  "authorization-token",
+			Usage: "authorization token (optional)",
+			Value: "",
+		},
 	}
 
 	app.Commands = []cli.Command{
