@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -23,7 +24,9 @@ import (
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/gofrs/flock"
+	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
 	"github.com/hashicorp/go-multierror"
+	"github.com/moby/buildkit/auth"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/cache/remotecache/azblob"
 	"github.com/moby/buildkit/cache/remotecache/gha"
@@ -39,6 +42,7 @@ import (
 	dockerfile "github.com/moby/buildkit/frontend/dockerfile/builder"
 	"github.com/moby/buildkit/frontend/gateway"
 	"github.com/moby/buildkit/frontend/gateway/forwarder"
+	"github.com/moby/buildkit/okteto"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/bboltcachestorage"
@@ -60,6 +64,7 @@ import (
 	"github.com/moby/buildkit/worker"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"go.etcd.io/bbolt"
@@ -219,6 +224,11 @@ func main() {
 			Name:  "otel-socket-path",
 			Usage: "OTEL collector trace socket path",
 		},
+		cli.StringFlag{
+			Name:  "authorization-endpoint",
+			Usage: "authorization endpoint",
+			Value: "",
+		},
 	)
 	app.Flags = append(app.Flags, appFlags...)
 	app.Flags = append(app.Flags, serviceFlags()...)
@@ -289,10 +299,21 @@ func main() {
 			otelgrpc.WithMeterProvider(mp),
 			otelgrpc.WithPropagators(propagators),
 		)
+
+		if cfg.AuthorizationEndpoint == "" {
+			logrus.Fatal("no authorization endpoint was provided, this is required for this fork of buildkitd")
+		}
+		logrus.Info("buildkitd is running with auth required")
+		svc := auth.NewService(cfg.AuthorizationEndpoint)
+		unaryAuthorizer := grpc_auth.UnaryServerInterceptor(svc.EnsureValidToken)
+		streamAuthorizer := grpc_auth.StreamServerInterceptor(svc.EnsureValidToken)
+
 		opts := []grpc.ServerOption{
 			grpc.StatsHandler(statsHandler),
-			grpc.ChainUnaryInterceptor(unaryInterceptor, grpcerrors.UnaryServerInterceptor),
-			grpc.StreamInterceptor(grpcerrors.StreamServerInterceptor),
+			grpc.ChainUnaryInterceptor(unaryInterceptor, unaryAuthorizer, grpcerrors.UnaryServerInterceptor),
+			grpc.ChainStreamInterceptor(streamAuthorizer, grpcerrors.StreamServerInterceptor),
+			grpc.KeepaliveEnforcementPolicy(okteto.LoadKeepaliveEnforcementPolicy()),
+			grpc.KeepaliveParams(okteto.LoadKeepaliveServerParams()),
 			grpc.MaxRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
 			grpc.MaxSendMsgSize(defaults.DefaultMaxSendMsgSize),
 		}
@@ -373,6 +394,12 @@ func main() {
 		if err := serveGRPC(server, listeners, errCh); err != nil {
 			return err
 		}
+
+		http.Handle("/metrics", promhttp.Handler())
+		go func() {
+			logrus.Info("running metrics server on :2112")
+			http.ListenAndServe(":2112", nil)
+		}()
 
 		select {
 		case serverErr := <-errCh:
@@ -612,6 +639,10 @@ func applyMainFlags(c *cli.Context, cfg *config.Config) error {
 			}
 			cfg.GRPC.GID = &gid
 		}
+	}
+
+	if authEndpoint := c.String("authorization-endpoint"); authEndpoint != "" {
+		cfg.AuthorizationEndpoint = authEndpoint
 	}
 
 	if tlscert := c.String("tlscert"); tlscert != "" {
