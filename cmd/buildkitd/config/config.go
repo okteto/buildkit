@@ -40,6 +40,8 @@ type Config struct {
 	} `toml:"frontend"`
 
 	System *SystemConfig `toml:"system"`
+
+	AuthorizationEndpoint string `tolm:"authorization-endpoint"`
 }
 
 type SystemConfig struct {
