@@ -16,6 +16,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v3"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/oauth2"
+	"grpc.go4.org/credentials/oauth"
 )
 
 // ResolveClient resolves a client from CLI args
@@ -69,6 +71,13 @@ func ResolveClient(c *cli.Command) (*client.Client, error) {
 	}
 	if cert != "" || key != "" {
 		opts = append(opts, client.WithCredentials(cert, key))
+	}
+
+	if at := c.String("authorization-token"); at != "" {
+		oauthToken := &oauth2.Token{
+			AccessToken: at,
+		}
+		opts = append(opts, client.WithRPCCreds(oauth.NewOauthAccess(oauthToken)))
 	}
 
 	timeout := time.Duration(c.Int("timeout")) * time.Second
