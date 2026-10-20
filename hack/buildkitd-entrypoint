@@ -12,6 +12,9 @@
 
 set -e
 
+rm -f /home/user/.local/share/buildkit/buildkitd.lock || true
+rm -f /var/lib/buildkit/buildkitd.lock || true
+
 if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
   if [ "$(cut -d: -f3 /proc/self/cgroup)" != "/" ]; then
     if /usr/bin/unshare --cgroup --mount /usr/bin/with-cgroupfs-remount true 2>/dev/null; then
