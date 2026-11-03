@@ -322,6 +322,11 @@ func (c *Controller) Prune(req *controlapi.PruneRequest, stream controlapi.Contr
 	return eg2.Wait()
 }
 
+// GetActiveBuilds returns the number of currently active builds
+func (c *Controller) GetActiveBuilds() int64 {
+	return c.buildCount.Load()
+}
+
 func (c *Controller) Export(ctx context.Context, req *tracev1.ExportTraceServiceRequest) (*tracev1.ExportTraceServiceResponse, error) {
 	if c.traceForwarder == nil {
 		return nil, status.Errorf(codes.Unavailable, "trace collector not configured")

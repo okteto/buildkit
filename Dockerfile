@@ -488,6 +488,8 @@ VOLUME /var/lib/buildkit
 # rootless builds a rootless variant of buildkitd image
 FROM alpine:${ALPINE_VERSION} AS rootless
 RUN apk add --no-cache fuse3 fuse-overlayfs git openssh openssl pigz shadow-uidmap xz
+# okteto: require the CA bundle without the distrusted eMudhra emSign roots
+RUN apk add --no-cache 'ca-certificates-bundle>=20261020-r0'
 RUN adduser -D -u 1000 user \
   && mkdir -p /run/user/1000 /home/user/.local/tmp /home/user/.local/share/buildkit \
   && chown -R user /run/user/1000 /home/user \
@@ -507,3 +509,7 @@ ENTRYPOINT ["rootlesskit", "buildkitd"]
 
 # buildkit builds the buildkit container image
 FROM buildkit-$TARGETOS${BUILDKIT_DEBUG:+-debug} AS buildkit
+# okteto: require the CA bundle without the distrusted eMudhra emSign roots
+RUN apk add --no-cache iptables 'ca-certificates-bundle>=20261020-r0'
+COPY --from=cni-plugins /opt/cni/bin /opt/cni/bin
+COPY --link hack/fixtures/cni.json /etc/buildkit/cni.json
