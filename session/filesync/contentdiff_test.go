@@ -551,9 +551,12 @@ func TestIsComparedXattr(t *testing.T) {
 		{name: "user.test", expected: true},
 		{name: "trusted.test", expected: true},
 		{name: "security.capability", expected: true},
+		// not part of the content hash of the cache, but fsutil transfers them
+		{name: "security.ima", expected: true},
+		{name: "system.posix_acl_access", expected: true},
+		{name: "system.posix_acl_default", expected: true},
+		// the node of the daemon labels every file
 		{name: "security.selinux"},
-		{name: "security.ima"},
-		{name: "system.posix_acl_access"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -563,6 +566,7 @@ func TestIsComparedXattr(t *testing.T) {
 }
 
 func TestSameComparedXattrs(t *testing.T) {
+	const acl = "system.posix_acl_access"
 	tests := []struct {
 		name     string
 		sent     map[string][]byte
@@ -574,11 +578,6 @@ func TestSameComparedXattrs(t *testing.T) {
 			name:     "same",
 			sent:     map[string][]byte{"user.a": []byte("1"), "security.capability": []byte("cap")},
 			saved:    map[string][]byte{"user.a": []byte("1"), "security.capability": []byte("cap")},
-			expected: true,
-		},
-		{
-			name:     "sent one that is not part of the content hash",
-			sent:     map[string][]byte{"security.selinux": []byte("label")},
 			expected: true,
 		},
 		{name: "only in the saved file", saved: map[string][]byte{"security.capability": []byte("cap")}},
@@ -597,6 +596,46 @@ func TestSameComparedXattrs(t *testing.T) {
 			name:  "one more in the saved file",
 			sent:  map[string][]byte{"user.a": []byte("1")},
 			saved: map[string][]byte{"user.a": []byte("1"), "user.b": []byte("2")},
+		},
+		{
+			name:     "same ACL",
+			sent:     map[string][]byte{acl: []byte("acl")},
+			saved:    map[string][]byte{acl: []byte("acl")},
+			expected: true,
+		},
+		{
+			name:  "ACL that the client changed",
+			sent:  map[string][]byte{acl: []byte("new")},
+			saved: map[string][]byte{acl: []byte("old")},
+		},
+		{name: "ACL that the client removed", saved: map[string][]byte{acl: []byte("acl")}},
+		{name: "ACL that the client added", sent: map[string][]byte{acl: []byte("acl")}},
+		{name: "security attribute only in the saved file", saved: map[string][]byte{"security.ima": []byte("ima")}},
+		{
+			name:  "security attribute with another value",
+			sent:  map[string][]byte{"security.ima": []byte("new")},
+			saved: map[string][]byte{"security.ima": []byte("old")},
+		},
+		{
+			name:     "SELinux label that only the client has",
+			sent:     map[string][]byte{"security.selinux": []byte("label")},
+			expected: true,
+		},
+		{
+			name:     "SELinux label that only the saved file has",
+			saved:    map[string][]byte{"security.selinux": []byte("label")},
+			expected: true,
+		},
+		{
+			name:     "other SELinux label",
+			sent:     map[string][]byte{"security.selinux": []byte("client")},
+			saved:    map[string][]byte{"security.selinux": []byte("node")},
+			expected: true,
+		},
+		{
+			name:  "same SELinux label and another ACL",
+			sent:  map[string][]byte{"security.selinux": []byte("label"), acl: []byte("new")},
+			saved: map[string][]byte{"security.selinux": []byte("label"), acl: []byte("old")},
 		},
 	}
 	for _, tt := range tests {

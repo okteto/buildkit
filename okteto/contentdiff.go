@@ -1,7 +1,6 @@
 package okteto
 
 import (
-	"context"
 	"os"
 	"strconv"
 	"strings"
@@ -75,37 +74,40 @@ func LocalSourcesFromOpts(opts map[string]string) map[string]string {
 
 // jobValues is implemented by the job context that a build step runs with.
 type jobValues interface {
-	EachValue(ctx context.Context, key string, fn func(any) error) error
+	EachJobValue(key string, fn func(sessionID string, value any))
 }
 
-// LocalSource returns the source that the client of the build named for the
-// local directory name, or "" if it named none.
+// LocalSource returns the source that the client of the session sessionID
+// named for the local directory name, or "" if there is none.
 //
-// jobCtx is the job context of the build step. A step can belong to several
-// builds: if they don't agree on the source there is none, and the files are
-// compared by modification time as usual.
-func LocalSource(ctx context.Context, jobCtx any, name string) string {
+// jobCtx is the job context of the build step and sessionID the session that
+// the files are requested from. A step can belong to several builds, of that
+// client and of others. Only the builds of that session count, because its
+// client is the one that is asked for the digests: a build of another session
+// can't opt it in. Every one of them has to name the same source. If one of
+// them names none or a different one, or if the session has no build in the
+// step, there is no source and the files are compared by modification time as
+// usual.
+func LocalSource(jobCtx any, sessionID, name string) string {
 	jv, ok := jobCtx.(jobValues)
-	if !ok {
+	if !ok || sessionID == "" {
 		return ""
 	}
-	source, conflict := "", false
-	err := jv.EachValue(ctx, LocalSourcesJobKey, func(v any) error {
-		sources, ok := v.(map[string]string)
-		if !ok {
-			return nil
+	source, first, agreed := "", true, true
+	jv.EachJobValue(LocalSourcesJobKey, func(id string, v any) {
+		if id != sessionID {
+			return
 		}
+		// a build without the option, or with a value of another type, has
+		// no source: it does not agree with one that has it
+		sources, _ := v.(map[string]string)
 		s := sources[name]
-		switch {
-		case s == "" || s == source:
-		case source == "":
-			source = s
-		default:
-			conflict = true
+		if !first && s != source {
+			agreed = false
 		}
-		return nil
+		source, first = s, false
 	})
-	if err != nil || conflict {
+	if !agreed {
 		return ""
 	}
 	return source

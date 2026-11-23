@@ -1,8 +1,6 @@
 package okteto
 
 import (
-	"context"
-	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -61,23 +59,24 @@ func TestLocalSourcesFromOpts(t *testing.T) {
 	}
 }
 
-// testJobValues has the values that each job of a build step has for
-// LocalSourcesJobKey.
-type testJobValues struct {
-	values []any
-	err    error
+// testJob is one of the builds of a build step: the session of its client and
+// its value for LocalSourcesJobKey, nil if the client did not send the option.
+type testJob struct {
+	sessionID string
+	value     any
 }
 
-func (j testJobValues) EachValue(_ context.Context, key string, fn func(any) error) error {
-	if key != LocalSourcesJobKey {
-		return nil
-	}
-	for _, v := range j.values {
-		if err := fn(v); err != nil {
-			return err
+// testJobs is the job context of a build step that belongs to several builds.
+type testJobs []testJob
+
+func (j testJobs) EachJobValue(key string, fn func(sessionID string, value any)) {
+	for _, job := range j {
+		var value any
+		if key == LocalSourcesJobKey {
+			value = job.value
 		}
+		fn(job.sessionID, value)
 	}
-	return j.err
 }
 
 func TestLocalSource(t *testing.T) {
@@ -90,19 +89,33 @@ func TestLocalSource(t *testing.T) {
 		jobCtx   any
 		expected string
 	}{
+		{name: "no job context", jobCtx: nil, expected: ""},
 		{name: "job context without values", jobCtx: struct{}{}, expected: ""},
-		{name: "no job named a source", jobCtx: testJobValues{}, expected: ""},
-		{name: "one job", jobCtx: testJobValues{values: []any{a}}, expected: "a"},
-		{name: "source of another local directory", jobCtx: testJobValues{values: []any{other}}, expected: ""},
-		{name: "jobs with the same source", jobCtx: testJobValues{values: []any{a, a}}, expected: "a"},
-		{name: "one of the jobs named no source", jobCtx: testJobValues{values: []any{other, a}}, expected: "a"},
-		{name: "jobs with different sources", jobCtx: testJobValues{values: []any{a, b}}, expected: ""},
-		{name: "value of another type", jobCtx: testJobValues{values: []any{"a"}}, expected: ""},
-		{name: "values can't be read", jobCtx: testJobValues{values: []any{a}, err: errors.New("failed")}, expected: ""},
+		{name: "no builds", jobCtx: testJobs{}, expected: ""},
+		{name: "one build", jobCtx: testJobs{{"session", a}}, expected: "a"},
+		{name: "build without the option", jobCtx: testJobs{{"session", nil}}, expected: ""},
+		{name: "source of another local directory", jobCtx: testJobs{{"session", other}}, expected: ""},
+		{name: "value of another type", jobCtx: testJobs{{"session", "a"}}, expected: ""},
+		{name: "builds of the session with the same source", jobCtx: testJobs{{"session", a}, {"session", a}}, expected: "a"},
+		{name: "builds of the session with different sources", jobCtx: testJobs{{"session", a}, {"session", b}}, expected: ""},
+		{name: "a build of the session without the option, first", jobCtx: testJobs{{"session", nil}, {"session", a}}, expected: ""},
+		{name: "a build of the session without the option, last", jobCtx: testJobs{{"session", a}, {"session", nil}}, expected: ""},
+		{name: "a build of the session with the source of another local directory", jobCtx: testJobs{{"session", other}, {"session", a}}, expected: ""},
+		// the builds of other clients don't count, whatever they sent
+		{name: "only another session named a source", jobCtx: testJobs{{"session", nil}, {"another", a}}, expected: ""},
+		{name: "only another session named a source, first", jobCtx: testJobs{{"another", a}, {"session", nil}}, expected: ""},
+		{name: "another session without the option", jobCtx: testJobs{{"session", a}, {"another", nil}}, expected: "a"},
+		{name: "another session with another source", jobCtx: testJobs{{"another", b}, {"session", a}}, expected: "a"},
+		{name: "the session has no build in the step", jobCtx: testJobs{{"another", a}}, expected: ""},
+		{name: "build without session", jobCtx: testJobs{{"", a}}, expected: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, LocalSource(t.Context(), tt.jobCtx, "context"))
+			assert.Equal(t, tt.expected, LocalSource(tt.jobCtx, "session", "context"))
 		})
 	}
+}
+
+func TestLocalSourceWithoutSession(t *testing.T) {
+	assert.Empty(t, LocalSource(testJobs{{"", map[string]string{"context": "a"}}}, "", "context"))
 }

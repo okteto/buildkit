@@ -53,8 +53,10 @@ import (
 //
 // A file is only kept when a transfer would leave the same file and the same
 // content hash in the cache: same size, mode and content, and the same
-// extended attributes among the ones that are part of that hash. Owner and
-// link target are compared by fsutil as usual.
+// extended attributes. All the attributes that fsutil transfers are compared,
+// also the ones that are not part of that hash, like ACLs. The SELinux label
+// is the exception, see isComparedXattr. Owner and link target are compared
+// by fsutil as usual.
 //
 // The paths of the stats come from the client and the saved copy has whatever
 // earlier clients sent. The receiver checks the order of the paths with the
@@ -95,6 +97,10 @@ const (
 	// savedDirsMaxDepth is the number of nested directories of the saved copy
 	// that the receiver keeps open. Files that are deeper are not compared.
 	savedDirsMaxDepth = 128
+
+	// selinuxXattr is the extended attribute with the SELinux label of a
+	// file, see isComparedXattr.
+	selinuxXattr = "security.selinux"
 )
 
 // useContentDiff reports whether a transfer compares the files by content:
@@ -553,7 +559,7 @@ func (s *contentDiffStream) sameSavedFile(dir *os.Root, base string, size int64,
 	defer f.Close()
 
 	// fsutil does not compare extended attributes: a file that is kept
-	// keeps the ones of the saved copy
+	// keeps all the ones of the saved copy, also its ACLs
 	saved, err := savedXattrs(f)
 	if err != nil || !sameComparedXattrs(xattrs, saved) {
 		return false
@@ -565,15 +571,27 @@ func (s *contentDiffStream) sameSavedFile(dir *os.Root, base string, size int64,
 	return err == nil && bytes.Equal(savedDgst[:], dgst)
 }
 
-// isComparedXattr reports whether an extended attribute is part of the
-// content hash of the cache (cache/contenthash).
+// isComparedXattr reports whether an extended attribute counts when a saved
+// file is compared with the file of the client.
+//
+// Every attribute that fsutil transfers counts, also the ones that are not
+// part of the content hash of the cache: ACLs (system.*) and the security
+// attributes. A transfer replaces the file and with it all its attributes, so
+// a saved file that differs in one of them, or that has one that the client
+// did not send, is not the file that a transfer would leave.
+//
+// The exception is the SELinux label. A node with SELinux gives one to every
+// file by its own policy, whether the client sent one or not, and a client
+// with SELinux sends the one of its own policy. Compared, no file would ever
+// be the same on such a node. A file that is kept keeps the label that it
+// has.
 func isComparedXattr(name string) bool {
-	return name == "security.capability" || (!strings.HasPrefix(name, "security.") && !strings.HasPrefix(name, "system."))
+	return name != selinuxXattr
 }
 
 // sameComparedXattrs reports whether the extended attributes sent by the
 // client and the ones of the saved file (see savedXattrs) are the same, for
-// the ones that are part of the content hash.
+// the ones that are compared.
 func sameComparedXattrs(sent, saved map[string][]byte) bool {
 	n := 0
 	for name, value := range sent {
@@ -585,7 +603,13 @@ func sameComparedXattrs(sent, saved map[string][]byte) bool {
 			return false
 		}
 	}
-	return n == len(saved)
+	// every compared one of the saved file was sent
+	for name := range saved {
+		if isComparedXattr(name) {
+			n--
+		}
+	}
+	return n == 0
 }
 
 // finish applies the modification time sent by the client to the files whose

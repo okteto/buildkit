@@ -13,8 +13,8 @@ import (
 )
 
 // savedXattrs returns the extended attributes of an open file of the saved
-// copy that are part of the content hash, without the ones that fsutil does
-// not load.
+// copy that are compared (see isComparedXattr), without the ones that fsutil
+// does not load.
 func savedXattrs(f *os.File) (map[string][]byte, error) {
 	defer runtime.KeepAlive(f)
 	fd := int(f.Fd())

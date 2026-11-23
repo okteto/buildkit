@@ -1,11 +1,10 @@
 package solver
 
-import "context"
-
-// EachValue (okteto) calls fn with the value that each of the jobs building
-// the vertex has for key. It lets a build step read a value of its build, as
-// Builder.EachValue does for a frontend, without changing JobContext.
-func (s *state) EachValue(ctx context.Context, key string, fn func(any) error) error {
+// EachJobValue (okteto) calls fn once for each of the jobs building the
+// vertex, with the session of the job and the value that it has for key.
+// value is nil for a job without one: unlike EachValue, such a job is not
+// left out, so a build step can tell that one of its builds did not set it.
+func (s *state) EachJobValue(key string, fn func(sessionID string, value any)) {
 	s.mu.RLock()
 	jobs := make([]*Job, 0, len(s.jobs))
 	for j := range s.jobs {
@@ -14,9 +13,7 @@ func (s *state) EachValue(ctx context.Context, key string, fn func(any) error) e
 	s.mu.RUnlock()
 
 	for _, j := range jobs {
-		if err := j.EachValue(ctx, key, fn); err != nil {
-			return err
-		}
+		value, _ := j.values.Load(key)
+		fn(j.SessionID, value)
 	}
-	return nil
 }

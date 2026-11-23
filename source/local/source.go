@@ -126,10 +126,6 @@ type localSourceHandler struct {
 	src LocalIdentifier
 	sm  *session.Manager
 	*localSource
-
-	// syncSource (okteto) is the source that the client of the build named for
-	// the files, see okteto.LocalSourceOptPrefix. It is empty if it named none.
-	syncSource string
 }
 
 func (ls *localSourceHandler) CacheKey(ctx context.Context, jobCtx solver.JobContext, index int) (string, string, solver.CacheOpts, bool, error) {
@@ -169,13 +165,9 @@ func (ls *localSourceHandler) CacheKey(ctx context.Context, jobCtx solver.JobCon
 
 func (ls *localSourceHandler) Snapshot(ctx context.Context, jobCtx solver.JobContext) (cache.ImmutableRef, error) {
 	g := jobCtx.Session()
-	// okteto: only the transfers that compare modification times can compare content instead
-	if ls.src.Differ == fsutil.DiffMetadata && !ls.src.MetadataOnly {
-		ls.syncSource = okteto.LocalSource(ctx, jobCtx, ls.src.Name)
-	}
 	sessionID := ls.src.SessionID
 	if sessionID == "" {
-		return ls.snapshotWithAnySession(ctx, g)
+		return ls.snapshotWithAnySession(ctx, jobCtx, g)
 	}
 
 	timeoutCtx, cancel := context.WithCancelCause(ctx)
@@ -184,24 +176,24 @@ func (ls *localSourceHandler) Snapshot(ctx context.Context, jobCtx solver.JobCon
 
 	caller, err := ls.sm.Get(timeoutCtx, sessionID, false)
 	if err != nil {
-		return ls.snapshotWithAnySession(ctx, g)
+		return ls.snapshotWithAnySession(ctx, jobCtx, g)
 	}
 
-	ref, err := ls.snapshot(ctx, caller)
+	ref, err := ls.snapshot(ctx, caller, ls.syncSource(jobCtx, sessionID))
 	if err != nil {
 		var serr filesync.InvalidSessionError
 		if errors.As(err, &serr) {
-			return ls.snapshotWithAnySession(ctx, g)
+			return ls.snapshotWithAnySession(ctx, jobCtx, g)
 		}
 		return nil, err
 	}
 	return ref, nil
 }
 
-func (ls *localSourceHandler) snapshotWithAnySession(ctx context.Context, g session.Group) (cache.ImmutableRef, error) {
+func (ls *localSourceHandler) snapshotWithAnySession(ctx context.Context, jobCtx solver.JobContext, g session.Group) (cache.ImmutableRef, error) {
 	var ref cache.ImmutableRef
-	err := ls.sm.Any(ctx, g, func(ctx context.Context, _ string, c session.Caller) error {
-		r, err := ls.snapshot(ctx, c)
+	err := ls.sm.Any(ctx, g, func(ctx context.Context, sessionID string, c session.Caller) error {
+		r, err := ls.snapshot(ctx, c, ls.syncSource(jobCtx, sessionID))
 		if err != nil {
 			return err
 		}
@@ -211,14 +203,24 @@ func (ls *localSourceHandler) snapshotWithAnySession(ctx context.Context, g sess
 	return ref, err
 }
 
-func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Caller) (out cache.ImmutableRef, retErr error) {
+// syncSource (okteto) returns the source that the client of the session that
+// sends the files named for them, see okteto.LocalSourceOptPrefix. It is
+// empty if that client named none: the builds of other sessions that share
+// the step don't count.
+func (ls *localSourceHandler) syncSource(jobCtx solver.JobContext, sessionID string) string {
+	// only the transfers that compare modification times can compare content instead
+	if ls.src.Differ != fsutil.DiffMetadata || ls.src.MetadataOnly {
+		return ""
+	}
+	return okteto.LocalSource(jobCtx, sessionID, ls.src.Name)
+}
+
+func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Caller, syncSource string) (out cache.ImmutableRef, retErr error) {
 	metaSfx := ""
 	if ls.src.MetadataOnly {
 		metaSfx = ":metadata"
 	}
 	sharedKey := ls.src.Name + ":" + ls.src.SharedKeyHint + ":" + caller.SharedKey() + metaSfx // TODO: replace caller.SharedKey() with source based hint from client(absolute-path+nodeid)
-	// okteto: source that the client of the build named for the files, empty if it named none
-	syncSource := ls.syncSource
 
 	var mutable cache.MutableRef
 	sis, err := searchSharedKey(ctx, ls.cm, sharedKey)
