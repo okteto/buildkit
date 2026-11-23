@@ -12,6 +12,7 @@ import (
 	"github.com/containerd/continuity/sysx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tonistiigi/fsutil"
 )
 
 const (
@@ -352,4 +353,50 @@ func TestContentDiffKeepsFilesWithOtherSELinuxLabels(t *testing.T) {
 	assert.Equal(t, "label of A", string(contentDiffXattr(t, filepath.Join(dest, "both"), selinuxXattr)))
 	assert.Equal(t, "label of A", string(contentDiffXattr(t, filepath.Join(dest, "node"), selinuxXattr)))
 	assert.Nil(t, contentDiffXattr(t, filepath.Join(dest, "client"), selinuxXattr))
+}
+
+// The key that carries the digest can't be the name of an extended attribute
+// of a file, so the digest never replaces one.
+func TestContentDigestXattrIsNotAnAttributeName(t *testing.T) {
+	dir := writeContentDiffTree(t, map[string]string{"file": "content"}, contentDiffModTimeA)
+	p := filepath.Join(dir, "file")
+	// the filesystem has extended attributes
+	setContentDiffXattr(t, p, "value")
+
+	err := sysx.LSetxattr(p, contentDigestXattr, []byte("value"), 0)
+
+	require.Error(t, err)
+}
+
+// macOS takes attribute names without a namespace: a file can have one that
+// looks like a key of this protocol. It is sent as any other attribute, next
+// to the digest.
+func TestWithContentDigestsKeepsAttributeNamedLikeADigest(t *testing.T) {
+	const name = "okteto.sha256"
+	dir := writeContentDiffTree(t, map[string]string{"file": "content"}, contentDiffModTimeA)
+	setContentDiffXattrNamed(t, filepath.Join(dir, "file"), name, []byte("an attribute of the file"))
+	base, err := fsutil.NewFS(dir)
+	require.NoError(t, err)
+
+	stats := walkContentDiffStats(t, withContentDigests(base))
+
+	assert.Equal(t, map[string][]byte{
+		name:               []byte("an attribute of the file"),
+		contentDigestXattr: contentDiffDigest("content"),
+	}, stats["file"].Xattrs)
+}
+
+// The same on the side of the daemon: only the digest is removed from the
+// stat, and the attribute counts for the comparison as any other.
+func TestContentDiffStreamKeepsAttributeNamedLikeADigest(t *testing.T) {
+	const name = "okteto.sha256"
+	s, _ := newTestContentDiffStream(t)
+	st := newContentDiffStat("file")
+	st.Xattrs[name] = []byte("an attribute of the file")
+
+	s.handleStat(st)
+
+	assert.Equal(t, map[string][]byte{name: []byte("an attribute of the file")}, st.Xattrs)
+	// the saved file does not have the attribute
+	assert.Empty(t, s.kept)
 }

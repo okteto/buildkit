@@ -81,9 +81,12 @@ const (
 	contentDigestSHA256 = "sha256"
 
 	// contentDigestXattr is the key of the Stat.Xattrs entry that carries the
-	// digest. It is sent with every regular file, so it is short. It is not a
-	// valid xattr name on Linux on purpose.
-	contentDigestXattr = "okteto.sha256"
+	// digest. It is sent with every regular file, so it is short. It starts
+	// with a NUL byte so that no file can have an extended attribute with
+	// this name, on any platform: the system calls take the names as C
+	// strings. A key that is only invalid on Linux is not enough, because
+	// macOS takes names without a namespace.
+	contentDigestXattr = "\x00sha256"
 
 	contentDigestBufferSize = 256 << 10
 
