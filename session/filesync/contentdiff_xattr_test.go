@@ -400,3 +400,26 @@ func TestContentDiffStreamKeepsAttributeNamedLikeADigest(t *testing.T) {
 	// the saved file does not have the attribute
 	assert.Empty(t, s.kept)
 }
+
+// The same when the modification time is the one of the saved file: the ACL
+// is compared, and the file is sent when it is another one.
+func TestContentDiffSendsFilesWithSameModTimeAndOtherACL(t *testing.T) {
+	files := map[string]string{"changed": "content", "removed": "content", "same": "content"}
+	dirA := writeContentDiffTree(t, files, contentDiffModTimeA)
+	dirB := writeContentDiffTree(t, files, contentDiffModTimeA)
+	setContentDiffXattrNamed(t, filepath.Join(dirA, "changed"), contentDiffACLXattr, contentDiffACL(1001))
+	setContentDiffXattrNamed(t, filepath.Join(dirB, "changed"), contentDiffACLXattr, contentDiffACL(1002))
+	setContentDiffXattrNamed(t, filepath.Join(dirA, "removed"), contentDiffACLXattr, contentDiffACL(1001))
+	setContentDiffXattrNamed(t, filepath.Join(dirA, "same"), contentDiffACLXattr, contentDiffACL(1001))
+	setContentDiffXattrNamed(t, filepath.Join(dirB, "same"), contentDiffACLXattr, contentDiffACL(1001))
+	dest := t.TempDir()
+	syncContentDiffDir(t, dirA, dest, FSSendRequestOpt{ContentDiff: true})
+
+	second := syncContentDiffDir(t, dirB, dest, FSSendRequestOpt{ContentDiff: true})
+
+	assert.Equal(t, []string{"changed", "removed"}, second.writtenFiles())
+	requireSameContentDiffTree(t, dirB, dest)
+	assert.Equal(t, contentDiffACL(1002), contentDiffXattr(t, filepath.Join(dest, "changed"), contentDiffACLXattr))
+	assert.Nil(t, contentDiffXattr(t, filepath.Join(dest, "removed"), contentDiffACLXattr))
+	assert.Equal(t, contentDiffACL(1001), contentDiffXattr(t, filepath.Join(dest, "same"), contentDiffACLXattr))
+}

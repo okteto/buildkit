@@ -404,6 +404,73 @@ func TestSnapshotComparesModTimesWithoutSource(t *testing.T) {
 	assert.Equal(t, testLocalModTimeB.UnixNano(), second[0].files["Dockerfile"].ModTime)
 }
 
+// writeTestLocalTreeWithOtherDockerfile creates a directory like the one of
+// writeTestLocalTree, with the same modification times, whose Dockerfile has
+// another content of the same size.
+func writeTestLocalTreeWithOtherDockerfile(t *testing.T, modTime time.Time) string {
+	t.Helper()
+	const content = "FROM busybox\n"
+	require.Len(t, content, len(testLocalTree["Dockerfile"]))
+	dir := writeTestLocalTree(t, modTime)
+	p := filepath.Join(dir, "Dockerfile")
+	require.NoError(t, os.WriteFile(p, []byte(content), 0600))
+	require.NoError(t, os.Chtimes(p, modTime, modTime))
+	return dir
+}
+
+// The modification times of a copy that another source synced prove nothing:
+// a file with the saved size and modification time and another content is
+// received, and the one that is the same is kept.
+func TestSnapshotComparesContentOfFilesWithSameModTimeForOtherSource(t *testing.T) {
+	cm := newTestCacheManager(t)
+	dirA := writeTestLocalTree(t, testLocalModTimeA)
+	dirB := writeTestLocalTreeWithOtherDockerfile(t, testLocalModTimeA)
+
+	syncTestLocalDir(t, cm, dirA, "repository", "a")
+	first := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, first, 1)
+	require.Equal(t, "FROM scratch\n", first[0].files["Dockerfile"].Content)
+
+	syncTestLocalDir(t, cm, dirB, "repository", "b")
+	second := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, second, 1)
+
+	assert.Equal(t, "b", second[0].source)
+	assert.Equal(t, "FROM busybox\n", second[0].files["Dockerfile"].Content)
+	assert.Equal(t, testLocalModTimeA.UnixNano(), second[0].files["Dockerfile"].ModTime)
+	assert.NotEqual(t, first[0].files["Dockerfile"].Inode, second[0].files["Dockerfile"].Inode)
+	assert.Equal(t, first[0].files["src/main.go"], second[0].files["src/main.go"])
+}
+
+// For the source that synced the copy last, and for a build that names none,
+// the rule is the one of upstream: size and modification time decide.
+func TestSnapshotTrustsModTimesOfSameSource(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{name: "same source", source: "a"},
+		{name: "no source", source: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := newTestCacheManager(t)
+			dirA := writeTestLocalTree(t, testLocalModTimeA)
+			dirB := writeTestLocalTreeWithOtherDockerfile(t, testLocalModTimeA)
+
+			syncTestLocalDir(t, cm, dirA, "repository", "a")
+			first := readTestSavedCopies(t, cm, "repository")
+			require.Len(t, first, 1)
+
+			syncTestLocalDir(t, cm, dirB, "repository", tt.source)
+			second := readTestSavedCopies(t, cm, "repository")
+			require.Len(t, second, 1)
+
+			assert.Equal(t, first[0].files, second[0].files)
+		})
+	}
+}
+
 // A build that names no source does nothing new: it compares modification
 // times and leaves the record of the copy as it was.
 func TestSnapshotKeepsSourceWhenClientHasNone(t *testing.T) {

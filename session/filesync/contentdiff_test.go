@@ -245,6 +245,45 @@ func TestContentDiffKeepsFilesWithSameModTime(t *testing.T) {
 	requireSameContentDiffTree(t, dir, dest)
 }
 
+// contentDiffSameTimeTrees returns two directories with the same files and
+// the same modification times. "changed" has another content of the same size
+// in the second one.
+func contentDiffSameTimeTrees(t *testing.T) (string, string) {
+	t.Helper()
+	dirA := writeContentDiffTree(t, map[string]string{"changed": "content of A", "same": "content"}, contentDiffModTimeA)
+	dirB := writeContentDiffTree(t, map[string]string{"changed": "content of B", "same": "content"}, contentDiffModTimeA)
+	return dirA, dirB
+}
+
+// A file of another directory with the size and the modification time of the
+// saved one, and another content: fsutil alone keeps the saved content.
+func TestContentDiffSendsFilesWithSameModTimeAndOtherContent(t *testing.T) {
+	dirA, dirB := contentDiffSameTimeTrees(t)
+	dest := t.TempDir()
+	syncContentDiffDir(t, dirA, dest, FSSendRequestOpt{ContentDiff: true})
+
+	second := syncContentDiffDir(t, dirB, dest, FSSendRequestOpt{ContentDiff: true})
+
+	assert.Equal(t, []string{"changed"}, second.writtenFiles())
+	// the content of the second directory, with its modification times
+	requireSameContentDiffTree(t, dirB, dest)
+}
+
+// The rule of fsutil, which is the one of a transfer that does not compare
+// content: the saved file stays.
+func TestSyncWithoutContentDiffKeepsFilesWithSameModTimeAndOtherContent(t *testing.T) {
+	dirA, dirB := contentDiffSameTimeTrees(t)
+	dest := t.TempDir()
+	syncContentDiffDir(t, dirA, dest, FSSendRequestOpt{})
+
+	second := syncContentDiffDir(t, dirB, dest, FSSendRequestOpt{})
+
+	assert.Empty(t, second.writtenFiles())
+	content, err := os.ReadFile(filepath.Join(dest, "changed"))
+	require.NoError(t, err)
+	assert.Equal(t, "content of A", string(content))
+}
+
 func TestUseContentDiff(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -331,7 +370,7 @@ func TestContentDiffStreamKeepsFileWithSameContent(t *testing.T) {
 
 	assert.Equal(t, contentDiffModTimeA.UnixNano(), st.ModTime)
 	assert.Nil(t, st.Xattrs)
-	assert.Equal(t, []keptFile{{name: "file", modTime: contentDiffModTimeB.UnixNano()}}, s.kept)
+	assert.Equal(t, []retimedFile{{name: "file", modTime: contentDiffModTimeB.UnixNano()}}, s.kept)
 	assert.Equal(t, 1, s.hashedFiles)
 	assert.Equal(t, int64(len(contentDiffSavedContent)), s.hashedBytes)
 
@@ -369,17 +408,129 @@ func TestContentDiffStreamKeepsOtherXattrs(t *testing.T) {
 	assert.Equal(t, map[string][]byte{"user.test": []byte("value")}, st.Xattrs)
 }
 
-func TestContentDiffStreamDoesNotHashFilesWithSameModTime(t *testing.T) {
-	s, _ := newTestContentDiffStream(t)
+// newContentDiffSameTimeStat is the stat that a client sends for a file with
+// the size and the modification time of "file", and the same content.
+func newContentDiffSameTimeStat() *fstypes.Stat {
 	st := newContentDiffStat("file")
 	st.ModTime = contentDiffModTimeA.UnixNano()
+	return st
+}
+
+// The modification time of a saved copy that another source synced proves
+// nothing, so a file with the saved size and time is hashed too. When it is
+// the same file there is nothing to change.
+func TestContentDiffStreamChecksFileWithSameModTime(t *testing.T) {
+	s, _ := newTestContentDiffStream(t)
+	st := newContentDiffSameTimeStat()
 
 	s.handleStat(st)
 
 	assert.Equal(t, contentDiffModTimeA.UnixNano(), st.ModTime)
 	assert.Nil(t, st.Xattrs)
 	assert.Empty(t, s.kept)
-	assert.Equal(t, 0, s.hashedFiles)
+	assert.Empty(t, s.requested)
+	assert.Equal(t, 1, s.hashedFiles)
+}
+
+// fsutil keeps a file with the saved size and modification time. When it is
+// not the same file, the stat gets another time so that fsutil requests it,
+// and the time that the client sent is applied at the end.
+func TestContentDiffStreamRequestsOtherFileWithSameModTime(t *testing.T) {
+	otherContent := "other content"
+	require.Len(t, otherContent, len(contentDiffSavedContent))
+
+	tests := []struct {
+		name   string
+		change func(*fstypes.Stat)
+		xattrs map[string][]byte
+	}{
+		{
+			name: "other content with the same size",
+			change: func(st *fstypes.Stat) {
+				st.Xattrs[contentDigestXattr] = contentDiffDigest(otherContent)
+			},
+		},
+		{
+			name: "extended attribute that the saved file does not have",
+			change: func(st *fstypes.Stat) {
+				st.Xattrs["user.test"] = []byte("value")
+			},
+			xattrs: map[string][]byte{"user.test": []byte("value")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, dest := newTestContentDiffStream(t)
+			st := newContentDiffSameTimeStat()
+			tt.change(st)
+
+			s.handleStat(st)
+
+			assert.NotEqual(t, contentDiffModTimeA.UnixNano(), st.ModTime)
+			assert.Equal(t, tt.xattrs, st.Xattrs)
+			assert.Empty(t, s.kept)
+			assert.Equal(t, []retimedFile{{name: "file", modTime: contentDiffModTimeA.UnixNano()}}, s.requested)
+
+			// fsutil writes the file with the time of the stat
+			p := filepath.Join(dest, "file")
+			require.NoError(t, os.Chtimes(p, time.Unix(0, st.ModTime), time.Unix(0, st.ModTime)))
+			require.NoError(t, s.finish())
+			fi, err := os.Lstat(p)
+			require.NoError(t, err)
+			assert.Equal(t, contentDiffModTimeA.UnixNano(), fi.ModTime().UnixNano())
+		})
+	}
+}
+
+// What fsutil decides by itself stays as it is, also with the saved
+// modification time: nothing is hashed and the stat is not changed.
+func TestContentDiffStreamLeavesFileWithSameModTimeToFsutil(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*fstypes.Stat)
+	}{
+		{
+			// the usual rule: the client sent no digest to compare with
+			name: "without digest",
+			change: func(st *fstypes.Stat) {
+				delete(st.Xattrs, contentDigestXattr)
+			},
+		},
+		{
+			name: "digest with another length",
+			change: func(st *fstypes.Stat) {
+				st.Xattrs[contentDigestXattr] = st.Xattrs[contentDigestXattr][:16]
+			},
+		},
+		{
+			// fsutil requests it for the size
+			name: "other size",
+			change: func(st *fstypes.Stat) {
+				st.Size++
+			},
+		},
+		{
+			name: "hardlink",
+			change: func(st *fstypes.Stat) {
+				st.Linkname = "other"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := newTestContentDiffStream(t)
+			st := newContentDiffSameTimeStat()
+			tt.change(st)
+
+			s.handleStat(st)
+
+			assert.Equal(t, contentDiffModTimeA.UnixNano(), st.ModTime)
+			assert.Empty(t, st.Xattrs)
+			assert.Empty(t, s.kept)
+			assert.Empty(t, s.requested)
+			assert.Equal(t, 0, s.hashedFiles)
+		})
+	}
 }
 
 func TestContentDiffStreamIgnoresStatWithoutDigest(t *testing.T) {
@@ -469,6 +620,7 @@ func TestContentDiffStreamDoesNotKeepFile(t *testing.T) {
 			assert.Equal(t, contentDiffModTimeB.UnixNano(), st.ModTime)
 			assert.Nil(t, st.Xattrs)
 			assert.Empty(t, s.kept)
+			assert.Empty(t, s.requested)
 			assert.Equal(t, 0, s.hashedFiles-tt.hashed)
 		})
 	}
@@ -505,7 +657,7 @@ func TestContentDiffStreamStopsAtPathOutOfOrder(t *testing.T) {
 			s.handleStat(later)
 
 			// the first file is kept; nothing is looked up from the path that fsutil rejects
-			assert.Equal(t, []keptFile{{name: "file", modTime: contentDiffModTimeB.UnixNano()}}, s.kept)
+			assert.Equal(t, []retimedFile{{name: "file", modTime: contentDiffModTimeB.UnixNano()}}, s.kept)
 			assert.Equal(t, 1, s.hashedFiles)
 			assert.True(t, s.invalid)
 			assert.Equal(t, contentDiffModTimeB.UnixNano(), wrong.ModTime)
@@ -533,7 +685,7 @@ func TestContentDiffStreamKeepsFilesOfDirectories(t *testing.T) {
 	}
 
 	assert.False(t, s.invalid)
-	assert.Equal(t, []keptFile{
+	assert.Equal(t, []retimedFile{
 		{name: filepath.Join("dir", "sub", "file"), modTime: contentDiffModTimeB.UnixNano()},
 		{name: "file", modTime: contentDiffModTimeB.UnixNano()},
 	}, s.kept)
@@ -790,7 +942,7 @@ func TestContentDiffStreamFinishIgnoresFilesThatAreGone(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, dest := newTestContentDiffStream(t)
-			s.kept = []keptFile{{name: filepath.FromSlash(tt.path), modTime: contentDiffModTimeB.UnixNano()}}
+			s.kept = []retimedFile{{name: filepath.FromSlash(tt.path), modTime: contentDiffModTimeB.UnixNano()}}
 			require.NoError(t, os.RemoveAll(filepath.Join(dest, tt.remove)))
 
 			require.NoError(t, s.finish())
@@ -800,7 +952,7 @@ func TestContentDiffStreamFinishIgnoresFilesThatAreGone(t *testing.T) {
 
 func TestContentDiffStreamFinishFails(t *testing.T) {
 	s, _ := newTestContentDiffStream(t)
-	s.kept = []keptFile{{name: filepath.FromSlash("../outside"), modTime: contentDiffModTimeB.UnixNano()}}
+	s.kept = []retimedFile{{name: filepath.FromSlash("../outside"), modTime: contentDiffModTimeB.UnixNano()}}
 
 	require.ErrorContains(t, s.finish(), "failed to set modification time")
 }

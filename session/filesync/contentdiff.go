@@ -41,6 +41,14 @@ import (
 // sent by the client is applied to those files. The saved copy ends in the
 // same state as if the content had been transferred.
 //
+// The modification time of a saved copy that another source synced says
+// nothing about the files of this one, also when it is the same. So a file
+// with the size and the modification time of the saved one is hashed too. If
+// the digests differ, the receiver moves the modification time of the stat by
+// a nanosecond, so fsutil requests the content, and applies the real one once
+// the transfer is done. This only happens for the files that come with a
+// digest: without one the rule is the one of fsutil.
+//
 // The digest travels as an extra entry of Stat.Xattrs that is removed before
 // fsutil sees the stat, so it never reaches the disk or the content hash of
 // the cache. A sender that does not know the option ignores the request, and
@@ -485,15 +493,19 @@ type contentDiffStream struct {
 
 	// kept has the files whose stat was changed to match the saved copy, in
 	// the order of the stats.
-	kept []keptFile
+	kept []retimedFile
+	// requested has the files with the size and the modification time of
+	// the saved one and another content or other attributes, whose stat was
+	// changed so that fsutil requests the content, in the order of the stats.
+	requested []retimedFile
 
 	hashedFiles int
 	hashedBytes int64
 }
 
-// keptFile is a file of the saved copy with the modification time that the
-// client sent for it.
-type keptFile struct {
+// retimedFile is a file whose stat reached fsutil with another modification
+// time, with the one that the client sent for it.
+type retimedFile struct {
 	name    string
 	modTime int64
 }
@@ -520,9 +532,11 @@ func (s *contentDiffStream) RecvMsg(m any) error {
 	return nil
 }
 
-// handleStat removes the digest from the stat and, if the saved copy has the
-// same file with a different modification time, replaces the modification
-// time with the saved one.
+// handleStat removes the digest from the stat and compares the file with the
+// one of the saved copy. If it is the same file with a different modification
+// time, it replaces the modification time with the saved one. If it is
+// another file with the same size and modification time, it changes the
+// modification time so that it is not the saved one.
 func (s *contentDiffStream) handleStat(st *fstypes.Stat) {
 	dgst, ok := st.Xattrs[contentDigestXattr]
 	if ok {
@@ -552,21 +566,25 @@ func (s *contentDiffStream) handleStat(st *fstypes.Stat) {
 	if err != nil || !fi.Mode().IsRegular() || fi.Size() != st.Size {
 		return
 	}
-	savedModTime := fi.ModTime().UnixNano()
-	if savedModTime == st.ModTime {
-		// fsutil already treats the file as unchanged
-		return
-	}
 	if runtime.GOOS != "windows" && uint32(fi.Mode()) != st.Mode {
 		// fsutil requests the content of a file with another mode, whatever
 		// its modification time is
 		return
 	}
-	if !s.sameSavedFile(dir, base, fi.Size(), st.Xattrs, dgst) {
-		return
+	savedModTime := fi.ModTime().UnixNano()
+	same := s.sameSavedFile(dir, base, fi.Size(), st.Xattrs, dgst)
+	switch {
+	case same && savedModTime != st.ModTime:
+		// only the modification time differs: with the saved one fsutil
+		// keeps the file
+		s.kept = append(s.kept, retimedFile{name: name, modTime: st.ModTime})
+		st.ModTime = savedModTime
+	case !same && savedModTime == st.ModTime:
+		// fsutil would keep the file for its size and modification time:
+		// with another time it requests the content
+		s.requested = append(s.requested, retimedFile{name: name, modTime: st.ModTime})
+		st.ModTime++
 	}
-	s.kept = append(s.kept, keptFile{name: name, modTime: st.ModTime})
-	st.ModTime = savedModTime
 }
 
 // sameSavedFile reports whether a regular file of the saved copy has the
@@ -635,7 +653,7 @@ func sameComparedXattrs(sent, saved map[string][]byte) bool {
 // finish applies the modification time sent by the client to the files whose
 // stat was changed. It must be called after fsutil has finished writing.
 func (s *contentDiffStream) finish() error {
-	if len(s.kept) == 0 {
+	if len(s.kept) == 0 && len(s.requested) == 0 {
 		return nil
 	}
 	// fsutil may have replaced directories since the stats were read
@@ -645,7 +663,7 @@ func (s *contentDiffStream) finish() error {
 	}
 	defer dirs.close()
 
-	for _, f := range s.kept {
+	for _, f := range slices.Concat(s.kept, s.requested) {
 		t := time.Unix(0, f.modTime)
 		dir, base := dirs.parent(f.name)
 		if dir == nil {
