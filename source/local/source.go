@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/contenthash"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/okteto"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/filesync"
 	"github.com/moby/buildkit/snapshot"
@@ -124,6 +126,10 @@ type localSourceHandler struct {
 	src LocalIdentifier
 	sm  *session.Manager
 	*localSource
+
+	// syncSource (okteto) is the source that the client of the build named for
+	// the files, see okteto.LocalSourceOptPrefix. It is empty if it named none.
+	syncSource string
 }
 
 func (ls *localSourceHandler) CacheKey(ctx context.Context, jobCtx solver.JobContext, index int) (string, string, solver.CacheOpts, bool, error) {
@@ -163,6 +169,10 @@ func (ls *localSourceHandler) CacheKey(ctx context.Context, jobCtx solver.JobCon
 
 func (ls *localSourceHandler) Snapshot(ctx context.Context, jobCtx solver.JobContext) (cache.ImmutableRef, error) {
 	g := jobCtx.Session()
+	// okteto: only the transfers that compare modification times can compare content instead
+	if ls.src.Differ == fsutil.DiffMetadata && !ls.src.MetadataOnly {
+		ls.syncSource = okteto.LocalSource(ctx, jobCtx, ls.src.Name)
+	}
 	sessionID := ls.src.SessionID
 	if sessionID == "" {
 		return ls.snapshotWithAnySession(ctx, g)
@@ -207,11 +217,19 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		metaSfx = ":metadata"
 	}
 	sharedKey := ls.src.Name + ":" + ls.src.SharedKeyHint + ":" + caller.SharedKey() + metaSfx // TODO: replace caller.SharedKey() with source based hint from client(absolute-path+nodeid)
+	// okteto: source that the client of the build named for the files, empty if it named none
+	syncSource := ls.syncSource
 
 	var mutable cache.MutableRef
 	sis, err := searchSharedKey(ctx, ls.cm, sharedKey)
 	if err != nil {
 		return nil, err
+	}
+	if syncSource != "" {
+		// okteto: prefer the copy that has the modification times of this source
+		slices.SortStableFunc(sis, func(a, b cacheRefMetadata) int {
+			return compareSyncSource(a.getSyncSource(), b.getSyncSource(), syncSource)
+		})
 	}
 	for _, si := range sis {
 		if m, err := ls.cm.GetMutable(ctx, si.ID()); err == nil {
@@ -222,6 +240,10 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 			bklog.G(ctx).Debugf("not reusing ref %s for local: %v", si.ID(), err)
 		}
 	}
+
+	// okteto: the modification times of a reused copy are the ones of the source that
+	// synced it last. For any other source the files are compared by content.
+	contentDiff := mutable != nil && syncSource != "" && cacheRefMetadata{mutable}.getSyncSource() != syncSource
 
 	if mutable == nil {
 		m, err := ls.cm.New(ctx, nil, nil, cache.CachePolicyRetain, cache.WithRecordType(client.UsageRecordTypeLocalSource), cache.WithDescription(fmt.Sprintf("local source for %s", ls.src.Name)))
@@ -276,6 +298,7 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		ProgressCb:      newProgressHandler(ctx, "transferring "+ls.src.Name+":"),
 		Differ:          ls.src.Differ,
 		MetadataOnly:    ls.src.MetadataOnly,
+		ContentDiff:     contentDiff,
 	}
 
 	if opt.MetadataOnly && len(ls.src.MetadataExceptions) > 0 {
@@ -321,6 +344,12 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 			return nil, err
 		}
 		bklog.G(ctx).Debugf("saved %s as %s", mutable.ID(), sharedKey)
+	}
+	// okteto: remember which source the modification times of the copy belong to
+	if syncSource != "" && md.getSyncSource() != syncSource {
+		if err := md.setSyncSource(syncSource); err != nil {
+			return nil, err
+		}
 	}
 
 	snap, err := mutable.Commit(ctx)
@@ -372,6 +401,9 @@ func (cu *cacheUpdater) ContentHasher() fsutil.ContentHasher {
 const (
 	keySharedKey   = "local.sharedKey"
 	sharedKeyIndex = keySharedKey + ":"
+
+	// keySyncSource (okteto) is the source that synced a local source copy last
+	keySyncSource = "okteto.local.syncSource"
 )
 
 func searchSharedKey(ctx context.Context, store cache.MetadataStore, k string) ([]cacheRefMetadata, error) {
@@ -396,4 +428,25 @@ func (md cacheRefMetadata) getSharedKey() string {
 
 func (md cacheRefMetadata) setSharedKey(key string) error {
 	return md.SetString(keySharedKey, key, sharedKeyIndex+key)
+}
+
+func (md cacheRefMetadata) getSyncSource() string {
+	return md.GetString(keySyncSource)
+}
+
+func (md cacheRefMetadata) setSyncSource(source string) error {
+	return md.SetString(keySyncSource, source, "")
+}
+
+// compareSyncSource orders the copies of a local source so that the ones that
+// were last synced by source come first.
+func compareSyncSource(a, b, source string) int {
+	switch {
+	case a == source && b != source:
+		return -1
+	case a != source && b == source:
+		return 1
+	default:
+		return 0
+	}
 }

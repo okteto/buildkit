@@ -132,6 +132,10 @@ func (sp *fsSyncProvider) handle(method string, stream grpc.ServerStream) (retEr
 	if err != nil {
 		return err
 	}
+	// okteto: the daemon compares the files by content
+	if pr.name == "diffcopy" && slices.Contains(opts[keyContentDigest], contentDigestSHA256) {
+		dir = withContentDigests(dir)
+	}
 
 	var progress progressCb
 	if sp.p != nil {
@@ -188,6 +192,11 @@ type FSSendRequestOpt struct {
 	Differ             fsutil.DiffType
 	MetadataOnly       bool
 	MetadataOnlyFilter func(string, *fstypes.Stat) bool
+	// ContentDiff (okteto) treats a file as unchanged when the destination has
+	// a file with the same content and a different modification time. The
+	// modification time of the source is still applied. It needs a sender
+	// that knows the option, otherwise it has no effect.
+	ContentDiff bool
 }
 
 // CacheUpdater is an object capable of sending notifications for the cache hash changes
@@ -225,6 +234,11 @@ func FSSync(ctx context.Context, c session.Caller, opt FSSendRequestOpt) error {
 	}
 
 	opts[keyDirName] = []string{opt.Name}
+
+	contentDiff := useContentDiff(opt, pr.name) // okteto
+	if contentDiff {
+		opts[keyContentDigest] = []string{contentDigestSHA256}
+	}
 
 	ctx = c.Context(ctx)
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -264,7 +278,20 @@ func FSSync(ctx context.Context, c session.Caller, opt FSSendRequestOpt) error {
 		}
 	}
 
-	return pr.recvFn(stream, opt.DestDir, opt.CacheUpdater, opt.ProgressCb, opt.Differ, opt.Filter, metadataOnlyFilter)
+	if !contentDiff {
+		return pr.recvFn(stream, opt.DestDir, opt.CacheUpdater, opt.ProgressCb, opt.Differ, opt.Filter, metadataOnlyFilter)
+	}
+
+	cds, err := newContentDiffStream(stream, opt.DestDir)
+	if err != nil {
+		return err
+	}
+	defer cds.close()
+	if err := pr.recvFn(cds, opt.DestDir, opt.CacheUpdater, opt.ProgressCb, opt.Differ, opt.Filter, metadataOnlyFilter); err != nil {
+		return err
+	}
+	bklog.G(ctx).Debugf("content diff for %s: %d files kept by content, %d files (%d bytes) hashed", opt.Name, len(cds.kept), cds.hashedFiles, cds.hashedBytes)
+	return cds.finish()
 }
 
 type FSSyncTarget interface {

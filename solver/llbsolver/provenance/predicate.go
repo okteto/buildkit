@@ -9,6 +9,7 @@ import (
 	slsa "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/common"
 	slsa1 "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/v1"
 	"github.com/moby/buildkit/frontend/dockerfile/dfgitutil"
+	"github.com/moby/buildkit/okteto"
 	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
 	srctypes "github.com/moby/buildkit/source/types"
 	"github.com/moby/buildkit/util/purl"
@@ -358,6 +359,10 @@ func FilterArgs(m map[string]string) map[string]string {
 			continue
 		}
 		if strings.HasPrefix(k, "attest:") {
+			continue
+		}
+		// okteto: the source of a local directory is specific to the host of the client
+		if strings.HasPrefix(k, okteto.LocalSourceOptPrefix) {
 			continue
 		}
 		if k == contextKey || strings.HasPrefix(k, defaultContextKey+":") {

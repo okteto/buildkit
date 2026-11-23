@@ -262,6 +262,7 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 		compatibilityVersion = compat.CompatibilityVersionCurrent
 	}
 	j.SetValue(compat.JobValueKey, compatibilityVersion)
+	setLocalSources(j, req.FrontendOpt) // okteto
 
 	j.SessionID = sessionID
 
