@@ -167,6 +167,10 @@ type testLocalBuild struct {
 	// sameSession are the sources named by other builds of the same client
 	// that share the step, empty for a build that named none
 	sameSession []string
+	// prefixedSession are the sources named by other builds of the same
+	// client whose session is written with a prefix, empty for a build that
+	// named none
+	prefixedSession []string
 	// others are the builds of other clients that share the step
 	others []testOtherBuild
 	// anySession leaves the session out of the local source, so the files
@@ -223,6 +227,9 @@ func snapshotTestLocalBuild(t *testing.T, cm cache.Manager, b testLocalBuild) ca
 		others := slices.Clone(b.others)
 		for _, source := range b.sameSession {
 			others = append(others, testOtherBuild{sessionID: s.ID(), source: source})
+		}
+		for _, source := range b.prefixedSession {
+			others = append(others, testOtherBuild{sessionID: "prefix:" + s.ID(), source: source})
 		}
 		ref, err = ls.Snapshot(ctx, testJobContext{sessionID: s.ID(), source: b.source, others: others})
 		return err
@@ -499,12 +506,15 @@ func TestSnapshotUsesSourceOfItsSession(t *testing.T) {
 // source, or there is none.
 func TestSnapshotNeedsEveryBuildOfTheSessionToNameTheSource(t *testing.T) {
 	tests := []struct {
-		name        string
-		sameSession []string
+		name            string
+		sameSession     []string
+		prefixedSession []string
 	}{
 		{name: "one without source", sameSession: []string{""}},
 		{name: "one with another source", sameSession: []string{"c"}},
 		{name: "one of two without source", sameSession: []string{"b", ""}},
+		// "prefix:id" is the session "id" for the session manager
+		{name: "one without source, its session written with a prefix", prefixedSession: []string{""}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -516,7 +526,7 @@ func TestSnapshotNeedsEveryBuildOfTheSessionToNameTheSource(t *testing.T) {
 			first := readTestSavedCopies(t, cm, "repository")
 			require.Len(t, first, 1)
 
-			syncTestLocalBuild(t, cm, testLocalBuild{dir: dirB, sharedKey: "repository", source: "b", sameSession: tt.sameSession})
+			syncTestLocalBuild(t, cm, testLocalBuild{dir: dirB, sharedKey: "repository", source: "b", sameSession: tt.sameSession, prefixedSession: tt.prefixedSession})
 			second := readTestSavedCopies(t, cm, "repository")
 			require.Len(t, second, 1)
 

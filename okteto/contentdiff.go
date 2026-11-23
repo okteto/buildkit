@@ -90,12 +90,13 @@ type jobValues interface {
 // usual.
 func LocalSource(jobCtx any, sessionID, name string) string {
 	jv, ok := jobCtx.(jobValues)
+	sessionID = sessionName(sessionID)
 	if !ok || sessionID == "" {
 		return ""
 	}
 	source, first, agreed := "", true, true
 	jv.EachJobValue(LocalSourcesJobKey, func(id string, v any) {
-		if id != sessionID {
+		if sessionName(id) != sessionID {
 			return
 		}
 		// a build without the option, or with a value of another type, has
@@ -111,4 +112,14 @@ func LocalSource(jobCtx any, sessionID, name string) string {
 		return ""
 	}
 	return source
+}
+
+// sessionName returns a session id without the prefix that a client can put
+// in front of it, as the session manager does when it looks a session up
+// (session.Manager.Get): "prefix:id" and "id" are the same session.
+func sessionName(id string) string {
+	if p := strings.SplitN(id, ":", 2); len(p) == 2 && len(p[1]) > 0 {
+		return p[1]
+	}
+	return id
 }

@@ -108,6 +108,12 @@ func TestLocalSource(t *testing.T) {
 		{name: "another session with another source", jobCtx: testJobs{{"another", b}, {"session", a}}, expected: "a"},
 		{name: "the session has no build in the step", jobCtx: testJobs{{"another", a}}, expected: ""},
 		{name: "build without session", jobCtx: testJobs{{"", a}}, expected: ""},
+		// a client can write its session with a prefix: it is the same session
+		{name: "session written with a prefix", jobCtx: testJobs{{"prefix:session", a}}, expected: "a"},
+		{name: "builds of the session written in two ways with the same source", jobCtx: testJobs{{"prefix:session", a}, {"session", a}}, expected: "a"},
+		{name: "a build of the session written with a prefix without the option", jobCtx: testJobs{{"session", a}, {"prefix:session", nil}}, expected: ""},
+		{name: "a build of the session written without the prefix without the option", jobCtx: testJobs{{"prefix:session", a}, {"session", nil}}, expected: ""},
+		{name: "another session with the same prefix", jobCtx: testJobs{{"prefix:another", a}}, expected: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -118,4 +124,45 @@ func TestLocalSource(t *testing.T) {
 
 func TestLocalSourceWithoutSession(t *testing.T) {
 	assert.Empty(t, LocalSource(testJobs{{"", map[string]string{"context": "a"}}}, "", "context"))
+}
+
+// The session that the files are requested from can come with a prefix too.
+func TestLocalSourceOfSessionWithPrefix(t *testing.T) {
+	a := map[string]string{"context": "a"}
+	tests := []struct {
+		name     string
+		jobCtx   testJobs
+		expected string
+	}{
+		{name: "build written without the prefix", jobCtx: testJobs{{"session", a}}, expected: "a"},
+		{name: "build written with the prefix", jobCtx: testJobs{{"prefix:session", a}}, expected: "a"},
+		{name: "build written with another prefix", jobCtx: testJobs{{"other:session", a}}, expected: "a"},
+		{name: "one of the builds without the option", jobCtx: testJobs{{"prefix:session", a}, {"session", nil}}, expected: ""},
+		{name: "another session", jobCtx: testJobs{{"prefix:another", a}}, expected: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, LocalSource(tt.jobCtx, "prefix:session", "context"))
+		})
+	}
+}
+
+// sessionName resolves a session id as session.Manager.Get does.
+func TestSessionName(t *testing.T) {
+	tests := []struct {
+		id       string
+		expected string
+	}{
+		{id: "", expected: ""},
+		{id: "session", expected: "session"},
+		{id: "prefix:session", expected: "session"},
+		{id: ":session", expected: "session"},
+		{id: "session:", expected: "session:"},
+		{id: "a:b:session", expected: "b:session"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.id, func(t *testing.T) {
+			assert.Equal(t, tt.expected, sessionName(tt.id))
+		})
+	}
 }

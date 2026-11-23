@@ -543,6 +543,37 @@ func TestContentDiffStreamKeepsFilesOfDirectories(t *testing.T) {
 	assert.Equal(t, contentDiffModTimeB.UnixNano(), fi.ModTime().UnixNano())
 }
 
+// The sender only adds digests for the exact request that it knows: with any
+// other value the transfer is the usual one.
+func TestWantsContentDigests(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		opts     map[string][]string
+		expected bool
+	}{
+		{name: "asked", protocol: "diffcopy", opts: map[string][]string{keyContentDigest: {contentDigestSHA256}}, expected: true},
+		{name: "asked among other values", protocol: "diffcopy", opts: map[string][]string{keyContentDigest: {"other", contentDigestSHA256}}, expected: true},
+		{name: "not asked", protocol: "diffcopy", opts: map[string][]string{keyDirName: {"context"}}},
+		{name: "no options", protocol: "diffcopy"},
+		{name: "another digest", protocol: "diffcopy", opts: map[string][]string{keyContentDigest: {"blake3"}}},
+		// test builds of this feature sent the digest under other keys with this value
+		{name: "value of the test builds", protocol: "diffcopy", opts: map[string][]string{keyContentDigest: {"sha256"}}},
+		{name: "another protocol", protocol: "tarstream", opts: map[string][]string{keyContentDigest: {contentDigestSHA256}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, wantsContentDigests(tt.protocol, tt.opts))
+		})
+	}
+}
+
+// No file can have an extended attribute whose name has a NUL byte, on any
+// platform, so the key of the digest never is the name of one.
+func TestContentDigestXattrHasNUL(t *testing.T) {
+	assert.True(t, strings.HasPrefix(contentDigestXattr, "\x00"))
+}
+
 func TestIsComparedXattr(t *testing.T) {
 	tests := []struct {
 		name     string

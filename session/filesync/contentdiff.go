@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,12 +52,19 @@ import (
 // given digest at a given path, which is inherent to skipping content that the
 // receiver already has.
 //
-// A file is only kept when a transfer would leave the same file and the same
-// content hash in the cache: same size, mode and content, and the same
-// extended attributes. All the attributes that fsutil transfers are compared,
-// also the ones that are not part of that hash, like ACLs. The SELinux label
-// is the exception, see isComparedXattr. Owner and link target are compared
-// by fsutil as usual.
+// A file is only kept when a transfer would leave the same file: same size,
+// mode and content, and the same extended attributes. All the attributes that
+// fsutil transfers are compared, also the ones that are not part of the
+// content hash of the cache, like ACLs. The SELinux label is the exception,
+// see isComparedXattr. Owner and link target are compared by fsutil as usual.
+//
+// The comparison is against the saved file, so the content hash that the
+// cache has for a kept file stays the one of its last transfer. It was
+// computed from the same content, mode and owner. It can differ from the one
+// that a transfer by this client would record in one case: an extended
+// attribute that an earlier client sent and the receiver could not store.
+// fsutil ignores that error and the hash is computed from the stat as sent,
+// so such an attribute is in the hash although it is not on disk.
 //
 // The paths of the stats come from the client and the saved copy has whatever
 // earlier clients sent. The receiver checks the order of the paths with the
@@ -76,9 +84,12 @@ import (
 const (
 	// keyContentDigest is the request metadata key that asks the sender to
 	// add content digests to the stats. Its value names the digest and how it
-	// is sent: a change in any of them needs another value.
+	// is sent: a change in any of them needs another value, so that a sender
+	// and a receiver that don't agree fall back to the usual transfer. The
+	// plain value "sha256" is not used: test builds of this feature sent the
+	// digest under other keys with it.
 	keyContentDigest    = "okteto-content-digest"
-	contentDigestSHA256 = "sha256"
+	contentDigestSHA256 = "sha256-1"
 
 	// contentDigestXattr is the key of the Stat.Xattrs entry that carries the
 	// digest. It is sent with every regular file, so it is short. It starts
@@ -105,6 +116,12 @@ const (
 	// file, see isComparedXattr.
 	selinuxXattr = "security.selinux"
 )
+
+// wantsContentDigests reports whether the receiver of a transfer asked the
+// sender for the content digests, in the way that this sender sends them.
+func wantsContentDigests(protocol string, opts map[string][]string) bool {
+	return protocol == "diffcopy" && slices.Contains(opts[keyContentDigest], contentDigestSHA256)
+}
 
 // useContentDiff reports whether a transfer compares the files by content:
 // content diff replaces the modification time check of the metadata differ,

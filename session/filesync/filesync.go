@@ -133,7 +133,7 @@ func (sp *fsSyncProvider) handle(method string, stream grpc.ServerStream) (retEr
 		return err
 	}
 	// okteto: the daemon compares the files by content
-	if pr.name == "diffcopy" && slices.Contains(opts[keyContentDigest], contentDigestSHA256) {
+	if wantsContentDigests(pr.name, opts) {
 		dir = withContentDigests(dir)
 	}
 
