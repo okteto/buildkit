@@ -136,7 +136,8 @@ func syncContentDiffDir(t *testing.T, src, dest string, opt FSSendRequestOpt) *r
 }
 
 // requireSameContentDiffTree checks that every regular file of src is in dest
-// with the same content, mode and modification time.
+// with the same content, mode and modification time, and that dest has no
+// path that src does not have.
 func requireSameContentDiffTree(t *testing.T, src, dest string) {
 	t.Helper()
 	srcFS, destFS := os.DirFS(src), os.DirFS(dest)
@@ -164,6 +165,16 @@ func requireSameContentDiffTree(t *testing.T, src, dest string) {
 		}
 		assert.Equal(t, srcInfo.Mode(), destInfo.Mode(), "mode of %s", p)
 		assert.Equal(t, srcInfo.ModTime().UnixNano(), destInfo.ModTime().UnixNano(), "modification time of %s", p)
+		return nil
+	})
+	require.NoError(t, err)
+
+	err = gofs.WalkDir(destFS, ".", func(p string, _ gofs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		_, err = os.Lstat(filepath.Join(src, filepath.FromSlash(p)))
+		assert.NoError(t, err, "%s is not in the source", p)
 		return nil
 	})
 	require.NoError(t, err)
@@ -415,6 +426,126 @@ func newContentDiffSameTimeStat() *fstypes.Stat {
 	st := newContentDiffStat("file")
 	st.ModTime = contentDiffModTimeA.UnixNano()
 	return st
+}
+
+// newContentDiffHardlinkStat is the stat that a client sends for a hardlink
+// to the file of target: the same stat with the name of the target and
+// without digest.
+func newContentDiffHardlinkStat(path string, target *fstypes.Stat) *fstypes.Stat {
+	st := target.CloneVT()
+	st.Path = path
+	st.Linkname = target.Path
+	st.Xattrs = nil
+	return st
+}
+
+// fsutil compares a hardlink by its modification time too. When the one of
+// its target was replaced with the saved one, the hardlink gets it as well:
+// fsutil keeps both.
+func TestContentDiffStreamGivesHardlinkTheModTimeOfKeptTarget(t *testing.T) {
+	s, _ := newTestContentDiffStream(t)
+	target := newContentDiffStat("file")
+	hardlink := newContentDiffHardlinkStat("hardlink", target)
+
+	s.handleStat(target)
+	s.handleStat(hardlink)
+
+	assert.Equal(t, contentDiffModTimeA.UnixNano(), target.ModTime)
+	assert.Equal(t, contentDiffModTimeA.UnixNano(), hardlink.ModTime)
+	assert.Equal(t, "file", hardlink.Linkname)
+	// the time of the client is applied through the target
+	assert.Equal(t, []retimedFile{{name: "file", modTime: contentDiffModTimeB.UnixNano()}}, s.kept)
+	assert.Equal(t, 1, s.hashedFiles)
+}
+
+// When the content of the target is requested, the hardlink gets the same
+// modification time, which is not the saved one: fsutil links it to the file
+// that it writes.
+func TestContentDiffStreamGivesHardlinkTheModTimeOfRequestedTarget(t *testing.T) {
+	s, _ := newTestContentDiffStream(t)
+	target := newContentDiffSameTimeStat()
+	target.Xattrs[contentDigestXattr] = contentDiffDigest("other content")
+	hardlink := newContentDiffHardlinkStat("hardlink", target)
+
+	s.handleStat(target)
+	s.handleStat(hardlink)
+
+	assert.NotEqual(t, contentDiffModTimeA.UnixNano(), target.ModTime)
+	assert.Equal(t, target.ModTime, hardlink.ModTime)
+	assert.Equal(t, []retimedFile{{name: "file", modTime: contentDiffModTimeA.UnixNano()}}, s.requested)
+	assert.Empty(t, s.kept)
+}
+
+// The hardlinks of a file in a directory name it with its path.
+func TestContentDiffStreamGivesHardlinkTheModTimeOfTargetInDirectory(t *testing.T) {
+	s, dest := newTestContentDiffStream(t)
+	saved := filepath.Join(dest, "dir", "file")
+	require.NoError(t, os.WriteFile(saved, []byte(contentDiffSavedContent), 0600))
+	require.NoError(t, os.Chtimes(saved, contentDiffModTimeA, contentDiffModTimeA))
+	dir := &fstypes.Stat{Path: "dir", Mode: uint32(os.ModeDir | 0700)}
+	target := newContentDiffStat("dir/file")
+	hardlink := newContentDiffHardlinkStat("dir/hardlink", target)
+
+	s.handleStat(dir)
+	s.handleStat(target)
+	s.handleStat(hardlink)
+
+	assert.Equal(t, contentDiffModTimeA.UnixNano(), target.ModTime)
+	assert.Equal(t, contentDiffModTimeA.UnixNano(), hardlink.ModTime)
+}
+
+// A hardlink keeps the modification time that the client sent when the one
+// of its target was not replaced, and so does a symlink to a file whose
+// modification time was.
+func TestContentDiffStreamLeavesModTimeOfOtherLinks(t *testing.T) {
+	tests := []struct {
+		name   string
+		target func() *fstypes.Stat
+		change func(*fstypes.Stat)
+	}{
+		{
+			name:   "hardlink to a file with the saved content and time",
+			target: newContentDiffSameTimeStat,
+			change: func(*fstypes.Stat) {},
+		},
+		{
+			name: "hardlink to a file that fsutil requests for its size",
+			target: func() *fstypes.Stat {
+				st := newContentDiffStat("file")
+				st.Size++
+				return st
+			},
+			change: func(*fstypes.Stat) {},
+		},
+		{
+			name:   "hardlink to another file",
+			target: func() *fstypes.Stat { return newContentDiffStat("file") },
+			change: func(st *fstypes.Stat) {
+				st.Linkname = "other"
+			},
+		},
+		{
+			name:   "symlink to a kept file",
+			target: func() *fstypes.Stat { return newContentDiffStat("file") },
+			change: func(st *fstypes.Stat) {
+				st.Mode = uint32(os.ModeSymlink | 0777)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := newTestContentDiffStream(t)
+			target := tt.target()
+			link := newContentDiffHardlinkStat("link", target)
+			link.ModTime = contentDiffModTimeB.UnixNano() + 1
+			tt.change(link)
+
+			s.handleStat(target)
+			s.handleStat(link)
+
+			assert.Equal(t, contentDiffModTimeB.UnixNano()+1, link.ModTime)
+		})
+	}
 }
 
 // The modification time of a saved copy that another source synced proves

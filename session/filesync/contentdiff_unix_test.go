@@ -37,25 +37,127 @@ func TestContentDiffKeepsSymlinksAndHardlinks(t *testing.T) {
 	for _, dir := range []string{dirA, dirB} {
 		require.NoError(t, os.Symlink("Dockerfile", filepath.Join(dir, "symlink")))
 		require.NoError(t, os.Link(filepath.Join(dir, "Dockerfile"), filepath.Join(dir, "hardlink")))
+		require.NoError(t, os.Link(filepath.Join(dir, "Dockerfile"), filepath.Join(dir, "src", "hardlink")))
 	}
 	dest := t.TempDir()
 
 	syncContentDiffDir(t, dirA, dest, FSSendRequestOpt{ContentDiff: true})
 
-	// fsutil links the hardlink again because its modification time changed,
-	// which does not need the content
+	// the hardlink is kept with its target. If fsutil linked it again, to the
+	// file that it already is, the temporary link would stay in dest
 	second := syncContentDiffDir(t, dirB, dest, FSSendRequestOpt{ContentDiff: true})
-	assert.Equal(t, []string{"hardlink"}, second.writtenFiles())
+	assert.Empty(t, second.writtenFiles())
 	requireSameContentDiffTree(t, dirB, dest)
 
 	target, err := os.Readlink(filepath.Join(dest, "symlink"))
 	require.NoError(t, err)
 	assert.Equal(t, "Dockerfile", target)
+	requireContentDiffHardlinks(t, dest, "Dockerfile", "hardlink", "src/hardlink")
+}
+
+// requireContentDiffHardlinks checks that the paths of dir are one file.
+func requireContentDiffHardlinks(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	first, err := os.Stat(filepath.Join(dir, filepath.FromSlash(names[0])))
+	require.NoError(t, err)
+	for _, name := range names[1:] {
+		fi, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name)))
+		require.NoError(t, err)
+		assert.True(t, os.SameFile(first, fi), "%s and %s are not the same file", names[0], name)
+	}
+}
+
+// contentDiffSameTimeHardlinkTrees returns two directories where "Dockerfile"
+// has the hardlinks "hardlink" and "src/hardlink", with the same modification
+// times in both. The file has another content of the same size in the second
+// one.
+func contentDiffSameTimeHardlinkTrees(t *testing.T) (string, string) {
+	t.Helper()
+	other := maps.Clone(contentDiffTree)
+	other["Dockerfile"] = "FROM busybox\n"
+	require.Len(t, other["Dockerfile"], len(contentDiffTree["Dockerfile"]))
+
+	dirA := writeContentDiffTree(t, contentDiffTree, contentDiffModTimeA)
+	dirB := writeContentDiffTree(t, other, contentDiffModTimeA)
+	for _, dir := range []string{dirA, dirB} {
+		// a link does not change the modification time of the file
+		require.NoError(t, os.Link(filepath.Join(dir, "Dockerfile"), filepath.Join(dir, "hardlink")))
+		require.NoError(t, os.Link(filepath.Join(dir, "Dockerfile"), filepath.Join(dir, "src", "hardlink")))
+	}
+	return dirA, dirB
+}
+
+// A file with hardlinks comes from another directory with another content and
+// the saved size and modification time. fsutil writes the file as a new one,
+// and the hardlinks have to follow it: with the saved modification time
+// fsutil would keep them, with the content that was replaced.
+func TestContentDiffLinksHardlinksToRequestedTarget(t *testing.T) {
+	dirA, dirB := contentDiffSameTimeHardlinkTrees(t)
+	dest := t.TempDir()
+	syncContentDiffDir(t, dirA, dest, FSSendRequestOpt{ContentDiff: true})
+
+	second := syncContentDiffDir(t, dirB, dest, FSSendRequestOpt{ContentDiff: true})
+
+	assert.Equal(t, []string{"Dockerfile", "hardlink", "src/hardlink"}, second.writtenFiles())
+	// the content of the second directory in the three paths
+	requireSameContentDiffTree(t, dirB, dest)
+	requireContentDiffHardlinks(t, dest, "Dockerfile", "hardlink", "src/hardlink")
+}
+
+// The rule of fsutil for the same directories, which is the one of a transfer
+// that does not compare content: the file and its hardlinks stay as saved.
+func TestSyncWithoutContentDiffKeepsHardlinksWithSameModTimeAndOtherContent(t *testing.T) {
+	dirA, dirB := contentDiffSameTimeHardlinkTrees(t)
+	dest := t.TempDir()
+	syncContentDiffDir(t, dirA, dest, FSSendRequestOpt{})
+
+	second := syncContentDiffDir(t, dirB, dest, FSSendRequestOpt{})
+
+	assert.Empty(t, second.writtenFiles())
+	requireSameContentDiffTree(t, dirA, dest)
+	requireContentDiffHardlinks(t, dest, "Dockerfile", "hardlink", "src/hardlink")
+}
+
+// The saved copy has two files with the same content, and for the client they
+// are one file with two paths: the first one is kept and fsutil links the
+// second one to it.
+func TestContentDiffLinksFileThatIsAHardlinkOfKeptTarget(t *testing.T) {
+	separate := maps.Clone(contentDiffTree)
+	separate["hardlink"] = separate["Dockerfile"]
+	dirA := writeContentDiffTree(t, separate, contentDiffModTimeA)
+	dirB := writeContentDiffTree(t, contentDiffTree, contentDiffModTimeB)
+	require.NoError(t, os.Link(filepath.Join(dirB, "Dockerfile"), filepath.Join(dirB, "hardlink")))
+	dest := t.TempDir()
+	syncContentDiffDir(t, dirA, dest, FSSendRequestOpt{ContentDiff: true})
+
+	second := syncContentDiffDir(t, dirB, dest, FSSendRequestOpt{ContentDiff: true})
+
+	assert.Equal(t, []string{"hardlink"}, second.writtenFiles())
+	requireSameContentDiffTree(t, dirB, dest)
+	requireContentDiffHardlinks(t, dest, "Dockerfile", "hardlink")
+}
+
+// The other way around: the saved copy has one file with two paths, and for
+// the client they are two files with the same content. The second path
+// becomes a file of its own.
+func TestContentDiffSplitsHardlinkThatIsAFileForTheClient(t *testing.T) {
+	separate := maps.Clone(contentDiffTree)
+	separate["hardlink"] = separate["Dockerfile"]
+	dirA := writeContentDiffTree(t, contentDiffTree, contentDiffModTimeA)
+	require.NoError(t, os.Link(filepath.Join(dirA, "Dockerfile"), filepath.Join(dirA, "hardlink")))
+	dirB := writeContentDiffTree(t, separate, contentDiffModTimeB)
+	dest := t.TempDir()
+	syncContentDiffDir(t, dirA, dest, FSSendRequestOpt{ContentDiff: true})
+
+	second := syncContentDiffDir(t, dirB, dest, FSSendRequestOpt{ContentDiff: true})
+
+	assert.Equal(t, []string{"hardlink"}, second.writtenFiles())
+	requireSameContentDiffTree(t, dirB, dest)
 	file, err := os.Stat(filepath.Join(dest, "Dockerfile"))
 	require.NoError(t, err)
 	hardlink, err := os.Stat(filepath.Join(dest, "hardlink"))
 	require.NoError(t, err)
-	assert.True(t, os.SameFile(file, hardlink))
+	assert.False(t, os.SameFile(file, hardlink))
 }
 
 func TestContentDiffReplacesSymlinkWithDirectory(t *testing.T) {

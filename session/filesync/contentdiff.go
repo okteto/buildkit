@@ -50,6 +50,11 @@ import (
 // the transfer is done. This only happens for the files that come with a
 // digest: without one the rule is the one of fsutil.
 //
+// A hardlink has no digest and is not compared: fsutil links it to its target,
+// the first path of the same file in the transfer. It gets the modification
+// time that fsutil got for that target, so that fsutil keeps or writes both
+// together as it does without content diff, see followLinkTarget.
+//
 // The digest travels as an extra entry of Stat.Xattrs that is removed before
 // fsutil sees the stat, so it never reaches the disk or the content hash of
 // the cache. A sender that does not know the option ignores the request, and
@@ -143,6 +148,13 @@ func useContentDiff(opt FSSendRequestOpt, protocol string) bool {
 // Hardlinks are excluded: fsutil links them to a file that it already has.
 func isContentDiffCandidate(st *fstypes.Stat) bool {
 	return os.FileMode(st.Mode).IsRegular() && st.Linkname == ""
+}
+
+// isHardlink reports whether a stat is another path of a regular file that
+// the transfer already has: its Linkname is the first path of that file. A
+// symlink has a Linkname too, the path that it points to.
+func isHardlink(st *fstypes.Stat) bool {
+	return os.FileMode(st.Mode).IsRegular() && st.Linkname != ""
 }
 
 type contentDigester struct {
@@ -499,6 +511,9 @@ type contentDiffStream struct {
 	// the saved one and another content or other attributes, whose stat was
 	// changed so that fsutil requests the content, in the order of the stats.
 	requested []retimedFile
+	// given has the modification time that fsutil got for every file of kept
+	// and requested, for the hardlinks to them.
+	given map[string]int64
 
 	hashedFiles int
 	hashedBytes int64
@@ -524,6 +539,7 @@ func newContentDiffStream(stream grpc.ClientStream, dest string) (*contentDiffSt
 		ClientStream: stream,
 		dest:         dest,
 		dirs:         dirs,
+		given:        map[string]int64{},
 	}, nil
 }
 
@@ -541,7 +557,8 @@ func (s *contentDiffStream) RecvMsg(m any) error {
 // one of the saved copy. If it is the same file with a different modification
 // time, it replaces the modification time with the saved one. If it is
 // another file with the same size and modification time, it changes the
-// modification time so that it is not the saved one.
+// modification time so that it is not the saved one. A hardlink to a file
+// whose modification time was replaced gets the same one.
 func (s *contentDiffStream) handleStat(st *fstypes.Stat) {
 	dgst, ok := st.Xattrs[contentDigestXattr]
 	if ok {
@@ -557,6 +574,10 @@ func (s *contentDiffStream) handleStat(st *fstypes.Stat) {
 	}
 	if err := s.order.HandleChange(fsutil.ChangeKindAdd, name, &fsutil.StatInfo{Stat: st}, nil); err != nil {
 		s.invalid = true
+		return
+	}
+	if isHardlink(st) {
+		s.followLinkTarget(st)
 		return
 	}
 	if len(dgst) != sha256.Size || !isContentDiffCandidate(st) {
@@ -587,11 +608,42 @@ func (s *contentDiffStream) handleStat(st *fstypes.Stat) {
 		// keeps the file
 		s.kept = append(s.kept, retimedFile{name: name, modTime: st.ModTime})
 		st.ModTime = savedModTime
+		s.given[name] = st.ModTime
 	case !same && savedModTime == st.ModTime:
 		// fsutil would keep the file for its size and modification time:
 		// with another time it requests the content
 		s.requested = append(s.requested, retimedFile{name: name, modTime: st.ModTime})
 		st.ModTime++
+		s.given[name] = st.ModTime
+	}
+}
+
+// followLinkTarget gives a hardlink the modification time that fsutil got for
+// its target, when that is not the one that the client sent.
+//
+// fsutil compares a hardlink by its target, size and modification time. For
+// the client both paths are one file, so without content diff their stats
+// match or differ from the saved ones together, and fsutil keeps both or
+// writes both. A target whose modification time was replaced here has to take
+// its hardlinks along:
+//
+//   - The target is kept with the saved modification time. With the one of the
+//     client, fsutil links the hardlink again to the file that it already is.
+//     It does that with a temporary link that it renames over the hardlink,
+//     and a rename between two links of one file does nothing: the temporary
+//     link stays in the saved copy.
+//   - The content of the target is requested. With the saved modification
+//     time, fsutil keeps the hardlink. The target is written as a new file,
+//     so the hardlink stays with the content that was replaced.
+//
+// With the time of its target the hardlink is kept in the first case, when the
+// saved copy has it linked to the target, and linked to the new file in the
+// second. A hardlink that the saved copy does not have like that is linked in
+// both, by the rules of fsutil. The time that the client sent reaches the file
+// through the target, see finish.
+func (s *contentDiffStream) followLinkTarget(st *fstypes.Stat) {
+	if modTime, ok := s.given[filepath.FromSlash(st.Linkname)]; ok {
+		st.ModTime = modTime
 	}
 }
 

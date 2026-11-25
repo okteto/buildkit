@@ -418,6 +418,60 @@ func writeTestLocalTreeWithOtherDockerfile(t *testing.T, modTime time.Time) stri
 	return dir
 }
 
+// linkTestLocalDockerfile gives the Dockerfile of dir a second path,
+// "hardlink".
+func linkTestLocalDockerfile(t *testing.T, dir string) string {
+	t.Helper()
+	require.NoError(t, os.Link(filepath.Join(dir, "Dockerfile"), filepath.Join(dir, "hardlink")))
+	return dir
+}
+
+// A file with two paths that another source sends with the same content is
+// kept with both. The copy has the paths of the client and nothing else:
+// fsutil does not link the second path again, which would leave a temporary
+// link in the copy.
+func TestSnapshotKeepsHardlinkForOtherSource(t *testing.T) {
+	cm := newTestCacheManager(t)
+	dirA := linkTestLocalDockerfile(t, writeTestLocalTree(t, testLocalModTimeA))
+	dirB := linkTestLocalDockerfile(t, writeTestLocalTree(t, testLocalModTimeB))
+
+	syncTestLocalDir(t, cm, dirA, "repository", "a")
+	first := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, first, 1)
+	require.Equal(t, first[0].files["Dockerfile"], first[0].files["hardlink"])
+
+	syncTestLocalDir(t, cm, dirB, "repository", "b")
+	second := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, second, 1)
+
+	// same inodes and the same paths
+	assert.Equal(t, withTestModTime(first[0].files, testLocalModTimeB), second[0].files)
+}
+
+// The same file comes from another source with another content, and the size
+// and the modification time of the saved one. It is received, and its second
+// path is the new file too.
+func TestSnapshotReceivesHardlinkWithSameModTimeForOtherSource(t *testing.T) {
+	cm := newTestCacheManager(t)
+	dirA := linkTestLocalDockerfile(t, writeTestLocalTree(t, testLocalModTimeA))
+	dirB := linkTestLocalDockerfile(t, writeTestLocalTreeWithOtherDockerfile(t, testLocalModTimeA))
+
+	syncTestLocalDir(t, cm, dirA, "repository", "a")
+	first := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, first, 1)
+
+	syncTestLocalDir(t, cm, dirB, "repository", "b")
+	second := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, second, 1)
+
+	assert.Len(t, second[0].files, len(first[0].files))
+	assert.Equal(t, "FROM busybox\n", second[0].files["Dockerfile"].Content)
+	assert.Equal(t, testLocalModTimeA.UnixNano(), second[0].files["Dockerfile"].ModTime)
+	assert.NotEqual(t, first[0].files["Dockerfile"].Inode, second[0].files["Dockerfile"].Inode)
+	assert.Equal(t, second[0].files["Dockerfile"], second[0].files["hardlink"])
+	assert.Equal(t, first[0].files["src/main.go"], second[0].files["src/main.go"])
+}
+
 // The modification times of a copy that another source synced prove nothing:
 // a file with the saved size and modification time and another content is
 // received, and the one that is the same is kept.
