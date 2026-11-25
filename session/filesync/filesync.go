@@ -290,8 +290,7 @@ func FSSync(ctx context.Context, c session.Caller, opt FSSendRequestOpt) error {
 	if err := pr.recvFn(cds, opt.DestDir, opt.CacheUpdater, opt.ProgressCb, opt.Differ, opt.Filter, metadataOnlyFilter); err != nil {
 		return err
 	}
-	bklog.G(ctx).Debugf("content diff for %s: %d files kept by content, %d files with the saved size and time requested, %d files (%d bytes) hashed", opt.Name, len(cds.kept), len(cds.requested), cds.hashedFiles, cds.hashedBytes)
-	return cds.finish()
+	return cds.done(ctx, opt.Name)
 }
 
 type FSSyncTarget interface {

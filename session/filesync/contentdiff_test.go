@@ -373,6 +373,7 @@ func TestContentDiffStreamKeepsFileWithSameContent(t *testing.T) {
 	assert.Equal(t, []retimedFile{{name: "file", modTime: contentDiffModTimeB.UnixNano()}}, s.kept)
 	assert.Equal(t, 1, s.hashedFiles)
 	assert.Equal(t, int64(len(contentDiffSavedContent)), s.hashedBytes)
+	assert.Positive(t, s.compareTime)
 
 	require.NoError(t, s.finish())
 	fi, err := os.Lstat(filepath.Join(dest, "file"))
@@ -544,6 +545,7 @@ func TestContentDiffStreamIgnoresStatWithoutDigest(t *testing.T) {
 	assert.Equal(t, map[string][]byte{"user.test": []byte("value")}, st.Xattrs)
 	assert.Empty(t, s.kept)
 	assert.Equal(t, 0, s.hashedFiles)
+	assert.Zero(t, s.compareTime)
 }
 
 func TestContentDiffStreamDoesNotKeepFile(t *testing.T) {

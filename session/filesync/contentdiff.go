@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
 	fstypes "github.com/tonistiigi/fsutil/types"
@@ -501,6 +502,10 @@ type contentDiffStream struct {
 
 	hashedFiles int
 	hashedBytes int64
+	// compareTime is the time spent looking at the saved copy: lookups,
+	// extended attributes and hashing. fsutil reads the next packet of the
+	// stream, stat or file data, only after it.
+	compareTime time.Duration
 }
 
 // retimedFile is a file whose stat reached fsutil with another modification
@@ -557,6 +562,9 @@ func (s *contentDiffStream) handleStat(st *fstypes.Stat) {
 	if len(dgst) != sha256.Size || !isContentDiffCandidate(st) {
 		return
 	}
+
+	start := time.Now()
+	defer func() { s.compareTime += time.Since(start) }()
 
 	dir, base := s.dirs.parent(name)
 	if dir == nil {
@@ -677,6 +685,17 @@ func (s *contentDiffStream) finish() error {
 		}
 	}
 	return nil
+}
+
+// done ends a transfer that fsutil has finished writing: it sets the
+// modification times (see finish) and logs what the comparison did and the
+// time that it took.
+func (s *contentDiffStream) done(ctx context.Context, name string) error {
+	start := time.Now()
+	err := s.finish()
+	bklog.G(ctx).Debugf("content diff for %s: %d files kept by content, %d files with the saved size and time requested, %d files (%d bytes) hashed, %s comparing with the saved copy, %s setting modification times",
+		name, len(s.kept), len(s.requested), s.hashedFiles, s.hashedBytes, s.compareTime.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+	return err
 }
 
 func (s *contentDiffStream) close() error {
