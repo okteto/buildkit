@@ -347,8 +347,10 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		}
 		bklog.G(ctx).Debugf("saved %s as %s", mutable.ID(), sharedKey)
 	}
-	// okteto: remember which source the modification times of the copy belong to
-	if syncSource != "" && md.getSyncSource() != syncSource {
+	// okteto: remember which source the modification times of the copy belong
+	// to. After a sync that named no source they belong to none: the record is
+	// removed, so that the source that was recorded does not trust them.
+	if md.getSyncSource() != syncSource {
 		if err := md.setSyncSource(syncSource); err != nil {
 			return nil, err
 		}

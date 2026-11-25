@@ -26,7 +26,10 @@ const (
 	// comparable with that source, so when a different one reuses the copy the
 	// files are compared by content instead.
 	//
-	// A build without the option behaves as upstream buildkit.
+	// A build without the option behaves as upstream buildkit. The one thing
+	// that it does on top: if the saved copy that it syncs has a recorded
+	// source, the record is removed, because the modification times of the
+	// copy are no longer the ones of that source.
 	LocalSourceOptPrefix = "okteto-local-source:"
 
 	// LocalSourcesJobKey is the key of the job value that keeps the sources

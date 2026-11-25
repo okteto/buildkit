@@ -471,9 +471,10 @@ func TestSnapshotTrustsModTimesOfSameSource(t *testing.T) {
 	}
 }
 
-// A build that names no source does nothing new: it compares modification
-// times and leaves the record of the copy as it was.
-func TestSnapshotKeepsSourceWhenClientHasNone(t *testing.T) {
+// A build that names no source compares modification times, as upstream. The
+// times that it leaves in the copy are not the ones of the recorded source
+// any more, so the record is removed.
+func TestSnapshotRemovesSourceWhenClientHasNone(t *testing.T) {
 	cm := newTestCacheManager(t)
 	dirA := writeTestLocalTree(t, testLocalModTimeA)
 	dirB := writeTestLocalTree(t, testLocalModTimeB)
@@ -481,20 +482,75 @@ func TestSnapshotKeepsSourceWhenClientHasNone(t *testing.T) {
 	syncTestLocalDir(t, cm, dirA, "repository", "a")
 	first := readTestSavedCopies(t, cm, "repository")
 	require.Len(t, first, 1)
+	require.Equal(t, "a", first[0].source)
 
 	syncTestLocalDir(t, cm, dirB, "repository", "")
 	second := readTestSavedCopies(t, cm, "repository")
 	require.Len(t, second, 1)
 
-	assert.Equal(t, "a", second[0].source)
+	assert.Empty(t, second[0].source)
 	assert.NotEqual(t, first[0].files["Dockerfile"].Inode, second[0].files["Dockerfile"].Inode)
 	assert.Equal(t, testLocalModTimeB.UnixNano(), second[0].files["Dockerfile"].ModTime)
+}
+
+// The source that synced a copy comes back after a build without a source
+// synced another directory. The modification times of the copy are the ones
+// of that directory, so the files are compared by content: the ones that are
+// the same are kept, not sent again.
+func TestSnapshotComparesContentAfterSyncWithoutSource(t *testing.T) {
+	cm := newTestCacheManager(t)
+	dirA := writeTestLocalTree(t, testLocalModTimeA)
+	dirB := writeTestLocalTree(t, testLocalModTimeB)
+
+	syncTestLocalDir(t, cm, dirA, "repository", "a")
+	syncTestLocalDir(t, cm, dirB, "repository", "")
+	second := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, second, 1)
+
+	syncTestLocalDir(t, cm, dirA, "repository", "a")
+	third := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, third, 1)
+
+	assert.Equal(t, "a", third[0].source)
+	// same inodes: compared by content
+	assert.Equal(t, withTestModTime(second[0].files, testLocalModTimeA), third[0].files)
+}
+
+// The same, when the directory that was synced without a source has a file
+// with another content of the same size, and the recorded source comes back
+// with the modification times that the copy has now (checkouts whose times
+// are normalised or restored). The record would make the daemon keep the file
+// of the other directory.
+func TestSnapshotReceivesFileWithSameModTimeAfterSyncWithoutSource(t *testing.T) {
+	cm := newTestCacheManager(t)
+	dirA := writeTestLocalTree(t, testLocalModTimeA)
+	dirB := writeTestLocalTreeWithOtherDockerfile(t, testLocalModTimeB)
+
+	syncTestLocalDir(t, cm, dirA, "repository", "a")
+	syncTestLocalDir(t, cm, dirB, "repository", "")
+	second := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, second, 1)
+	require.Equal(t, "FROM busybox\n", second[0].files["Dockerfile"].Content)
+
+	for name := range testLocalTree {
+		p := filepath.Join(dirA, filepath.FromSlash(name))
+		require.NoError(t, os.Chtimes(p, testLocalModTimeB, testLocalModTimeB))
+	}
+	syncTestLocalDir(t, cm, dirA, "repository", "a")
+	third := readTestSavedCopies(t, cm, "repository")
+	require.Len(t, third, 1)
+
+	assert.Equal(t, "a", third[0].source)
+	assert.Equal(t, "FROM scratch\n", third[0].files["Dockerfile"].Content)
+	assert.Equal(t, testLocalModTimeB.UnixNano(), third[0].files["Dockerfile"].ModTime)
+	assert.NotEqual(t, second[0].files["Dockerfile"].Inode, third[0].files["Dockerfile"].Inode)
+	assert.Equal(t, second[0].files["src/main.go"], third[0].files["src/main.go"])
 }
 
 // A step can be shared with the build of another client. The source that the
 // other client named does not opt in the client that sends the files: it did
 // not send the option, so its files are compared by modification time and the
-// record of the copy stays as it was.
+// copy ends without a recorded source.
 func TestSnapshotIgnoresSourceOfAnotherSession(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -522,7 +578,7 @@ func TestSnapshotIgnoresSourceOfAnotherSession(t *testing.T) {
 			second := readTestSavedCopies(t, cm, "repository")
 			require.Len(t, second, 1)
 
-			assert.Equal(t, "a", second[0].source)
+			assert.Empty(t, second[0].source)
 			assert.NotEqual(t, first[0].files["Dockerfile"].Inode, second[0].files["Dockerfile"].Inode)
 			assert.NotEqual(t, first[0].files["src/main.go"].Inode, second[0].files["src/main.go"].Inode)
 			assert.Equal(t, testLocalModTimeB.UnixNano(), second[0].files["Dockerfile"].ModTime)
@@ -570,7 +626,8 @@ func TestSnapshotUsesSourceOfItsSession(t *testing.T) {
 }
 
 // Builds of the same client share the step: all of them have to name the same
-// source, or there is none.
+// source, or there is none. The files are then compared by modification time
+// and the copy ends without a recorded source.
 func TestSnapshotNeedsEveryBuildOfTheSessionToNameTheSource(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -597,7 +654,7 @@ func TestSnapshotNeedsEveryBuildOfTheSessionToNameTheSource(t *testing.T) {
 			second := readTestSavedCopies(t, cm, "repository")
 			require.Len(t, second, 1)
 
-			assert.Equal(t, "a", second[0].source)
+			assert.Empty(t, second[0].source)
 			assert.NotEqual(t, first[0].files["Dockerfile"].Inode, second[0].files["Dockerfile"].Inode)
 			assert.Equal(t, testLocalModTimeB.UnixNano(), second[0].files["Dockerfile"].ModTime)
 		})
