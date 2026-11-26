@@ -3,11 +3,18 @@
 package local
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
 	gofs "io/fs"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -19,6 +26,7 @@ import (
 	"github.com/containerd/containerd/v2/plugins/diff/walking"
 	"github.com/containerd/containerd/v2/plugins/snapshots/native"
 	"github.com/moby/buildkit/cache"
+	"github.com/moby/buildkit/cache/contenthash"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/okteto"
 	"github.com/moby/buildkit/session"
@@ -50,7 +58,13 @@ var (
 
 func newTestCacheManager(t *testing.T) cache.Manager {
 	t.Helper()
-	tmpdir := t.TempDir()
+	return newTestCacheManagerAt(t, t.TempDir())
+}
+
+// newTestCacheManagerAt opens a cache manager on the state that is stored in
+// tmpdir, as a daemon does with its root directory when it starts.
+func newTestCacheManagerAt(t *testing.T, tmpdir string) cache.Manager {
+	t.Helper()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
@@ -101,13 +115,20 @@ func newTestCacheManager(t *testing.T) cache.Manager {
 func writeTestLocalTree(t *testing.T, modTime time.Time) string {
 	t.Helper()
 	dir := t.TempDir()
-	for name, content := range testLocalTree {
+	writeTestFiles(t, dir, testLocalTree, modTime)
+	return dir
+}
+
+// writeTestFiles writes files in dir, all of them with the same modification
+// time.
+func writeTestFiles(t *testing.T, dir string, files map[string]string, modTime time.Time) {
+	t.Helper()
+	for name, content := range files {
 		p := filepath.Join(dir, filepath.FromSlash(name))
 		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0700))
 		require.NoError(t, os.WriteFile(p, []byte(content), 0600))
 		require.NoError(t, os.Chtimes(p, modTime, modTime))
 	}
-	return dir
 }
 
 // testJobContext is the job context of a build step. Its first build is the
@@ -176,6 +197,8 @@ type testLocalBuild struct {
 	// anySession leaves the session out of the local source, so the files
 	// are requested from any session of the builds of the step
 	anySession bool
+	// fs are the files that the client sends, instead of the ones of dir
+	fs fsutil.FS
 }
 
 // snapshotTestLocal runs the snapshot of the local source id for a client
@@ -191,8 +214,12 @@ func snapshotTestLocalBuild(t *testing.T, cm cache.Manager, b testLocalBuild) ca
 	t.Helper()
 	ctx := t.Context()
 
-	dirFS, err := fsutil.NewFS(b.dir)
-	require.NoError(t, err)
+	dirFS := b.fs
+	if dirFS == nil {
+		var err error
+		dirFS, err = fsutil.NewFS(b.dir)
+		require.NoError(t, err)
+	}
 	s, err := session.NewSession(ctx, b.sharedKey)
 	require.NoError(t, err)
 	sm, err := session.NewManager()
@@ -268,6 +295,7 @@ type testSavedFile struct {
 }
 
 type testSavedCopy struct {
+	id     string
 	source string
 	files  map[string]testSavedFile
 }
@@ -317,6 +345,7 @@ func readTestSavedCopies(t *testing.T, cm cache.Manager, key string) []testSaved
 		dir, err := lm.Mount()
 		require.NoError(t, err)
 		copies = append(copies, testSavedCopy{
+			id:     mutable.ID(),
 			source: cacheRefMetadata{mutable}.getSyncSource(),
 			files:  readTestSavedFiles(t, dir),
 		})
@@ -804,6 +833,528 @@ func TestCompareSyncSource(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expected, compareSyncSource(tt.a, tt.b, "source"))
+		})
+	}
+}
+
+// testOpenHookFS are the files of a client that runs hook when the content of
+// path is read for the nth time.
+type testOpenHookFS struct {
+	fsutil.FS
+	path  string
+	nth   int32
+	hook  func()
+	opens atomic.Int32
+}
+
+func (f *testOpenHookFS) Open(p string) (io.ReadCloser, error) {
+	if filepath.ToSlash(p) == f.path && f.opens.Add(1) == f.nth {
+		f.hook()
+	}
+	return f.FS.Open(p)
+}
+
+// readTestCompleteSyncs returns, for every copy of the local source that is
+// stored with the given key, whether it is recorded as the result of a sync
+// that finished. It does not take the copies, so it can be called during a
+// sync.
+func readTestCompleteSyncs(ctx context.Context, cm cache.Manager, key string) ([]bool, error) {
+	sis, err := searchSharedKey(ctx, cm, testLocalName+"::"+key)
+	if err != nil {
+		return nil, err
+	}
+	complete := make([]bool, 0, len(sis))
+	for _, si := range sis {
+		complete = append(complete, si.hasCompleteSync())
+	}
+	return complete, nil
+}
+
+// changeTestCopies applies change to the metadata of the copies of the local
+// source that source synced last.
+func changeTestCopies(t *testing.T, cm cache.Manager, key, source string, change func(cacheRefMetadata) error) {
+	t.Helper()
+	sis, err := searchSharedKey(t.Context(), cm, testLocalName+"::"+key)
+	require.NoError(t, err)
+	for _, si := range sis {
+		if si.getSyncSource() == source {
+			require.NoError(t, change(si))
+		}
+	}
+}
+
+// leaveTestSyncUnfinished leaves the metadata of a copy as a daemon that dies
+// during a sync of it leaves it.
+func leaveTestSyncUnfinished(md cacheRefMetadata) error {
+	return md.setCompleteSync(false)
+}
+
+// waitForTestSavedCopies waits until n copies of the local source are stored
+// with the given key: a copy that is not reused is removed in the background.
+func waitForTestSavedCopies(t *testing.T, cm cache.Manager, key string, n int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		sis, err := searchSharedKey(t.Context(), cm, testLocalName+"::"+key)
+		return err == nil && len(sis) == n
+	}, 10*time.Second, 10*time.Millisecond)
+}
+
+func TestSnapshotCopyIsNotCompleteDuringSync(t *testing.T) {
+	cm := newTestCacheManager(t)
+	ctx := t.Context()
+	dir := writeTestLocalTree(t, testLocalModTimeA)
+
+	syncTestLocalDir(t, cm, dir, "repository", "")
+	before, err := readTestCompleteSyncs(ctx, cm, "repository")
+	require.NoError(t, err)
+
+	// the content of the file that changed is read in the middle of the sync
+	require.NoError(t, os.Chtimes(filepath.Join(dir, "Dockerfile"), testLocalModTimeB, testLocalModTimeB))
+	dirFS, err := fsutil.NewFS(dir)
+	require.NoError(t, err)
+	var (
+		during    []bool
+		duringErr error
+	)
+	syncTestLocalBuild(t, cm, testLocalBuild{
+		sharedKey: "repository",
+		fs: &testOpenHookFS{FS: dirFS, path: "Dockerfile", nth: 1, hook: func() {
+			during, duringErr = readTestCompleteSyncs(ctx, cm, "repository")
+		}},
+	})
+	after, err := readTestCompleteSyncs(ctx, cm, "repository")
+	require.NoError(t, err)
+
+	require.NoError(t, duringErr)
+	assert.Equal(t, []bool{true}, before)
+	assert.Equal(t, []bool{false}, during)
+	assert.Equal(t, []bool{true}, after)
+}
+
+// testMetadataWrites are the writes to the metadata of the copies of a cache
+// manager, in the order in which they happen.
+type testMetadataWrites struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (w *testMetadataWrites) add(event string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.events = append(w.events, event)
+}
+
+func (w *testMetadataWrites) take() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	events := w.events
+	w.events = nil
+	return events
+}
+
+// testRecordingManager is a cache manager whose copies record the writes to
+// their metadata.
+type testRecordingManager struct {
+	cache.Manager
+	writes *testMetadataWrites
+}
+
+func (m testRecordingManager) New(ctx context.Context, parent cache.ImmutableRef, s session.Group, opts ...cache.RefOption) (cache.MutableRef, error) {
+	ref, err := m.Manager.New(ctx, parent, s, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &testRecordingRef{MutableRef: ref, writes: m.writes}, nil
+}
+
+func (m testRecordingManager) GetMutable(ctx context.Context, id string, opts ...cache.RefOption) (cache.MutableRef, error) {
+	ref, err := m.Manager.GetMutable(ctx, id, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &testRecordingRef{MutableRef: ref, writes: m.writes}, nil
+}
+
+type testRecordingRef struct {
+	cache.MutableRef
+	writes *testMetadataWrites
+}
+
+func (r *testRecordingRef) SetString(key, value, index string) error {
+	r.writes.add(key + "=" + value)
+	return r.MutableRef.SetString(key, value, index)
+}
+
+func (r *testRecordingRef) SetExternal(key string, dt []byte) error {
+	r.writes.add(key)
+	return r.MutableRef.SetExternal(key, dt)
+}
+
+// TestSnapshotOrderOfMetadataWrites checks when a copy stops being complete
+// and when it is complete again. Before the transfer, because the transfer
+// changes the files. After the content hashes and the source, because a copy
+// that is complete is trusted to have the ones of its files.
+func TestSnapshotOrderOfMetadataWrites(t *testing.T) {
+	const contentHashes = "buildkit.contenthash.v0"
+	writes := &testMetadataWrites{}
+	cm := testRecordingManager{Manager: newTestCacheManager(t), writes: writes}
+	dir := writeTestLocalTree(t, testLocalModTimeA)
+
+	syncTestLocalDir(t, cm, dir, "repository", "a")
+	first := writes.take()
+
+	// another source syncs the copy and a file is written again
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM alpine\n"), 0600))
+	dirFS, err := fsutil.NewFS(dir)
+	require.NoError(t, err)
+	syncTestLocalBuild(t, cm, testLocalBuild{
+		sharedKey: "repository",
+		source:    "b",
+		fs: &testOpenHookFS{FS: dirFS, path: "Dockerfile", nth: 2, hook: func() {
+			writes.add("transfer")
+		}},
+	})
+	second := writes.take()
+
+	// a new copy has no record to remove before its first transfer
+	assert.Equal(t, []string{
+		contentHashes,
+		keySharedKey + "=" + testLocalName + "::repository",
+		keySyncSource + "=a",
+		keyCompleteSync + "=true",
+	}, first)
+	assert.Equal(t, []string{
+		keyCompleteSync + "=",
+		"transfer",
+		contentHashes,
+		keySyncSource + "=b",
+		keyCompleteSync + "=true",
+	}, second)
+}
+
+func TestSnapshotReplacesCopyThatIsNotComplete(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(cacheRefMetadata) error
+	}{
+		{
+			name:   "a sync of the copy did not finish",
+			change: leaveTestSyncUnfinished,
+		},
+		{
+			name: "the copy was synced by a daemon that does not record it",
+			change: func(md cacheRefMetadata) error {
+				return md.ClearValueAndIndex(keyCompleteSync, "")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := newTestCacheManager(t)
+			dir := writeTestLocalTree(t, testLocalModTimeA)
+
+			syncTestLocalDir(t, cm, dir, "repository", "a")
+			first := readTestSavedCopies(t, cm, "repository")
+			require.Len(t, first, 1)
+			changeTestCopies(t, cm, "repository", "a", tt.change)
+
+			syncTestLocalDir(t, cm, dir, "repository", "a")
+			waitForTestSavedCopies(t, cm, "repository", 1)
+			second := readTestSavedCopies(t, cm, "repository")
+			require.Len(t, second, 1)
+			complete, err := readTestCompleteSyncs(t.Context(), cm, "repository")
+			require.NoError(t, err)
+
+			// the source and the modification times are the ones of the
+			// saved copy, and the sync still fills another copy
+			assert.NotEqual(t, first[0].id, second[0].id)
+			assert.Equal(t, "a", second[0].source)
+			assert.Len(t, second[0].files, len(testLocalTree))
+			assert.Equal(t, []bool{true}, complete)
+		})
+	}
+}
+
+func TestSnapshotReusesAnotherCopyWhenOneIsNotComplete(t *testing.T) {
+	cm := newTestCacheManager(t)
+	dirA := writeTestLocalTree(t, testLocalModTimeA)
+	dirB := writeTestLocalTree(t, testLocalModTimeB)
+
+	// the copy of a is in use while b syncs, so b gets a copy of its own
+	refA := snapshotTestLocalDir(t, cm, dirA, "repository", "a")
+	refB := snapshotTestLocalDir(t, cm, dirB, "repository", "b")
+	require.NoError(t, refA.Release(t.Context()))
+	require.NoError(t, refB.Release(t.Context()))
+	initial := readTestSavedCopies(t, cm, "repository")
+	require.ElementsMatch(t, []string{"a", "b"}, testSavedCopySources(initial))
+	copyB := initial[slices.IndexFunc(initial, func(c testSavedCopy) bool { return c.source == "b" })]
+	changeTestCopies(t, cm, "repository", "a", leaveTestSyncUnfinished)
+
+	syncTestLocalDir(t, cm, dirA, "repository", "a")
+	waitForTestSavedCopies(t, cm, "repository", 1)
+	final := readTestSavedCopies(t, cm, "repository")
+
+	// a syncs the copy of b: its files are compared by content and stay
+	assert.Equal(t, []testSavedCopy{{id: copyB.id, source: "a", files: withTestModTime(copyB.files, testLocalModTimeA)}}, final)
+}
+
+const (
+	// testKilledSyncEnv has the testKilledSync of the process that is killed
+	testKilledSyncEnv = "BUILDKIT_TEST_KILLED_SYNC"
+	// testKilledSyncLastFile is the file whose content the daemon never gets
+	testKilledSyncLastFile = "zzz/last"
+)
+
+var (
+	// testKilledSyncOld is the directory in the first sync, and
+	// testKilledSyncNew in the sync that is killed and in the next one: a file
+	// has other content, a file is gone and the last one has another size.
+	testKilledSyncOld = map[string]string{
+		"aaa/changed":          "old\n",
+		"aaa/removed":          "removed\n",
+		"aaa/same":             "same\n",
+		testKilledSyncLastFile: "old, last\n",
+	}
+	testKilledSyncNew = map[string]string{
+		"aaa/changed":          "new\n",
+		"aaa/same":             "same\n",
+		testKilledSyncLastFile: "new, last, with another size\n",
+	}
+	testKilledSyncChanged = map[string]string{
+		"aaa/changed":          testKilledSyncNew["aaa/changed"],
+		testKilledSyncLastFile: testKilledSyncNew[testKilledSyncLastFile],
+	}
+)
+
+// testKilledSync is what the process that is killed does: a daemon on Root
+// that syncs FirstDir and then KilledDir, where it stops for ever when the
+// client reads the last file for the StopAtOpen time. It creates the file
+// Reached at that moment.
+type testKilledSync struct {
+	Root         string
+	FirstDir     string
+	FirstSource  string
+	KilledDir    string
+	KilledSource string
+	StopAtOpen   int32
+	Reached      string
+}
+
+// writeTestKilledSyncNew creates a directory with testKilledSyncNew. The
+// files that are also in testKilledSyncOld with the same content have the
+// given modification time, and the ones that changed a later one.
+func writeTestKilledSyncNew(t *testing.T, modTime time.Time) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeTestFiles(t, dir, testKilledSyncNew, modTime)
+	writeTestFiles(t, dir, testKilledSyncChanged, modTime.Add(time.Hour))
+	return dir
+}
+
+// testKilledSyncIsHalfway reports whether the daemon of the process that is
+// going to be killed has the file that changed, with its content and its
+// modification time, does not have the one that is gone, and waits for the
+// content of the last one.
+func testKilledSyncIsHalfway(c testKilledSync, modTime time.Time) bool {
+	if _, err := os.Stat(c.Reached); err != nil {
+		return false
+	}
+	// the native snapshotter keeps the files of the copy in a directory of its root
+	dirs, err := filepath.Glob(filepath.Join(c.Root, "snapshots", "snapshots", "*", "aaa"))
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(dirs, func(dir string) bool {
+		content, err := os.ReadFile(filepath.Join(dir, "changed"))
+		if err != nil || string(content) != testKilledSyncNew["aaa/changed"] {
+			return false
+		}
+		fi, err := os.Stat(filepath.Join(dir, "changed"))
+		if err != nil || !fi.ModTime().Equal(modTime.Add(time.Hour)) {
+			return false
+		}
+		_, err = os.Stat(filepath.Join(dir, "removed"))
+		return os.IsNotExist(err)
+	})
+}
+
+// killTestSync runs the process of c and kills it when it is in the middle of
+// its second sync, as a daemon that runs out of memory is killed.
+func killTestSync(t *testing.T, c testKilledSync, modTime time.Time) {
+	t.Helper()
+	config, err := json.Marshal(c)
+	require.NoError(t, err)
+
+	var output bytes.Buffer
+	// the timeout ends the process if nobody is left to kill it
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestSnapshotKilledSyncProcess$", "-test.count=1", "-test.v", "-test.timeout=5m") //nolint:gosec // the test binary runs itself
+	cmd.Env = append(os.Environ(), testKilledSyncEnv+"="+string(config))
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	require.NoError(t, cmd.Start())
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for !testKilledSyncIsHalfway(c, modTime) {
+		select {
+		case err := <-exited:
+			require.FailNowf(t, "the process ended before it was killed", "%v\n%s", err, output.String())
+		case <-time.After(10 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			require.NoError(t, cmd.Process.Kill())
+			<-exited
+			require.FailNowf(t, "the process did not get to the middle of the sync", "%s", output.String())
+		}
+	}
+	require.NoError(t, cmd.Process.Kill())
+	<-exited
+}
+
+// TestSnapshotKilledSyncProcess is the process that TestSnapshotAfterKilledSync
+// kills. It does nothing when the tests of the package run.
+func TestSnapshotKilledSyncProcess(t *testing.T) {
+	config, ok := os.LookupEnv(testKilledSyncEnv)
+	if !ok {
+		t.Skip("it only runs as the process that TestSnapshotAfterKilledSync kills")
+	}
+	var c testKilledSync
+	require.NoError(t, json.Unmarshal([]byte(config), &c))
+
+	cm := newTestCacheManagerAt(t, c.Root)
+	syncTestLocalDir(t, cm, c.FirstDir, "repository", c.FirstSource)
+
+	killedFS, err := fsutil.NewFS(c.KilledDir)
+	require.NoError(t, err)
+	syncTestLocalBuild(t, cm, testLocalBuild{
+		sharedKey: "repository",
+		source:    c.KilledSource,
+		fs: &testOpenHookFS{FS: killedFS, path: testKilledSyncLastFile, nth: c.StopAtOpen, hook: func() {
+			_ = os.WriteFile(c.Reached, nil, 0600)
+			<-t.Context().Done()
+		}},
+	})
+	t.Fatal("the sync finished: the process had to be killed in the middle of it")
+}
+
+// readTestChecksums returns the content hashes that the cache has for the
+// paths of a local source, empty for the paths that it has none for.
+func readTestChecksums(t *testing.T, ref cache.ImmutableRef, paths ...string) map[string]string {
+	t.Helper()
+	sums := make(map[string]string, len(paths))
+	for _, p := range paths {
+		sums[p] = ""
+		if dgst, err := contenthash.Checksum(t.Context(), ref, p, contenthash.ChecksumOpts{}, nil); err == nil {
+			sums[p] = dgst.String()
+		}
+	}
+	return sums
+}
+
+// TestSnapshotAfterKilledSync checks the content hashes of a build that comes
+// after a daemon was killed in the middle of a sync. They are what the build
+// steps that read the files are cached by, so they have to be the ones of the
+// files that the build gets.
+func TestSnapshotAfterKilledSync(t *testing.T) {
+	const (
+		// the files are compared by modification time: the daemon only asks
+		// the client for the content of the last file
+		readForContent = 1
+		// the files are compared by content: the client reads the last file
+		// to hash it before the daemon asks for its content
+		readForDigestAndContent = 2
+	)
+	tests := []struct {
+		name         string
+		firstSource  string
+		killedSource string
+		stopAtOpen   int32
+		// killedModTime and nextModTime are the modification times of the
+		// files that did not change in the directory of the sync that is
+		// killed and in the one of the next sync
+		killedModTime time.Time
+		nextSource    string
+		nextModTime   time.Time
+	}{
+		{
+			name:          "the same directory syncs again, without source",
+			stopAtOpen:    readForContent,
+			killedModTime: testLocalModTimeA,
+			nextModTime:   testLocalModTimeA,
+		},
+		{
+			name:          "the same directory syncs again, with its source",
+			firstSource:   "a",
+			killedSource:  "a",
+			stopAtOpen:    readForContent,
+			killedModTime: testLocalModTimeA,
+			nextSource:    "a",
+			nextModTime:   testLocalModTimeA,
+		},
+		{
+			name:          "another clone is killed and syncs again",
+			firstSource:   "a",
+			killedSource:  "b",
+			stopAtOpen:    readForDigestAndContent,
+			killedModTime: testLocalModTimeB,
+			nextSource:    "b",
+			nextModTime:   testLocalModTimeB,
+		},
+		{
+			name:          "another clone is killed and a third one syncs next",
+			firstSource:   "a",
+			killedSource:  "b",
+			stopAtOpen:    readForDigestAndContent,
+			killedModTime: testLocalModTimeB,
+			nextSource:    "c",
+			nextModTime:   testLocalModTimeB.Add(24 * time.Hour),
+		},
+	}
+	paths := []string{"/", "aaa", "aaa/changed", "aaa/removed", "aaa/same", testKilledSyncLastFile}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			firstDir := t.TempDir()
+			writeTestFiles(t, firstDir, testKilledSyncOld, testLocalModTimeA)
+			nextDir := writeTestKilledSyncNew(t, tt.nextModTime)
+			c := testKilledSync{
+				Root:         t.TempDir(),
+				FirstDir:     firstDir,
+				FirstSource:  tt.firstSource,
+				KilledDir:    writeTestKilledSyncNew(t, tt.killedModTime),
+				KilledSource: tt.killedSource,
+				StopAtOpen:   tt.stopAtOpen,
+				Reached:      filepath.Join(t.TempDir(), "reached"),
+			}
+			killTestSync(t, c, tt.killedModTime)
+
+			// a daemon starts on the state of the one that was killed
+			cm := newTestCacheManagerAt(t, c.Root)
+			ref := snapshotTestLocalDir(t, cm, nextDir, "repository", tt.nextSource)
+			sums := readTestChecksums(t, ref, paths...)
+			require.NoError(t, ref.Release(ctx))
+			waitForTestSavedCopies(t, cm, "repository", 1)
+			copies := readTestSavedCopies(t, cm, "repository")
+			require.Len(t, copies, 1)
+			complete, err := readTestCompleteSyncs(ctx, cm, "repository")
+			require.NoError(t, err)
+
+			// what a daemon without state has for the same directory
+			plainRef := snapshotTestLocalDir(t, newTestCacheManager(t), nextDir, "repository", "")
+			plainSums := readTestChecksums(t, plainRef, paths...)
+			require.NoError(t, plainRef.Release(ctx))
+
+			content := make(map[string]string, len(copies[0].files))
+			for name, f := range copies[0].files {
+				content[name] = f.Content
+			}
+			assert.Equal(t, testKilledSyncNew, content)
+			assert.Equal(t, plainSums, sums)
+			assert.Empty(t, sums["aaa/removed"])
+			assert.NotEmpty(t, sums["aaa/changed"])
+			assert.Equal(t, tt.nextSource, copies[0].source)
+			assert.Equal(t, []bool{true}, complete)
 		})
 	}
 }

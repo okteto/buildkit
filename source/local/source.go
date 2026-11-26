@@ -235,6 +235,13 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 	}
 	for _, si := range sis {
 		if m, err := ls.cm.GetMutable(ctx, si.ID()); err == nil {
+			// okteto: only a copy that a sync left complete is reused, see
+			// keyCompleteSync
+			if !(cacheRefMetadata{m}).hasCompleteSync() {
+				bklog.G(ctx).Warnf("not reusing ref %s for local: it is not the result of a sync that finished", m.ID())
+				removeLocalRef(ctx, m)
+				continue
+			}
 			bklog.G(ctx).Debugf("reusing ref for local: %s", m.ID())
 			mutable = m
 			break
@@ -326,6 +333,15 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		}
 	}
 
+	// okteto: the transfer writes the files, and their content hashes are only
+	// saved when it has finished. If the daemon dies in between, the saved
+	// hashes may not describe the files, and a later sync only corrects the
+	// hashes of the files that it writes. So the copy stops being complete
+	// before the transfer starts.
+	if err := (cacheRefMetadata{mutable}).setCompleteSync(false); err != nil {
+		return nil, err
+	}
+
 	if err := filesync.FSSync(ctx, caller, opt); err != nil {
 		return nil, err
 	}
@@ -354,6 +370,11 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		if err := md.setSyncSource(syncSource); err != nil {
 			return nil, err
 		}
+	}
+	// okteto: the content hashes, the shared key and the source of the files
+	// that the transfer left are saved
+	if err := md.setCompleteSync(true); err != nil {
+		return nil, err
 	}
 
 	snap, err := mutable.Commit(ctx)
@@ -408,6 +429,13 @@ const (
 
 	// keySyncSource (okteto) is the source that synced a local source copy last
 	keySyncSource = "okteto.local.syncSource"
+
+	// keyCompleteSync (okteto) is set on a local source copy when a sync has
+	// saved its content hashes and its source, and removed before the next
+	// sync starts its transfer. A copy without it is not reused: a sync of it
+	// did not finish, or it was only synced by daemons that do not record
+	// this.
+	keyCompleteSync = "okteto.local.completeSync"
 )
 
 func searchSharedKey(ctx context.Context, store cache.MetadataStore, k string) ([]cacheRefMetadata, error) {
@@ -440,6 +468,31 @@ func (md cacheRefMetadata) getSyncSource() string {
 
 func (md cacheRefMetadata) setSyncSource(source string) error {
 	return md.SetString(keySyncSource, source, "")
+}
+
+func (md cacheRefMetadata) hasCompleteSync() bool {
+	return md.GetString(keyCompleteSync) != ""
+}
+
+func (md cacheRefMetadata) setCompleteSync(complete bool) error {
+	if md.hasCompleteSync() == complete {
+		return nil
+	}
+	value := ""
+	if complete {
+		value = "true"
+	}
+	return md.SetString(keyCompleteSync, value, "")
+}
+
+// removeLocalRef (okteto) removes a local source copy that is not reused, as
+// the snapshot does with the copy of a sync that fails.
+func removeLocalRef(ctx context.Context, mutable cache.MutableRef) {
+	if err := mutable.SetCachePolicyDefault(); err != nil {
+		bklog.G(ctx).Errorf("failed to reset mutable cachepolicy: %v", err)
+	}
+	contenthash.ClearCacheContext(mutable)
+	go mutable.Release(context.WithoutCancel(ctx))
 }
 
 // compareSyncSource orders the copies of a local source so that the ones that
