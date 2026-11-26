@@ -160,6 +160,150 @@ func TestContentDiffSplitsHardlinkThatIsAFileForTheClient(t *testing.T) {
 	assert.False(t, os.SameFile(file, hardlink))
 }
 
+// syncContentDiffClientDir is syncContentDiffDir with the directory as the
+// client of BuildKit gives it to the session (prepareSyncedFiles of the
+// client package): behind a filter that makes root the owner of every path.
+// That filter reads every path of the directory, also the ones that the
+// request of the daemon filters out afterwards, and reading the paths is what
+// names the hardlinks. The receiver gives the files to the user of the test,
+// who may not be root.
+func syncContentDiffClientDir(t *testing.T, src, dest string, opt FSSendRequestOpt) *recordingUpdater {
+	t.Helper()
+	srcFS, err := fsutil.NewFS(src)
+	require.NoError(t, err)
+	srcFS, err = fsutil.NewFilterFS(srcFS, &fsutil.FilterOpt{
+		Map: func(_ string, st *fstypes.Stat) fsutil.MapResult {
+			st.Uid = 0
+			st.Gid = 0
+			return fsutil.MapResultKeep
+		},
+	})
+	require.NoError(t, err)
+
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	opt.Filter = func(_ string, st *fstypes.Stat) bool {
+		st.Uid = uid
+		st.Gid = gid
+		return true
+	}
+	return syncContentDiffFS(t, srcFS, dest, opt)
+}
+
+// contentDiffFilteredFirstPaths are requests of the daemon that filter out
+// the first path of the file of writeContentDiffHardlinks, and keep its
+// hardlinks.
+var contentDiffFilteredFirstPaths = []struct {
+	name  string
+	first string
+	opt   FSSendRequestOpt
+}{
+	{
+		name:  "excluded path",
+		first: "hardlink-a",
+		opt:   FSSendRequestOpt{ContentDiff: true, ExcludePatterns: []string{"hardlink-a"}},
+	},
+	{
+		name:  "path that is not included",
+		first: "hardlink-a",
+		opt:   FSSendRequestOpt{ContentDiff: true, FollowPaths: []string{"file", "hardlink-b", "hardlink-c"}},
+	},
+	{
+		// fsutil does not go into an excluded directory, unless a pattern
+		// with a wildcard could include one of its paths again
+		name:  "path of an excluded directory",
+		first: "dir/hardlink-a",
+		opt:   FSSendRequestOpt{ContentDiff: true, ExcludePatterns: []string{"dir", "!**/*.keep"}},
+	},
+}
+
+// writeContentDiffHardlinks creates a directory with "file" and with another
+// file that has three paths: first, which a walk has to find before the other
+// two, "hardlink-b" and "hardlink-c".
+func writeContentDiffHardlinks(t *testing.T, first, content string, modTime time.Time) string {
+	t.Helper()
+	dir := writeContentDiffTree(t, map[string]string{"file": "content", first: content}, modTime)
+	for _, name := range []string{"hardlink-b", "hardlink-c"} {
+		// a link does not change the modification time of the file
+		require.NoError(t, os.Link(filepath.Join(dir, filepath.FromSlash(first)), filepath.Join(dir, name)))
+	}
+	return dir
+}
+
+// requireContentDiffNames checks the names of the paths that dir has.
+func requireContentDiffNames(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	actual := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		actual = append(actual, entry.Name())
+	}
+	assert.Equal(t, names, actual)
+}
+
+// The request of the daemon filters out the first path of a file with
+// hardlinks. For the client the next path is a hardlink of a path that is not
+// sent, and fsutil sends it as a regular file. It has to be compared by
+// content as any other file: here it comes from another directory with the
+// same content, and nothing is sent.
+func TestContentDiffKeepsHardlinksWhenFirstPathIsFilteredOut(t *testing.T) {
+	for _, tc := range contentDiffFilteredFirstPaths {
+		t.Run(tc.name, func(t *testing.T) {
+			dirA := writeContentDiffHardlinks(t, tc.first, "content", contentDiffModTimeA)
+			dirB := writeContentDiffHardlinks(t, tc.first, "content", contentDiffModTimeB)
+			dest := t.TempDir()
+			first := syncContentDiffClientDir(t, dirA, dest, tc.opt)
+			require.Equal(t, []string{"file", "hardlink-b", "hardlink-c"}, first.writtenFiles())
+
+			second := syncContentDiffClientDir(t, dirB, dest, tc.opt)
+
+			assert.Empty(t, second.writtenFiles())
+			requireContentDiffNames(t, dest, "file", "hardlink-b", "hardlink-c")
+			requireContentDiffHardlinks(t, dest, "hardlink-b", "hardlink-c")
+			fi, err := os.Stat(filepath.Join(dest, "hardlink-b"))
+			require.NoError(t, err)
+			assert.Equal(t, contentDiffModTimeB.UnixNano(), fi.ModTime().UnixNano())
+		})
+	}
+}
+
+// The same file comes with another content and the saved size and
+// modification time: without its digest the saved content would stay.
+func TestContentDiffSendsHardlinksWhenFirstPathIsFilteredOut(t *testing.T) {
+	for _, tc := range contentDiffFilteredFirstPaths {
+		t.Run(tc.name, func(t *testing.T) {
+			dirA := writeContentDiffHardlinks(t, tc.first, "content of A", contentDiffModTimeA)
+			dirB := writeContentDiffHardlinks(t, tc.first, "content of B", contentDiffModTimeA)
+			dest := t.TempDir()
+			syncContentDiffClientDir(t, dirA, dest, tc.opt)
+
+			second := syncContentDiffClientDir(t, dirB, dest, tc.opt)
+
+			assert.Equal(t, []string{"hardlink-b", "hardlink-c"}, second.writtenFiles())
+			requireContentDiffNames(t, dest, "file", "hardlink-b", "hardlink-c")
+			requireContentDiffHardlinks(t, dest, "hardlink-b", "hardlink-c")
+			content, err := os.ReadFile(filepath.Join(dest, "hardlink-c"))
+			require.NoError(t, err)
+			assert.Equal(t, "content of B", string(content))
+		})
+	}
+}
+
+// The client names the hardlinks of every directory that it reads, and no
+// request filters them here: the mount of the client does not change what the
+// tests above get from a plain directory.
+func TestContentDiffLinksHardlinksOfClientToRequestedTarget(t *testing.T) {
+	dirA, dirB := contentDiffSameTimeHardlinkTrees(t)
+	dest := t.TempDir()
+	syncContentDiffClientDir(t, dirA, dest, FSSendRequestOpt{ContentDiff: true})
+
+	second := syncContentDiffClientDir(t, dirB, dest, FSSendRequestOpt{ContentDiff: true})
+
+	assert.Equal(t, []string{"Dockerfile", "hardlink", "src/hardlink"}, second.writtenFiles())
+	requireSameContentDiffTree(t, dirB, dest)
+	requireContentDiffHardlinks(t, dest, "Dockerfile", "hardlink", "src/hardlink")
+}
+
 func TestContentDiffReplacesSymlinkWithDirectory(t *testing.T) {
 	dirA := writeContentDiffTree(t, contentDiffTree, contentDiffModTimeA)
 	require.NoError(t, os.Symlink("src", filepath.Join(dirA, "link")))

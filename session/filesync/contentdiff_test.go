@@ -100,10 +100,16 @@ func (u *recordingUpdater) writtenFiles() []string {
 // for a local source, and returns the files that were written.
 func syncContentDiffDir(t *testing.T, src, dest string, opt FSSendRequestOpt) *recordingUpdater {
 	t.Helper()
-	ctx := t.Context()
-
 	srcFS, err := fsutil.NewFS(src)
 	require.NoError(t, err)
+	return syncContentDiffFS(t, srcFS, dest, opt)
+}
+
+// syncContentDiffFS is syncContentDiffDir for a directory that the client
+// gives to the session as srcFS.
+func syncContentDiffFS(t *testing.T, srcFS fsutil.FS, dest string, opt FSSendRequestOpt) *recordingUpdater {
+	t.Helper()
+	ctx := t.Context()
 
 	s, err := session.NewSession(ctx, "content-diff")
 	require.NoError(t, err)

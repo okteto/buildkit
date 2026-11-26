@@ -53,7 +53,10 @@ import (
 // A hardlink has no digest and is not compared: fsutil links it to its target,
 // the first path of the same file in the transfer. It gets the modification
 // time that fsutil got for that target, so that fsutil keeps or writes both
-// together as it does without content diff, see followLinkTarget.
+// together as it does without content diff, see followLinkTarget. What is a
+// hardlink is decided by the paths that are sent: when the request filters
+// out the first path of a file, the next one is sent as a regular file, with
+// its digest. See withContentDigests.
 //
 // The digest travels as an extra entry of Stat.Xattrs that is removed before
 // fsutil sees the stat, so it never reaches the disk or the content hash of
@@ -198,6 +201,14 @@ func contentDigest(ctx context.Context, r io.Reader) (dgst [sha256.Size]byte, er
 // withContentDigests returns an FS that adds the sha256 of the content to the
 // stat of every regular file. Files that can't be read are sent without a
 // digest, the receiver then compares their modification time as usual.
+//
+// A path that fs gives as a hardlink gets no digest, so fs has to name the
+// hardlinks as fsutil.Send sends them. The client of BuildKit names them over
+// all the paths of the directory, before the include and exclude patterns of
+// the request filter them. Send then sends a hardlink whose first path was
+// filtered out as a regular file. fsutil.WithHardlinkReset makes that change
+// before the digests are added, the sender wraps the filtered directory with
+// it.
 func withContentDigests(fs fsutil.FS) fsutil.FS {
 	return &contentDigestFS{
 		FS:           fs,

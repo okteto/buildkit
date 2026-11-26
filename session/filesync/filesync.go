@@ -132,9 +132,11 @@ func (sp *fsSyncProvider) handle(method string, stream grpc.ServerStream) (retEr
 	if err != nil {
 		return err
 	}
-	// okteto: the daemon compares the files by content
+	// okteto: the daemon compares the files by content. The hardlinks are
+	// named first as fsutil.Send names them: a hardlink whose first path was
+	// filtered out is a regular file for the daemon, and needs its digest.
 	if wantsContentDigests(pr.name, opts) {
-		dir = withContentDigests(dir)
+		dir = withContentDigests(fsutil.WithHardlinkReset(dir))
 	}
 
 	var progress progressCb
