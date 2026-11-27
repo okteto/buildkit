@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/contenthash"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/okteto"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/filesync"
 	"github.com/moby/buildkit/snapshot"
@@ -165,7 +167,7 @@ func (ls *localSourceHandler) Snapshot(ctx context.Context, jobCtx solver.JobCon
 	g := jobCtx.Session()
 	sessionID := ls.src.SessionID
 	if sessionID == "" {
-		return ls.snapshotWithAnySession(ctx, g)
+		return ls.snapshotWithAnySession(ctx, jobCtx, g)
 	}
 
 	timeoutCtx, cancel := context.WithCancelCause(ctx)
@@ -174,24 +176,24 @@ func (ls *localSourceHandler) Snapshot(ctx context.Context, jobCtx solver.JobCon
 
 	caller, err := ls.sm.Get(timeoutCtx, sessionID, false)
 	if err != nil {
-		return ls.snapshotWithAnySession(ctx, g)
+		return ls.snapshotWithAnySession(ctx, jobCtx, g)
 	}
 
-	ref, err := ls.snapshot(ctx, caller)
+	ref, err := ls.snapshot(ctx, caller, ls.syncSource(jobCtx, sessionID))
 	if err != nil {
 		var serr filesync.InvalidSessionError
 		if errors.As(err, &serr) {
-			return ls.snapshotWithAnySession(ctx, g)
+			return ls.snapshotWithAnySession(ctx, jobCtx, g)
 		}
 		return nil, err
 	}
 	return ref, nil
 }
 
-func (ls *localSourceHandler) snapshotWithAnySession(ctx context.Context, g session.Group) (cache.ImmutableRef, error) {
+func (ls *localSourceHandler) snapshotWithAnySession(ctx context.Context, jobCtx solver.JobContext, g session.Group) (cache.ImmutableRef, error) {
 	var ref cache.ImmutableRef
-	err := ls.sm.Any(ctx, g, func(ctx context.Context, _ string, c session.Caller) error {
-		r, err := ls.snapshot(ctx, c)
+	err := ls.sm.Any(ctx, g, func(ctx context.Context, sessionID string, c session.Caller) error {
+		r, err := ls.snapshot(ctx, c, ls.syncSource(jobCtx, sessionID))
 		if err != nil {
 			return err
 		}
@@ -201,7 +203,19 @@ func (ls *localSourceHandler) snapshotWithAnySession(ctx context.Context, g sess
 	return ref, err
 }
 
-func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Caller) (out cache.ImmutableRef, retErr error) {
+// syncSource (okteto) returns the source that the client of the session that
+// sends the files named for them, see okteto.LocalSourceOptPrefix. It is
+// empty if that client named none: the builds of other sessions that share
+// the step don't count.
+func (ls *localSourceHandler) syncSource(jobCtx solver.JobContext, sessionID string) string {
+	// only the transfers that compare modification times can compare content instead
+	if ls.src.Differ != fsutil.DiffMetadata || ls.src.MetadataOnly {
+		return ""
+	}
+	return okteto.LocalSource(jobCtx, sessionID, ls.src.Name)
+}
+
+func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Caller, syncSource string) (out cache.ImmutableRef, retErr error) {
 	metaSfx := ""
 	if ls.src.MetadataOnly {
 		metaSfx = ":metadata"
@@ -213,8 +227,21 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 	if err != nil {
 		return nil, err
 	}
+	if syncSource != "" {
+		// okteto: prefer the copy that has the modification times of this source
+		slices.SortStableFunc(sis, func(a, b cacheRefMetadata) int {
+			return compareSyncSource(a.getSyncSource(), b.getSyncSource(), syncSource)
+		})
+	}
 	for _, si := range sis {
 		if m, err := ls.cm.GetMutable(ctx, si.ID()); err == nil {
+			// okteto: only a copy that a sync left complete is reused, see
+			// keyCompleteSync
+			if !(cacheRefMetadata{m}).hasCompleteSync() {
+				bklog.G(ctx).Warnf("not reusing ref %s for local: it is not the result of a sync that finished", m.ID())
+				removeLocalRef(ctx, m)
+				continue
+			}
 			bklog.G(ctx).Debugf("reusing ref for local: %s", m.ID())
 			mutable = m
 			break
@@ -222,6 +249,10 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 			bklog.G(ctx).Debugf("not reusing ref %s for local: %v", si.ID(), err)
 		}
 	}
+
+	// okteto: the modification times of a reused copy are the ones of the source that
+	// synced it last. For any other source the files are compared by content.
+	contentDiff := mutable != nil && syncSource != "" && cacheRefMetadata{mutable}.getSyncSource() != syncSource
 
 	if mutable == nil {
 		m, err := ls.cm.New(ctx, nil, nil, cache.CachePolicyRetain, cache.WithRecordType(client.UsageRecordTypeLocalSource), cache.WithDescription(fmt.Sprintf("local source for %s", ls.src.Name)))
@@ -276,6 +307,7 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		ProgressCb:      newProgressHandler(ctx, "transferring "+ls.src.Name+":"),
 		Differ:          ls.src.Differ,
 		MetadataOnly:    ls.src.MetadataOnly,
+		ContentDiff:     contentDiff,
 	}
 
 	if opt.MetadataOnly && len(ls.src.MetadataExceptions) > 0 {
@@ -301,6 +333,15 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		}
 	}
 
+	// okteto: the transfer writes the files, and their content hashes are only
+	// saved when it has finished. If the daemon dies in between, the saved
+	// hashes may not describe the files, and a later sync only corrects the
+	// hashes of the files that it writes. So the copy stops being complete
+	// before the transfer starts.
+	if err := (cacheRefMetadata{mutable}).setCompleteSync(false); err != nil {
+		return nil, err
+	}
+
 	if err := filesync.FSSync(ctx, caller, opt); err != nil {
 		return nil, err
 	}
@@ -321,6 +362,19 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 			return nil, err
 		}
 		bklog.G(ctx).Debugf("saved %s as %s", mutable.ID(), sharedKey)
+	}
+	// okteto: remember which source the modification times of the copy belong
+	// to. After a sync that named no source they belong to none: the record is
+	// removed, so that the source that was recorded does not trust them.
+	if md.getSyncSource() != syncSource {
+		if err := md.setSyncSource(syncSource); err != nil {
+			return nil, err
+		}
+	}
+	// okteto: the content hashes, the shared key and the source of the files
+	// that the transfer left are saved
+	if err := md.setCompleteSync(true); err != nil {
+		return nil, err
 	}
 
 	snap, err := mutable.Commit(ctx)
@@ -372,6 +426,16 @@ func (cu *cacheUpdater) ContentHasher() fsutil.ContentHasher {
 const (
 	keySharedKey   = "local.sharedKey"
 	sharedKeyIndex = keySharedKey + ":"
+
+	// keySyncSource (okteto) is the source that synced a local source copy last
+	keySyncSource = "okteto.local.syncSource"
+
+	// keyCompleteSync (okteto) is set on a local source copy when a sync has
+	// saved its content hashes and its source, and removed before the next
+	// sync starts its transfer. A copy without it is not reused: a sync of it
+	// did not finish, or it was only synced by daemons that do not record
+	// this.
+	keyCompleteSync = "okteto.local.completeSync"
 )
 
 func searchSharedKey(ctx context.Context, store cache.MetadataStore, k string) ([]cacheRefMetadata, error) {
@@ -396,4 +460,50 @@ func (md cacheRefMetadata) getSharedKey() string {
 
 func (md cacheRefMetadata) setSharedKey(key string) error {
 	return md.SetString(keySharedKey, key, sharedKeyIndex+key)
+}
+
+func (md cacheRefMetadata) getSyncSource() string {
+	return md.GetString(keySyncSource)
+}
+
+func (md cacheRefMetadata) setSyncSource(source string) error {
+	return md.SetString(keySyncSource, source, "")
+}
+
+func (md cacheRefMetadata) hasCompleteSync() bool {
+	return md.GetString(keyCompleteSync) != ""
+}
+
+func (md cacheRefMetadata) setCompleteSync(complete bool) error {
+	if md.hasCompleteSync() == complete {
+		return nil
+	}
+	value := ""
+	if complete {
+		value = "true"
+	}
+	return md.SetString(keyCompleteSync, value, "")
+}
+
+// removeLocalRef (okteto) removes a local source copy that is not reused, as
+// the snapshot does with the copy of a sync that fails.
+func removeLocalRef(ctx context.Context, mutable cache.MutableRef) {
+	if err := mutable.SetCachePolicyDefault(); err != nil {
+		bklog.G(ctx).Errorf("failed to reset mutable cachepolicy: %v", err)
+	}
+	contenthash.ClearCacheContext(mutable)
+	go mutable.Release(context.WithoutCancel(ctx))
+}
+
+// compareSyncSource orders the copies of a local source so that the ones that
+// were last synced by source come first.
+func compareSyncSource(a, b, source string) int {
+	switch {
+	case a == source && b != source:
+		return -1
+	case a != source && b == source:
+		return 1
+	default:
+		return 0
+	}
 }
